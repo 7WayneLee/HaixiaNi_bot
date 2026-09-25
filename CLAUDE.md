@@ -72,13 +72,22 @@
   - [x] 計畫已確認（2026-09-25）：轉錄人紀影片、八綱辨證、臨牀案例、天紀、六壬，共 220.9 小時；「MP3 人紀全」與人紀影片重複，不轉；梁冬對話倪海廈用現成 `.lrc`；國學堂其他非倪師內容不轉、不進索引；GPU 用 us-central1 的 L4 Spot
   - [x] 第二步的程式（2026-09-25，程式由 sol 撰寫；最後一輪修正時 Codex 額度用完、改由 Claude 直接審查驗收）：`scripts/extract_audio.py`、`scripts/transcribe.py`、`scripts/lrc_to_transcript.py`、`scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py`、`scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh`、`haixia/transcript.py`、`docs/02-transcribe.md`；163 個測試通過。模型只從官方來源下載（ModelScope `iic/…`，或 Hugging Face 的 FunAudioLLM、funasr 官方倉庫），不用社群鏡像
   - [x] 小規模比較已跑完（2026-09-25，L4 一般計費）：25 份結果在 `gs://haixiani-bot-data-507014/bakeoff/`。速度（RTF）：whisper-prompt 0.078、whisper-noprompt 0.080、whisper-batched 0.029（但每 10 分鐘只切 16–22 段，時間點太粗）、sensevoice 0.031、paraformer 0.054。發現兩種要加進過濾器的幻聽：whisper 夾著「好」的重複迴圈（「你怎麼知道，好，你怎麼知道……」）、batched 把提示詞吐出來（「中文逐字稿：陰陽、表裡……」重複）。「說白傷寒論」確認是梁冬對話郭生白，不轉
-  - [ ] 使用者校對 15 分鐘參考答案（草稿與 mp3 在 Mac 桌面「倪師校對」），再用 `bakeoff_score.py` 評分、選模型。評分時已會忽略語助詞、把數字轉成中文念法、把症／證視為同字（2026-09-25）。幻聽過濾已補上段內重複迴圈與提示詞外洩（用 25 份實際結果驗證，只動到真正的幻聽）
+  - [x] 使用者校對 15 分鐘參考答案（2026-09-25，存在 `gs://haixiani-bot-data-507014/bakeoff/references/`），評分結果（字錯率／中醫詞召回率）：whisper-noprompt 14.5%／51%、whisper-prompt 15.8%／51%、whisper-batched 21.0%／45%、paraformer 27.0%／59%、sensevoice 30.7%／32%
+  - [x] 校正盲測（sol 只拿模型輸出、詞表與使用者的校正原則，看不到答案）：只用 Whisper 校正 → 9.2%／93%；Whisper 加 Paraformer 校正 → 8.8%／98%。Paraformer 帶來的改善太小（字錯率少不到 2 個百分點、召回率多不到 10 個百分點），依使用者決定**不跑 Paraformer**。LLM 校正本身效果很大，但用訂閱額度做全量校正會吃掉好幾週的 Codex 額度，不可行；第三步的校正方式待定（Claude API 批次需要先小量試跑、估算費用）
+  - [x] 轉錄引擎定案：**Whisper large-v3，不加提示詞**（不用 Paraformer、SenseVoice、批次模式）
   - [x] 全量抽音訊：影片資料夾 440 個檔轉 16kHz 單聲道 FLAC，放在 `gs://haixiani-bot-data-507014/audio/<raw 相對路徑>.flac`（440 個、23.6 GiB，0 個失敗；2026-09-25 完成後 GPU VM 已停機）
   - [ ] 全量轉錄
 - [ ] 第三步：校對、切段、建索引
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
+
+## 預算
+
+- 架設整個系統（第一步到第六步）的總預算約 **1,100 台幣**（約 34 美元，以 1 美元 ≈ 32 台幣估算），**不含**之後 bot 問答用的 Claude API 費用。
+- 2026-09-25 估算：已花約 97 台幣（跨區傳輸、GPU 約 2 小時）；第二步只跑 Whisper 約 450 台幣，加跑 Paraformer 再多約 290 台幣；GCS 每月約 64 台幣。
+- 因為預算緊，有三個原則：(1) 大量的 LLM 校正交給訂閱額度的 worker（sol／Claude），不走 Claude API；(2) GPU VM 不用就刪掉，停機時 200GB 磁碟每天約 21 台幣；(3) 第二步做完後刪掉 GCS 上的原始影片（Drive 有原檔），音訊改放冷儲存。
+- 任何會增加花費的新做法，先估算、先問使用者。
 
 ## 工作守則
 
