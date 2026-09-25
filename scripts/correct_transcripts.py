@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,6 +26,25 @@ ROOT = Path(__file__).resolve().parents[1]
 QUOTA = re.compile(r"RESOURCE_EXHAUSTED|\b429\b|quota|rate.?limit|too many requests|額度|限速", re.I)
 NETWORK = re.compile(r"connection|network|dns|timed? ?out|unreachable|unavailable|socket|ECONN|ENET|連線|網路", re.I)
 OUTPUT_LINE = re.compile(r"^\s*\[\d+(?:\.\d+)?\]", re.M)
+RESET_TIME = re.compile(r"Resets\s+in\s+(\d+(?:h|m|s)(?:\d+(?:h|m|s))*)(?=$|[\s\"',.!?}\]])", re.I)
+RESET_PARTS = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", re.I)
+
+
+def quota_reset_seconds(result):
+    """從額度錯誤取得重設倒數；只接受 0 到 6 小時之間的值。"""
+    message = result["stderr"] + "\n" + result["output"]
+    seconds = []
+    for match in RESET_TIME.finditer(message):
+        parts = RESET_PARTS.fullmatch(match.group(1))
+        if parts and any(value is not None for value in parts.groups()):
+            value = sum(int(number or 0) * unit for number, unit in zip(parts.groups(), (3600, 60, 1)))
+            if 0 < value <= 6 * 3600:
+                seconds.append(value)
+    return max(seconds, default=None)
+
+
+def timestamp(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def atomic_json(path, data):
@@ -140,6 +160,7 @@ class SharedState:
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.pause_until = 0.0
+        self.quota_resets_at = 0.0
         self.pause_level = 0
         self.consecutive_errors = 0
         self.processes = set()
@@ -148,22 +169,29 @@ class SharedState:
         self.backoff_max = backoff_max
         self.work_dir = Path(work_dir)
         self.started = time.monotonic()
+        self.started_at = now()
+        self.last_progress_at = None
         self.counts = {"chunks_total": total, "chunks_done": 0, "chunks_ok": 0,
                        "chunks_partial": 0, "chunks_failed": 0, "files_total": files_total,
                        "files_done": 0,
                        "retries": 0, "searches": 0, "audio_hours_total": audio_total}
         self.audio_hours_done = 0.0
         self.last_error = None
+        self.failed_files = set()
         self.status("running")
 
     def status(self, state=None):
         with self.lock:
             if state is None:
                 state = "paused" if self.pause_until > time.time() else "running"
-            data = {"updated_at": now(), "state": state,
+            data = {"pid": os.getpid(), "started_at": self.started_at,
+                    "last_progress_at": self.last_progress_at,
+                    "quota_resets_at": timestamp(self.quota_resets_at) if self.quota_resets_at else None,
+                    "updated_at": now(), "state": state,
                     "paused_until": None if self.pause_until <= time.time() else
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.pause_until)),
                     **self.counts, "audio_hours_done": round(self.audio_hours_done, 4),
+                    "failed_files": sorted(self.failed_files),
                     "consecutive_errors": self.consecutive_errors, "last_error": self.last_error}
             atomic_json(self.work_dir / "status.json", data)
 
@@ -174,14 +202,26 @@ class SharedState:
                 if remaining <= 0:
                     if self.pause_until:
                         self.pause_until = 0.0
+                        self.quota_resets_at = 0.0
                         self.status("running")
                     return not self.stop.is_set()
             if self.stop.wait(min(remaining, 1.0)):
                 return False
 
-    def note_error(self, kind, reason, log):
+    def note_error(self, kind, reason, log, reset_seconds=None):
         with self.lock:
             self.last_error = reason
+            if kind == "quota" and reset_seconds is not None:
+                reset_at = time.time() + reset_seconds
+                if reset_at > self.quota_resets_at:
+                    self.quota_resets_at = reset_at
+                    self.pause_until = reset_at + 120
+                    self.pause_level = 0
+                    reset_clock = time.strftime("%H:%M", time.localtime(reset_at))
+                    retry_clock = time.strftime("%H:%M", time.localtime(self.pause_until))
+                    log.warning("暫停：Antigravity 額度用完，預計 %s 重設，%s 再試", reset_clock, retry_clock)
+                self.status("paused")
+                return True
             if self.pause_until > time.time():
                 self.status("paused")
                 return True
@@ -191,6 +231,7 @@ class SharedState:
                 delay = min(self.backoff_max, self.backoff_base * 2 ** self.pause_level)
                 self.pause_level += 1
                 self.pause_until = time.time() + delay
+                self.quota_resets_at = 0.0
                 clock = time.strftime("%H:%M", time.localtime(self.pause_until))
                 cause = ("Antigravity 額度用完或被限速" if kind == "quota" else
                          f"連續 {self.consecutive_errors} 次呼叫失敗")
@@ -247,6 +288,7 @@ class SharedState:
             self.counts[f'chunks_{result["status"]}'] += 1
             self.counts["searches"] += result["searches"]
             self.audio_hours_done += audio_hours
+            self.last_progress_at = now()
             self.status()
             log.info("%s 第 %d 段：%d 行，%.1f 秒，搜尋 %d 次，%s", result["source"],
                      result["chunk_number"], chunk["end_index"] - chunk["start_index"],
@@ -338,7 +380,8 @@ def correct_chunk(job, args, ws, shared, log, digest):
         kind, reason = error_kind(response)
         if kind:
             log.warning("%s 第 %d 段第 %d 次呼叫錯誤（%s）：%s", source, number, sequence, kind, reason)
-            paused = shared.note_error(kind, reason, log)
+            paused = shared.note_error(kind, reason, log,
+                                       quota_reset_seconds(response) if kind == "quota" else None)
             if paused:
                 continue
             failures += 1
@@ -479,6 +522,7 @@ def main(argv=None):
     empty_sources = [source for source, (_, _, chunks) in documents.items() if not chunks]
     if not jobs:
         shared = SharedState(args.work_dir, 0, hours, len(documents))
+        shared.failed_files = failed_files.copy()
         for source in empty_sources:
             relative, original, chunks = documents[source]
             save_corrected(corrected_document(original, chunks, [], args.model,
@@ -495,6 +539,7 @@ def main(argv=None):
     base = float(os.environ.get("HAIXIA_BACKOFF_BASE_SEC", "300"))
     maximum = float(os.environ.get("HAIXIA_BACKOFF_MAX_SEC", "3600"))
     shared = SharedState(args.work_dir, len(jobs), hours, len(documents), base, maximum)
+    shared.failed_files = failed_files.copy()
     for source in empty_sources:
         relative, original, chunks = documents[source]
         save_corrected(corrected_document(original, chunks, [], args.model,
@@ -543,6 +588,7 @@ def main(argv=None):
                 failed_files.discard(source)
             with shared.lock:
                 shared.counts["files_done"] += 1
+                shared.failed_files = failed_files.copy()
                 shared.status()
     try:
         for job in jobs:

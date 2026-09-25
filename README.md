@@ -43,6 +43,7 @@
 | `scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh` | 建立 L4 GPU VM（預設一般計費、只預覽）、安裝轉錄環境並關掉自動更新 |
 | `scripts/gpu_job.sh` | 在 GPU VM 上以 systemd 服務跑長時間工作（start／status／log／stop） |
 | `scripts/correct_transcripts.py` | 在 Mac 上用 Antigravity CLI 批次校正逐字稿，可續跑與監看狀態 |
+| `scripts/watch_correction.py` | 不用 AI 監視校正作業，異常時寫警報並可通知 Orca Run |
 | `scripts/sync_transcripts.sh` | 經由 movie-nas 複製 ASR 與校正版逐字稿；操作見 [docs/03-correct.md](docs/03-correct.md) |
 | `haixia/correction.py`、`tools/agy_hook/` | 校正核心邏輯、提示詞與工具閘門 |
 | `haixia/transcript.py` | 逐字稿格式、驗證、幻聽過濾 |

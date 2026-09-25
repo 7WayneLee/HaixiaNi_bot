@@ -1,5 +1,6 @@
 """校正核心、hook 與假 agy 的離線測試。"""
 import copy
+import logging
 import json
 import os
 import signal
@@ -177,6 +178,55 @@ def test_cli_quota_pause_without_failure(fake_env, monkeypatch):
     assert all(chunk["status"] == "ok" for chunk in doc["correction"]["chunks"])
     assert "暫停：Antigravity 額度用完或被限速" in (tmp / "work/logs/correct.log").read_text()
     assert json.loads((tmp / "work/status.json").read_text())["chunks_failed"] == 0
+
+
+@pytest.mark.parametrize("duration,expected", [
+    ("2h31m45s", 9105), ("49m12s", 2952), ("30s", 30),
+    ("5h", 18000), ("0s", None), ("6h1s", None), ("unknown", None),
+])
+def test_quota_reset_parser(duration, expected):
+    response = {"stderr": 'AGY_ERROR: ' + json.dumps({
+        "short_error": f"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in {duration}",
+        "status": "RESOURCE_EXHAUSTED"}), "output": "", "exit_code": 1}
+    assert cli.error_kind(response)[0] == "quota"
+    assert cli.quota_reset_seconds(response) == expected
+
+
+def test_quota_uses_latest_reset_and_status_fields(tmp_path, monkeypatch, caplog):
+    epoch = 1_800_000_000.0
+    monkeypatch.setattr(cli.time, "time", lambda: epoch)
+    shared = cli.SharedState(tmp_path, 2, 1.0, backoff_base=300, backoff_max=3600)
+    log = logging.getLogger("quota-test")
+    with caplog.at_level(logging.WARNING):
+        assert shared.note_error("quota", "Resets in 30s", log, 30)
+        assert shared.pause_until == epoch + 150
+        assert shared.note_error("quota", "Resets in 49m12s", log, 2952)
+        assert shared.pause_until == epoch + 2952 + 120
+        assert shared.note_error("quota", "Resets in 30s", log, 30)
+        assert shared.pause_until == epoch + 2952 + 120
+    assert "預計" in caplog.text and "再試" in caplog.text
+    saved = json.loads((tmp_path / "status.json").read_text())
+    assert saved["pid"] == os.getpid()
+    assert saved["started_at"] and saved["last_progress_at"] is None
+    assert saved["quota_resets_at"] == cli.timestamp(epoch + 2952)
+    assert saved["failed_files"] == []
+    shared.completed({"status": "ok", "searches": 0, "source": "test", "chunk_number": 1,
+                      "elapsed_sec": 1}, {"start_index": 0, "end_index": 1}, 0.1, log)
+    assert json.loads((tmp_path / "status.json").read_text())["last_progress_at"]
+    monkeypatch.setattr(cli.time, "time", lambda: epoch + 5000)
+    assert shared.wait_if_paused()
+    with caplog.at_level(logging.WARNING):
+        shared.note_error("quota", "Resets in 30s", log, 30)
+    assert shared.pause_until == epoch + 5150
+    assert shared.pause_level == 0
+    assert shared.quota_resets_at == epoch + 5030
+
+
+def test_quota_without_valid_reset_uses_backoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.time, "time", lambda: 1_800_000_000.0)
+    shared = cli.SharedState(tmp_path, 1, 1.0, backoff_base=300, backoff_max=3600)
+    assert shared.note_error("quota", "Resets in 6h1s", logging.getLogger("quota-test"))
+    assert shared.pause_until == 1_800_000_300.0
 
 
 def test_cli_missing_line_retries_then_partial(fake_env, monkeypatch):
