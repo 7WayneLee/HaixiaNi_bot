@@ -175,8 +175,13 @@ def corrected_document(original, chunks, results, model, max_search, digest):
             document["segments"][index]["corrected"] = corrected
         detail = {key: result[key] for key in ("start", "end", "status", "attempts", "searches", "elapsed_sec")}
         detail["fallback_lines"] = sum(not corrected for _, corrected in result["lines"])
+        detail["engine"] = result.get("engine", "antigravity-cli")
+        detail["model"] = result.get("model", model)
+        detail["effort"] = result.get("effort")
         metadata.append(detail)
-    document["correction"] = {"tool": "antigravity-cli", "model": model,
+    engines = {item["engine"] for item in metadata}
+    tool = next(iter(engines)) if len(engines) == 1 else "mixed" if engines else "antigravity-cli"
+    document["correction"] = {"tool": tool, "model": model,
                               "max_search": max_search, "created_at": now(),
                               "prompt_sha256": digest, "chunks": metadata}
     return document

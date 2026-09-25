@@ -44,6 +44,20 @@ def sent(calls):
     return [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()] if calls.exists() else []
 
 
+def test_engine_stops_weekly_info_other_alert(monitor, capsys):
+    watcher, status, save, _current, _free, calls = monitor
+    status["engines"] = {"codex": {"state": "stopped", "reason": "Codex 週額度 85% 已達上限"}}
+    save()
+    watcher.check_once()
+    assert "Codex 週額度停止" in capsys.readouterr().out
+    assert not sent(calls)
+    status["engines"]["agy"] = {"state": "stopped", "reason": "CLI 損壞"}
+    save()
+    watcher.check_once()
+    assert "agy 引擎停止" in capsys.readouterr().out
+    assert len(sent(calls)) == 1
+
+
 @pytest.mark.parametrize("kind", ["程式意外結束", "卡住", "暫停逾時", "新的失敗段", "斷路器暫停", "磁碟空間不足"])
 def test_every_alert_uses_fake_orca(monitor, kind, capsys):
     watcher, status, save, current, free, calls = monitor

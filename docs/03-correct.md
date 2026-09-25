@@ -5,6 +5,7 @@
 ## 前置條件
 
 - 安裝並登入 Antigravity CLI；`agy models` 應列出 `gemini-3.8-flash-high`。
+- 若使用 Codex，安裝並登入 Codex CLI，並確認 `orca account list --json` 能讀取 Codex 的 session 與 weekly 額度。
 - 使用本專案的 `.venv`，並確認磁碟有空間存 ASR、校正版和工作快取。
 - 在 repo 外指定 `--work-dir`，例如 `/tmp/haixia-correct-work`。程式會建立 `ws/.agents/` 的 hook 設定；`ws/` 不放逐字稿或其他檔。
 
@@ -47,11 +48,30 @@ scripts/sync_transcripts.sh push "$HOME/haixia-corrected"
 
 `pull` 可以加 `--include '影片/02 針灸/'`，只傳回指定來源前綴；校正 CLI 也可重複加 `--include`，或用 `--files` 指定相對 JSON 路徑清單（每行一個）。不加 `--include` 就會處理 `--in-dir` 的全部 JSON。轉錄完成並拉回新檔後，按 Ctrl-C 停止校正，再用同一組目錄重跑；已完成的段會沿用，不必從頭開始。檔案很多時可依課程分批執行，降低 Mac 記憶體用量，也方便逐批驗收。`--limit-hours` 依檔名排序累加整檔音訊時數，到達門檻即停。`--retry-failed` 只重跑既有校正版中 `failed` 或 `partial` 的段；`--force` 會重做所有已輸出段。規則、詞表或提示詞改變時，尚未輸出的檔會自動捨棄舊段落快取，已輸出的檔需加 `--force` 重做。
 
+## Antigravity 與 Codex 接力或並行
+
+預設 `--engines agy`，維持原本只用 Antigravity 的行為。兩個引擎共用依檔案順序排列的段落佇列：
+
+```bash
+caffeinate -i .venv/bin/python scripts/correct_transcripts.py \
+  --in-dir "$HOME/haixia-asr" --out-dir "$HOME/haixia-corrected" \
+  --work-dir "$HOME/haixia-correct-work" --engines agy,codex \
+  --agy-jobs 4 --codex-jobs 4 --codex-model gpt-6-sol --codex-effort medium
+```
+
+`--codex-mode relay` 是預設：Antigravity 正常工作時，Codex 不取新段；Antigravity 因額度或斷路器暫停時，Codex 接手。Antigravity 恢復後，Codex 完成手上的段便等待下一次暫停。只選 `--engines codex` 時 Codex 直接工作。要讓兩邊同時取段，改用 `--codex-mode parallel`。`--jobs` 仍是 `--agy-jobs` 的別名。
+
+每段只由一個引擎持有並完成重試。額度暫停是例外：尚未成功的段會放回佇列前端，供另一個引擎從頭處理。兩個引擎使用完全相同的校正提示詞。每段中繼資料記錄 `engine`、`model`、`effort`；一份檔案若由兩個引擎完成，`correction.tool` 為 `mixed`。
+
+Codex 在 repo 外的 `工作目錄/codex-ws/` 空資料夾執行，stdin 關閉，網路搜尋設為 `cached`；這台機器的 `live` 搜尋會遇到授權錯誤。Codex 每次呼叫前檢查 Orca 額度，最多每 60 秒查一次。週額度達 `--codex-weekly-max`（預設 80%）時，本次執行停用 Codex，Antigravity 繼續；session 達 `--codex-session-max`（預設 85%）時，Codex 暫停到 `resetsAt` 後 2 分鐘。Codex 自己回報 usage limit 或 HTTP 429 也按 session 重設時間暫停；資料讀不到時保守暫停 15 分鐘。websocket 斷線後接 401 的錯誤視為暫時性連線錯誤重試，並非額度用完。錯誤訊息內的 `sk-` 金鑰字串會在 log、狀態與快取中遮蔽。
+
 ## 暫停、續跑與監看
 
-每段、每次嘗試會存到 `工作目錄/chunks/`，完成檔則寫到 `--out-dir`。按 Ctrl-C 後，程式立即停止派新段，向進行中的 `agy` 程序群組送出 SIGTERM；5 秒後仍未結束就送 SIGKILL。被中止的段不寫入快取，用同一組目錄重跑即可續跑。退出碼 0 表示無 failed 段，1 表示有 failed 段沿用 ASR，2 表示手動中止。
+每段、每次嘗試會存到 `工作目錄/chunks/`，完成檔則寫到 `--out-dir`。按 Ctrl-C 後，程式立即停止派新段，向進行中的 CLI 程序群組送出 SIGTERM；5 秒後仍未結束就送 SIGKILL。被中止的段不寫入快取，用同一組目錄重跑即可續跑。退出碼 0 表示無 failed 段，1 表示有 failed 段沿用 ASR 或段落未完成，2 表示手動中止。
 
-Antigravity 的額度每 5 小時重設一次，所有模型共用。額度錯誤若提供 `Resets in` 倒數，所有 worker 會暫停至預計重設時間再加 2 分鐘；多個 worker 回報不同時間時取最晚的。倒數缺失或不合理時，才從 5 分鐘起指數退避，最多 60 分鐘。額度暫停不扣段落重試次數。網路錯誤、空輸出或其他 CLI 錯誤若連續三次出現，也會啟動全體斷路暫停；暫停中其他 worker 回報的錯誤不會提高退避等級。成功呼叫會清除連續錯誤計數。`工作目錄/logs/correct.log` 有每段結果、仍有 failed 段的檔名和每五分鐘進度；`工作目錄/status.json` 有 `running`、`paused`、`finished`、`aborted` 狀態、PID、啟動時間、最後完成段落時間、已知額度重設時間、下次嘗試時間、計數與最後錯誤。
+Antigravity 的額度每 5 小時重設一次，所有模型共用。額度錯誤若提供 `Resets in` 倒數，Antigravity worker 會暫停至預計重設時間再加 2 分鐘；多個 worker 回報不同時間時取最晚的。倒數缺失或不合理時，才從 5 分鐘起指數退避，最多 60 分鐘。額度暫停不扣段落重試次數。網路錯誤、空輸出或其他 CLI 錯誤若連續三次出現，也會啟動該引擎的斷路暫停；暫停中其他 worker 回報的錯誤不會提高退避等級。成功呼叫會清除連續錯誤計數。`工作目錄/logs/correct.log` 有每段結果、仍有 failed 段的檔名和每五分鐘進度；`工作目錄/status.json` 有 `running`、`paused`、`finished`、`aborted` 狀態、PID、啟動時間、最後完成段落時間、已知額度重設時間、下次嘗試時間、計數與最後錯誤。
+
+雙引擎模式下，額度暫停、斷路器和連線錯誤各自計算，不會暫停另一個引擎。`status.json` 的 `engines` 區塊記錄各引擎狀態、暫停時間、原因、完成段數與平均耗時；Codex 另記最近的 session／weekly 使用百分比。`codex_mode` 和 `active_engines` 顯示接力／並行模式及目前正在呼叫的引擎。監視程式對非額度原因停止的引擎發警報；Codex 達週上限僅記 INFO。
 
 建議在**另一個 Orca 終端機分頁**啟動不用 AI 的監視程式，長時間執行時每 10 分鐘檢查 PID、進度、log 與磁碟。它只讀校正資料，僅寫自己的 `logs/watch.log`；額度暫停只記 INFO，異常才發 ALERT。可選擇將警報及每日摘要送到 Orca Run；先把 `RUN_ID` 設成目標 Run ID：
 

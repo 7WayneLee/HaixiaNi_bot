@@ -93,7 +93,16 @@
     - **Antigravity 額度是 5 小時一個週期、所有模型共用**，一個週期約能跑 90–100 段，全量約 3,300 段要跑約 7 天；使用者接受維持每段最多搜 5 次，也接受這段期間自己不用 Antigravity。
     - 之後程式改成依錯誤訊息的 `Resets in` 準時恢復，並加上不用 AI 的監視程式 `scripts/watch_correction.py`（出事時用 Orca 通知指揮、每天 9 點送進度）。
     - 監視用的 AI worker 改用 `gpt-6-luna`（medium）：2026-09-26 01:13 三個 gpt-6-sol（xhigh）worker 把 Codex 額度用完，監視中斷。
-  - [ ] 全量校正（依課程資料夾分批跑）
+  - [x] 加入 Codex 引擎（2026-09-26）：
+    - 同樣 4 段盲測：Codex gpt-6-sol（medium）字錯率 9.6%、召回 96%，每段 40–70 秒；gpt-6-luna（medium）11.0%、86%，不採用。
+    - 使用者決定：
+      - 用 sol（medium）跟 Antigravity **接力**：agy 沒額度時 Codex 接手，agy 恢復後 Codex 停止取新段；
+      - Codex 本週額度用到 80% 就停，5 小時額度到 85% 先暫停；
+      - 第二個 Google 帳號先不開。
+    - `codex exec` 的即時網路搜尋在這台機器有授權錯誤，所以用 cached。
+    - 約 2–6 成的呼叫會 websocket 斷線，改用 HTTPS 時又出現 401（Codex 0.157.0 的備用連線用錯憑證），程式會重試。
+    - 換成付費 Gemini API 估計要 17,000–21,000 台幣（批次約 10,000），遠超預算，不採用。
+  - [ ] 全量校正（2026-09-26 06:37 開始，先跑已轉好的 310 檔；轉錄完成後再補其餘檔案）
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試

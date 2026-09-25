@@ -62,6 +62,7 @@ class CorrectionWatcher:
         self.previous_failed = None
         self.last_quota_pause = None
         self.last_daily_date = None
+        self.engine_stops_seen = set()
 
     def write(self, level, now, kind, description):
         line = f"{level} {now:%Y-%m-%d %H:%M:%S} {kind}：{description}"
@@ -148,6 +149,18 @@ class CorrectionWatcher:
             self.alert("狀態讀取失敗", str(error), now)
             return False
         self.alert("狀態讀取失敗", "", now, False)
+        for engine, detail in status.get("engines", {}).items():
+            if detail.get("state") != "stopped":
+                continue
+            reason = str(detail.get("reason") or "")
+            key = (engine, reason)
+            if key in self.engine_stops_seen:
+                continue
+            self.engine_stops_seen.add(key)
+            if engine == "codex" and "週額度" in reason:
+                self.write("INFO", now, "Codex 週額度停止", reason)
+            elif reason != "執行結束":
+                self.alert(f"{engine} 引擎停止", reason, now)
         state = status.get("state")
         if state == "finished":
             names = self.failed_filenames(status)
