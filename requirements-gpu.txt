@@ -1,0 +1,14 @@
+# 本機 macOS／Python 3.12 實測版本下限；GPU VM 請使用 Python 3.12。
+# Ubuntu 的 CUDA 12.9 驅動可執行 CUDA 12.8 wheel。先安裝相容的 torch／torchaudio：
+# uv pip install --python .venv-asr/bin/python torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# 再執行：uv pip install --python .venv-asr/bin/python -r requirements-gpu.txt
+# torch、torchaudio 由 setup_gpu.sh 從上面的 CUDA 索引另行安裝，不在此清單重裝。
+# SeACo-Paraformer 只載入 ModelScope 官方權重；其餘模型失敗時可改用官方 Hugging Face 倉庫。
+# HAIXIA_MODEL_HUB=hf 只讓 SenseVoice、fsmn-vad、ct-punc 直接使用官方 Hugging Face 倉庫。
+faster-whisper>=1.2.1
+funasr>=1.4.16
+modelscope>=1.40.1
+huggingface_hub>=1.33.0
+opencc>=1.4.2
+soundfile>=0.14.0
+pytest>=9.1.1

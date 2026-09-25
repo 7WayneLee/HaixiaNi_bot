@@ -1,5 +1,6 @@
 """正體轉換、詞典與搜尋鍵的回歸測試。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,57 @@ from haixia.textnorm import search_key, to_traditional
 
 TERMS_PATH = Path(__file__).resolve().parents[1] / "data" / "tcm_terms_tw.txt"
 TERMS = TERMS_PATH.read_text(encoding="utf-8").splitlines()
+PROMPTS_PATH = Path(__file__).resolve().parents[1] / "data" / "course_prompts.json"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "紫微斗數",
+        "斗數",
+        "倪師講紫微斗數與天干地支",
+        "他的頭髮乾了",
+        "天后（六壬的天將）",
+        "北斗",
+        "一斗米",
+        "乾坤",
+        "皇后",
+    ],
+)
+def test_traditional_segments_keep_original_words(text):
+    assert to_traditional(text) == text
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("紫微斗数", "紫微斗數"),
+        ("倪师讲紫微斗数与天干地支", "倪師講紫微斗數與天干地支"),
+        ("斗争", "鬥爭"),
+        ("一斗米", "一斗米"),
+        ("裏急後重", "裡急後重"),
+    ],
+)
+def test_segment_script_detection(source, expected):
+    assert to_traditional(source) == expected
+
+
+def test_mixed_script_sentences_are_converted_separately():
+    source = "倪师讲紫微斗数与天干地支。倪師講紫微斗數與天干地支。"
+    expected = "倪師講紫微斗數與天干地支。倪師講紫微斗數與天干地支。"
+    assert to_traditional(source) == expected
+    assert to_traditional(source.replace("。", "\n")) == expected.replace("。", "\n")
+    assert to_traditional("紫微斗數,斗争. 斗數") == "紫微斗數,鬥爭. 斗數"
+    assert to_traditional("倪师講經") == "倪師講經"
+
+
+def test_course_prompts_and_hotwords_are_unchanged():
+    config = json.loads(PROMPTS_PATH.read_text(encoding="utf-8"))
+    texts = [text for course in [config["default"], *config["courses"]]
+             for text in [course["prompt"], *course["hotwords"]]]
+    assert texts
+    assert [(text, to_traditional(text)) for text in texts
+            if to_traditional(text) != text] == []
 
 
 @pytest.mark.parametrize(

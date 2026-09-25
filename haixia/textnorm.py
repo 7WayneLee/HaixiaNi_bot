@@ -26,6 +26,51 @@ def _converters():
 
 
 @lru_cache(maxsize=1)
+def _script_converters():
+    """逐字辨識用 s2t，正體段則用 t2tw 統一台灣用字。"""
+    return OpenCC("s2t"), OpenCC("t2tw")
+
+
+@lru_cache(maxsize=4096)
+def _script_evidence(char):
+    """回傳單字的簡體或正體線索；共用字及兩邊都改的字回傳零。"""
+    s2t, _ = _script_converters()
+    _, t2s = _converters()
+    changed_by_s2t = s2t.convert(char) != char
+    changed_by_t2s = t2s.convert(char) != char
+    if changed_by_s2t and not changed_by_t2s:
+        return -1
+    if changed_by_t2s and not changed_by_s2t:
+        return 1
+    return 0
+
+
+def _script_counts(text):
+    """計算一段文字的簡體與正體線索數量。"""
+    simple = traditional = 0
+    for char in text:
+        evidence = _script_evidence(char)
+        simple += evidence == -1
+        traditional += evidence == 1
+    return simple, traditional
+
+
+def _segments(text):
+    """以空白與中英文標點分段，並原樣保留分隔字元。"""
+    current = []
+    for char in text:
+        if char.isspace() or unicodedata.category(char).startswith("P"):
+            if current:
+                yield "".join(current), False
+                current.clear()
+            yield char, True
+        else:
+            current.append(char)
+    if current:
+        yield "".join(current), False
+
+
+@lru_cache(maxsize=1)
 def _term_tree():
     """載入覆寫詞條，建成逐字樹供最長匹配使用。"""
     root = {}
@@ -119,10 +164,8 @@ def _variant_table():
     return str.maketrans(variants)
 
 
-def to_traditional(text: str) -> str:
-    """先轉 OpenCC，再修正正體詞組與台灣異體用字。"""
-    converter, _ = _converters()
-    tree = _term_tree()
+def _convert_simplified(text, converter, tree):
+    """依簡體詞典最長匹配，再以 s2tw 轉換其餘文字。"""
     output = []
     plain = []
     index = 0
@@ -139,6 +182,34 @@ def to_traditional(text: str) -> str:
         index = best_end
     if plain:
         output.append(converter.convert("".join(plain)))
+    return "".join(output)
+
+
+def to_traditional(text: str) -> str:
+    """依分段字體選擇 OpenCC，再修正正體詞組與台灣異體用字。"""
+    s2tw, t2s = _converters()
+    _, t2tw = _script_converters()
+    parts = list(_segments(text))
+    counts = [_script_counts(part) if not separator else (0, 0)
+              for part, separator in parts]
+    simple_total = sum(simple for simple, _ in counts)
+    traditional_total = sum(traditional for _, traditional in counts)
+    tree = _term_tree()
+    output = []
+    for (part, separator), (simple, traditional) in zip(parts, counts):
+        if separator:
+            output.append(part)
+            continue
+        use_traditional = traditional > 0 and simple == 0
+        if simple and traditional:
+            # 「斗」等共用字會被逐字 s2t 當成簡體；整段回轉可辨識正體詞。
+            use_traditional = s2tw.convert(t2s.convert(part)) == t2tw.convert(part)
+        elif not simple and not traditional:
+            use_traditional = traditional_total > simple_total
+        if use_traditional:
+            output.append(t2tw.convert(part))
+        else:
+            output.append(_convert_simplified(part, s2tw, tree))
     return _fix_phrases("".join(output)).translate(_variant_table())
 
 

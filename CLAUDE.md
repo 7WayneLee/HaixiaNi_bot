@@ -69,6 +69,7 @@
   - [x] 準備：簡轉正體模組與中醫詞表（`haixia/textnorm.py`，sol 撰寫，經三輪審查，117 個測試通過，2026-09-25）
   - [x] 準備：影片截圖總覽 `scripts/sample_frames.py`，用來判斷畫面上有沒有燒進去的字幕（sol 撰寫，已審查）
   - [x] 計畫已確認（2026-09-25）：轉錄人紀影片、八綱辨證、臨牀案例、天紀、六壬，共 220.9 小時；「MP3 人紀全」與人紀影片重複，不轉；梁冬對話倪海廈用現成 `.lrc`；國學堂其他非倪師內容不轉、不進索引；GPU 用 us-central1 的 L4 Spot
+  - [x] 第二步的程式（2026-09-25，程式由 sol 撰寫；最後一輪修正時 Codex 額度用完、改由 Claude 直接審查驗收）：`scripts/extract_audio.py`、`scripts/transcribe.py`、`scripts/lrc_to_transcript.py`、`scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py`、`scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh`、`haixia/transcript.py`、`docs/02-transcribe.md`；163 個測試通過。模型只從官方來源下載（ModelScope `iic/…`，或 Hugging Face 的 FunAudioLLM、funasr 官方倉庫），不用社群鏡像
   - [ ] 小規模比較：4 段各 10 分鐘，比較 Whisper large-v3（有／無提示詞）、SenseVoice、SeACo-Paraformer（熱詞）；使用者校對 15 分鐘當標準答案，比字錯率與中醫詞正確率，並實測速度
   - [ ] 全量轉錄
 - [ ] 第三步：校對、切段、建索引

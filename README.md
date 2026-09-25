@@ -36,6 +36,12 @@
 | `scripts/transfer.sh` | 把 Drive 資料夾複製到 GCS |
 | `scripts/inventory.py` | 盤點檔案類型、大小與影音時數 |
 | `scripts/sample_frames.py` | 每門課抽幾部影片截圖，拼成總覽圖，檢查有沒有燒進畫面的字幕 |
+| `scripts/extract_audio.py` | 影音轉成 16kHz 單聲道 FLAC（可切片段、可批次續跑） |
+| `scripts/transcribe.py` | 轉錄：Whisper large-v3、SenseVoice、SeACo-Paraformer，輸出帶時間與信心分數的逐字稿 JSON |
+| `scripts/lrc_to_transcript.py` | 把現成的 `.lrc` 字幕轉成同格式的逐字稿 |
+| `scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py` | 小規模比較：跑 5 種設定、算字錯率與中醫詞召回率 |
+| `scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh` | 建立 L4 Spot GPU VM（預設只預覽）、安裝轉錄環境 |
+| `haixia/transcript.py` | 逐字稿格式、驗證、幻聽過濾 |
 | `haixia/textnorm.py` | 簡轉正體（含中醫詞典與台灣用字）與搜尋比對鍵 |
 | `data/` | 中醫正體詞表與轉換規則 |
 | `tests/` | 測試（`python -m pytest`） |
