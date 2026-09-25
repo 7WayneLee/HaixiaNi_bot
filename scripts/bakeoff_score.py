@@ -23,15 +23,69 @@ SETTINGS = (
     "paraformer",
 )
 TIME_MARK = re.compile(r"^\s*\[(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\.\d+)?\]\s*")
+# 純語助詞；在 search_key（轉簡體）之後比對，所以誒也要列簡體的诶。
+FILLERS = frozenset("嗯啊哈呃哦欸誒诶喔唉噢")
+FILLER_DISPLAY = "嗯、啊、哈、呃、哦、欸、誒、喔、唉、噢"
+NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+NUMBER_UNITS = ("", "十", "百", "千")
+LARGE_UNITS = ("", "萬", "億", "兆", "京")
+CHINESE_DIGITS = "零一二三四五六七八九"
 
 
-def normalize(text):
-    """保留統一表意文字、擴充 A 與英數字。"""
-    key = search_key(unicodedata.normalize("NFKC", text))
+def _four_digits(value):
+    output = []
+    zero = False
+    for position, digit in enumerate(f"{value:04d}"):
+        number = int(digit)
+        if number == 0:
+            zero = bool(output)
+        else:
+            if zero:
+                output.append("零")
+            output.append(CHINESE_DIGITS[number] + NUMBER_UNITS[3 - position])
+            zero = False
+    result = "".join(output)
+    return result[1:] if result.startswith("一十") else result
+
+
+def _integer_in_chinese(digits):
+    value = int(digits)
+    if value == 0:
+        return "零"
+    groups = []
+    while value:
+        groups.append(value % 10000)
+        value //= 10000
+    if len(groups) > len(LARGE_UNITS):
+        return "".join(CHINESE_DIGITS[int(digit)] for digit in digits)
+    output = ""
+    for index in range(len(groups) - 1, -1, -1):
+        group = groups[index]
+        if not group:
+            continue
+        if output and group < 1000:
+            output += "零"
+        output += _four_digits(group) + LARGE_UNITS[index]
+    return output
+
+
+def _number_in_chinese(match):
+    whole, dot, fraction = match.group().partition(".")
+    result = _integer_in_chinese(whole)
+    return result + "點" + "".join(CHINESE_DIGITS[int(digit)] for digit in fraction) if dot else result
+
+
+def normalize(text, keep_fillers=False, keep_numbers=False):
+    """統一字形、症／證及數字念法；預設拿掉語助詞。"""
+    text = unicodedata.normalize("NFKC", text)
+    if not keep_numbers:
+        text = NUMBER.sub(_number_in_chinese, text)
+    key = search_key(text).replace("证", "症")
     output = []
     for char in key:
         if 0x3400 <= ord(char) <= 0x4DBF or 0x4E00 <= ord(char) <= 0x9FFF:
-            output.append(char)
+            if keep_fillers or char not in FILLERS:
+                output.append(char)
         elif "A" <= char <= "Z":
             output.append(char.lower())
         elif "a" <= char <= "z" or "0" <= char <= "9":
@@ -96,7 +150,8 @@ def course_for(source, prompts):
     return max(matches, key=lambda course: len(course["prefix"]), default=prompts.get("default", {}))
 
 
-def term_map(terms_path, course):
+def term_map(terms_path, course, keep_fillers=False, skipped=None, keep_numbers=False):
+    """回傳 {正規化鍵: 原詞}。拿掉語助詞時，含語助詞用字的詞（例如呃逆）無法可靠比對，改記到 skipped。"""
     terms = []
     for line in terms_path.read_text(encoding="utf-8").splitlines():
         term = line.strip()
@@ -105,7 +160,11 @@ def term_map(terms_path, course):
     terms.extend(course.get("hotwords", []))
     normalized = {}
     for term in terms:
-        key = normalize(term)
+        key = normalize(term, keep_fillers, keep_numbers)
+        if not keep_fillers and key != normalize(term, keep_fillers=True, keep_numbers=keep_numbers):
+            if skipped is not None:
+                skipped.add(term)
+            continue
         if key:
             normalized.setdefault(key, term)
     return normalized
@@ -140,12 +199,12 @@ def count_terms(text, terms):
     return counts
 
 
-def score_one(clip, transcript, reference, terms):
+def score_one(clip, transcript, reference, terms, keep_fillers=False, keep_numbers=False):
     start = float(clip["score_start"])
     duration = float(clip["score_duration"])
     segments = selected_segments(transcript, start, duration)
-    ref_key = normalize(reference)
-    hyp_key = normalize("".join(segment.get("text", "") for segment in segments))
+    ref_key = normalize(reference, keep_fillers, keep_numbers)
+    hyp_key = normalize("".join(segment.get("text", "") for segment in segments), keep_fillers, keep_numbers)
     substitutions, deletions, insertions = edit_counts(ref_key, hyp_key)
     ref_count = count_terms(ref_key, terms)
     hyp_count = count_terms(hyp_key, terms)
@@ -207,8 +266,31 @@ def _decimal(value):
     return "—" if value is None else f"{value:.3f}"
 
 
+def filler_note(report):
+    if report.get("keep_fillers"):
+        note = "正規化：保留語助詞（`--keep-fillers`），語助詞也計入字錯率。"
+    else:
+        note = f"正規化：已拿掉語助詞（{FILLER_DISPLAY}），不計入字錯率與中醫詞比對；要保留請加 `--keep-fillers`。"
+    skipped = report.get("skipped_terms")
+    if skipped:
+        note += f"下列中醫詞含語助詞用字，拿掉語助詞後無法比對，未列入召回率：{'、'.join(skipped)}。"
+    if report.get("keep_numbers"):
+        note += "保留阿拉伯數字（`--keep-numbers`）。"
+    else:
+        note += "阿拉伯數字轉為中文念法（可用 `--keep-numbers` 關閉）。"
+    note += "「證」與「症」視為同一字。"
+    return note
+
+
 def render_report(report):
-    lines = ["# 小規模轉錄比較評分", "", "只評分有指定評分區間的片段；CER 越低越好，召回率越高越好。", ""]
+    lines = [
+        "# 小規模轉錄比較評分",
+        "",
+        filler_note(report),
+        "",
+        "只評分有指定評分區間的片段；CER 越低越好，召回率越高越好。",
+        "",
+    ]
     for clip in report["clips"]:
         lines.extend([
             f"## {clip['label']}（{clip['course']}）",
@@ -246,15 +328,17 @@ def render_report(report):
     return "\n".join(lines) + "\n"
 
 
-def build_report(clips_path, results_path, references_path, terms_path, prompts_path):
+def build_report(clips_path, results_path, references_path, terms_path, prompts_path,
+                 keep_fillers=False, keep_numbers=False):
     prompts = json.loads(prompts_path.read_text(encoding="utf-8"))
     clips = []
+    skipped = set()
     with clips_path.open(encoding="utf-8", newline="") as source:
         for clip in csv.DictReader(source, delimiter="\t"):
             if not clip["score_start"].strip():
                 continue
             course = course_for(clip["source"], prompts)
-            terms = term_map(terms_path, course)
+            terms = term_map(terms_path, course, keep_fillers, skipped, keep_numbers)
             reference_path = references_path / f"{clip['label']}.txt"
             reference = read_reference(reference_path) if reference_path.is_file() else None
             entry = {
@@ -268,9 +352,15 @@ def build_report(clips_path, results_path, references_path, terms_path, prompts_
             }
             for setting in SETTINGS:
                 result = results_path / setting / f"{clip['label']}.json"
-                entry["settings"][setting] = score_one(clip, json.loads(result.read_text(encoding="utf-8")), reference, terms) if reference is not None and result.is_file() else None
+                entry["settings"][setting] = score_one(clip, json.loads(result.read_text(encoding="utf-8")), reference, terms, keep_fillers, keep_numbers) if reference is not None and result.is_file() else None
             clips.append(entry)
-    return {"clips": clips, "summary": summarize(clips)}
+    return {
+        "keep_fillers": keep_fillers,
+        "keep_numbers": keep_numbers,
+        "skipped_terms": sorted(skipped),
+        "clips": clips,
+        "summary": summarize(clips),
+    }
 
 
 def main():
@@ -282,8 +372,11 @@ def main():
     parser.add_argument("--json", type=Path)
     parser.add_argument("--terms", type=Path, default=Path(__file__).resolve().parent.parent / "data/tcm_terms_tw.txt")
     parser.add_argument("--prompts", type=Path, default=Path(__file__).resolve().parent.parent / "data/course_prompts.json")
+    parser.add_argument("--keep-fillers", action="store_true", help=f"保留語助詞（預設拿掉：{FILLER_DISPLAY}）")
+    parser.add_argument("--keep-numbers", action="store_true", help="保留阿拉伯數字，不轉成中文念法")
     args = parser.parse_args()
-    report = build_report(args.clips, args.results, args.references, args.terms, args.prompts)
+    report = build_report(args.clips, args.results, args.references, args.terms, args.prompts,
+                          args.keep_fillers, args.keep_numbers)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(render_report(report), encoding="utf-8")
     if args.json:

@@ -11,7 +11,9 @@ from scripts.bakeoff_score import (
     normalize,
     read_reference,
     render_report,
+    score_one,
     selected_segments,
+    term_map,
 )
 
 
@@ -38,6 +40,71 @@ def test_simple_and_variant_are_equal():
 
 def test_punctuation_space_and_case_are_ignored():
     assert normalize(" 桂枝湯，ABC！ ") == normalize("桂枝汤abc")
+
+
+def _score(reference, hypothesis, keep_fillers=False, keep_numbers=False):
+    clip = {"score_start": "0", "score_duration": "10"}
+    transcript = {"duration_sec": 10, "segments": [{"start": 0, "end": 10, "text": hypothesis}]}
+    return score_one(clip, transcript, reference, {}, keep_fillers, keep_numbers)
+
+
+@pytest.mark.parametrize(("digits", "spoken"), [
+    ("33", "三十三"), ("33.3", "三十三點三"), ("164", "一百六十四"),
+    ("450", "四百五十"), ("1", "一"), ("10", "十"),
+    ("12", "十二"), ("2", "二"),
+])
+def test_arabic_numbers_match_spoken_chinese(digits, spoken):
+    assert normalize(digits) == normalize(spoken)
+    assert _score("用" + digits + "克", "用" + spoken + "克")["cer"] == 0
+    assert _score("用" + spoken + "克", "用" + digits + "克")["cer"] == 0
+
+
+def test_decimal_mixed_number_and_zheng_variants_have_zero_cer():
+    assert _score("用33.3克", "用三十三點三克")["cer"] == 0
+    assert _score("十2兩", "十二兩")["cer"] == 0
+    assert _score("陽明症", "陽明證")["cer"] == 0
+
+
+def test_keep_numbers_disables_conversion():
+    assert normalize("用33.3克", keep_numbers=True) == "用33.3克".replace(".", "")
+    assert normalize("十2兩", keep_numbers=True) == "十2两"
+    assert _score("用33.3克", "用三十三點三克", keep_numbers=True)["cer"] > 0
+    assert _score("十2兩", "十二兩", keep_numbers=True)["cer"] > 0
+
+
+def test_fillers_are_ignored_by_default():
+    first = normalize("好，我們看桂枝湯哈")
+    second = normalize("嗯，我們看啊桂枝湯")
+    assert first == normalize("好我們看桂枝湯")
+    assert second == normalize("我們看桂枝湯")
+    # 兩個方向都只差一個「好」字。
+    assert first.replace(normalize("好"), "", 1) == second
+    assert edit_counts(first, second) == (0, 1, 0)
+    assert edit_counts(second, first) == (0, 0, 1)
+    # 有語助詞的兩句，CER 和沒有語助詞的兩句相同。
+    with_fillers = _score("好，我們看桂枝湯哈", "嗯，我們看啊桂枝湯")
+    without_fillers = _score("好，我們看桂枝湯", "我們看桂枝湯")
+    assert with_fillers["cer"] == without_fillers["cer"] == pytest.approx(1 / 7)
+    assert (with_fillers["substitutions"], with_fillers["deletions"], with_fillers["insertions"]) == (0, 1, 0)
+    assert _score("嗯，我們看啊桂枝湯", "好，我們看桂枝湯哈")["cer"] == _score("我們看桂枝湯", "好，我們看桂枝湯")["cer"]
+
+
+def test_keep_fillers_counts_them():
+    assert normalize("嗯，我們看啊桂枝湯", keep_fillers=True) == normalize("嗯我們看啊桂枝湯", keep_fillers=True)
+    assert normalize("誒", keep_fillers=True) == "诶"
+    assert normalize("誒诶欸") == ""
+    kept = _score("好，我們看桂枝湯哈", "嗯，我們看啊桂枝湯", keep_fillers=True)
+    assert kept["reference_chars"] == 8
+    assert kept["cer"] > _score("好，我們看桂枝湯哈", "嗯，我們看啊桂枝湯")["cer"]
+
+
+def test_terms_with_filler_characters_are_skipped(tmp_path):
+    terms = tmp_path / "terms.txt"
+    terms.write_text("呃逆\n桂枝湯\n", encoding="utf-8")
+    skipped = set()
+    assert list(term_map(terms, {}, skipped=skipped).values()) == ["桂枝湯"]
+    assert skipped == {"呃逆"}
+    assert sorted(term_map(terms, {}, keep_fillers=True).values()) == ["呃逆", "桂枝湯"]
 
 
 def test_midpoint_selects_crossing_segments():
@@ -102,6 +169,14 @@ def test_missing_results_and_report(tmp_path):
     markdown = render_report(report)
     assert "（缺）" in markdown
     assert "50.00%" in markdown
+    assert report["keep_fillers"] is False
+    assert "已拿掉語助詞" in markdown.splitlines()[2]
+    assert "「證」與「症」視為同一字" in markdown.splitlines()[2]
+    assert "阿拉伯數字轉為中文念法" in markdown.splitlines()[2]
+    kept = render_report(build_report(clips, results, references, terms, prompts, keep_fillers=True))
+    assert kept.splitlines()[2].startswith("正規化：保留語助詞")
+    kept_numbers = render_report(build_report(clips, results, references, terms, prompts, keep_numbers=True))
+    assert "保留阿拉伯數字" in kept_numbers.splitlines()[2]
 
 
 def test_missing_reference_is_reported_without_interrupting(tmp_path):

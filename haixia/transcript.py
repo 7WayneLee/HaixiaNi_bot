@@ -8,7 +8,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from haixia.textnorm import search_key
+from haixia.textnorm import search_key, to_traditional
 
 SCHEMA = "haixia.transcript/1"
 HALLUCINATIONS = (
@@ -84,6 +84,8 @@ def validate(document):
             if not isinstance(segment, dict):
                 raise ValueError(f"{where} 必須是物件")
             expected = {"start", "end", "text_raw", "text", "speaker", "confidence", "low_confidence"} if field == "segments" else {"start", "end", "text_raw", "reason"}
+            if field == "segments" and "filtered" in segment:
+                expected.add("filtered")
             if set(segment) != expected:
                 raise ValueError(f"{where} 欄位錯誤")
             start, end = segment["start"], segment["end"]
@@ -104,16 +106,19 @@ def validate(document):
                 raise ValueError(f"{where} speaker 必須是字串或 null")
             if not isinstance(segment["low_confidence"], bool):
                 raise ValueError(f"{where} low_confidence 必須是布林值")
+            filtered = segment.get("filtered", False)
+            if not isinstance(filtered, bool) or (filtered and not segment["low_confidence"]):
+                raise ValueError(f"{where} filtered 與 low_confidence 不相符")
             confidence = segment["confidence"]
-            if confidence is None and segment["low_confidence"]:
-                raise ValueError(f"{where} 沒有信心分數時 low_confidence 必須是 false")
+            if confidence is None and segment["low_confidence"] and not filtered:
+                raise ValueError(f"{where} 沒有信心分數時 low_confidence 必須是 false，除非經過濾器改寫")
             if engine["name"] in {"sensevoice", "paraformer", "lrc"} and confidence is not None:
                 raise ValueError(f"{where} 此引擎的 confidence 必須是 null")
             if confidence is not None:
                 keys = {"avg_logprob", "no_speech_prob", "compression_ratio"}
                 if not isinstance(confidence, dict) or set(confidence) != keys or any(not _number(confidence[k]) for k in keys):
                     raise ValueError(f"{where} confidence 格式錯誤")
-                if segment["low_confidence"] != is_low_confidence(confidence):
+                if segment["low_confidence"] != (is_low_confidence(confidence) or filtered):
                     raise ValueError(f"{where} low_confidence 與規則不符")
     return document
 
@@ -153,39 +158,110 @@ def _compact(text):
     return re.sub(r"[^\w]+", "", search_key(text).casefold(), flags=re.UNICODE)
 
 
-def _repeated_sentence(text):
-    parts = [_compact(part) for part in re.split(r"[。！？!?；;，,、\n]+", text)]
-    parts = [part for part in parts if part]
-    for index in range(len(parts) - 2):
-        if len(parts[index]) >= 4 and parts[index] == parts[index + 1] == parts[index + 2]:
-            return True
-    return False
+def _compact_positions(text):
+    """回傳去標點的搜尋鍵，以及每個字對應的原文起訖位置。"""
+    positions = []
+    for index, original in enumerate(text):
+        for _ in _compact(original):
+            positions.append((index, index + 1))
+    return _compact(text), positions
 
 
-def filter_hallucinations(segments):
-    """回傳（保留段落，被移除段落）；重複句至少四字才整組移除。"""
+def _prompt_leak_start(key, prompt_key):
+    """找出與提示詞重疊至少八字的最早位置。"""
+    if len(prompt_key) < 8:
+        return None
+    for start in range(len(key) - 7):
+        if any(key[start:start + 8] == prompt_key[index:index + 8]
+               for index in range(len(prompt_key) - 7)):
+            return start
+    return None
+
+
+def _repetition_cut(key, positions):
+    """找出三次以上的段內迴圈；回傳應移除的原文起訖位置。"""
+    for start in range(len(key) - 11):
+        best = None
+        for length in range(4, (len(key) - start) // 3 + 1):
+            phrase = key[start:start + length]
+            cursor = start + length
+            count = 1
+            while True:
+                next_start = next((cursor + gap for gap in range(3)
+                                   if key.startswith(phrase, cursor + gap)), None)
+                if next_start is None:
+                    break
+                cursor = next_start + length
+                count += 1
+            if count >= 3 and (best is None or (count, length) > (best[0], best[1])):
+                best = count, length, cursor
+        if best is not None:
+            _count, length, cursor = best
+            phrase = key[start:start + length]
+            previous = key.rfind(phrase, max(0, start - length - 12), start)
+            cut_start = start + length
+            if previous >= 0 and previous + length <= start:
+                prefix = 0
+                while (prefix < 12 and previous - prefix > 0 and start - prefix > 0
+                       and key[previous - prefix - 1] == key[start - prefix - 1]):
+                    prefix += 1
+                if prefix >= 4:
+                    cut_start = start - prefix
+            raw_start = (positions[cut_start - 1][1] if cut_start == start + length
+                         else positions[cut_start][0])
+            return raw_start, positions[cursor - 1][1]
+    return None
+
+
+def filter_hallucinations(segments, prompt=""):
+    """回傳（保留段落，被移除文字）；保留段內迴圈的第一次出現。"""
     segments = list(segments)
-    reasons = [None] * len(segments)
-    keys = [_compact(s.get("text_raw", "")) for s in segments]
-    for index, segment in enumerate(segments):
-        for phrase in HALLUCINATIONS:
-            if _compact(phrase) in keys[index]:
-                reasons[index] = f"幻聽詞：{phrase}"
-                break
-        if reasons[index] is None and _repeated_sentence(segment.get("text_raw", "")):
-            reasons[index] = "同一句連續重複三次"
+    keys = [_compact(segment.get("text_raw", "")) for segment in segments]
+    repeated_segments = set()
     index = 0
     while index < len(segments):
         end = index + 1
         while end < len(segments) and keys[index] and keys[end] == keys[index]:
             end += 1
         if len(keys[index]) >= 4 and end - index >= 3:
-            for position in range(index, end):
-                reasons[position] = reasons[position] or "同一句連續重複三次"
+            repeated_segments.update(range(index, end))
         index = end
-    kept = [segment for segment, reason in zip(segments, reasons) if reason is None]
-    dropped = [{"start": segment["start"], "end": segment["end"], "text_raw": segment["text_raw"], "reason": reason}
-               for segment, reason in zip(segments, reasons) if reason is not None]
+
+    kept, dropped = [], []
+    prompt_key = _compact(prompt)
+    for index, segment in enumerate(segments):
+        raw = segment["text_raw"]
+        key, positions = _compact_positions(raw)
+        reason = next((f"幻聽詞：{phrase}" for phrase in HALLUCINATIONS
+                       if _compact(phrase) in key), None)
+        if reason is None and index in repeated_segments:
+            reason = "同一句連續重複三次"
+        if reason is not None:
+            dropped.append({"start": segment["start"], "end": segment["end"],
+                            "text_raw": raw, "reason": reason})
+            continue
+
+        leak_start = _prompt_leak_start(key, prompt_key)
+        cut = (positions[leak_start][0], len(raw)) if leak_start is not None else None
+        reason = "提示詞外洩" if cut is not None else None
+        if cut is None:
+            cut = _repetition_cut(key, positions)
+            reason = "段內重複迴圈" if cut is not None else None
+        if cut is None:
+            kept.append(segment)
+            continue
+
+        start, end = cut
+        dropped.append({"start": segment["start"], "end": segment["end"],
+                        "text_raw": raw[start:end], "reason": reason})
+        remaining = (raw[:start] + raw[end:]).strip()
+        if reason == "提示詞外洩" and not _compact(remaining):
+            dropped[-1]["text_raw"] = raw
+        elif remaining:
+            rewritten = segment.copy()
+            rewritten.update(text_raw=remaining, text=to_traditional(remaining),
+                             low_confidence=True, filtered=True)
+            kept.append(rewritten)
     return kept, dropped
 
 

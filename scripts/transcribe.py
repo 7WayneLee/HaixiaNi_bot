@@ -205,7 +205,7 @@ def transcribe_one(audio, source, out, engine, prompts, clip_start=None, no_prom
                          "text": to_traditional(text_raw), "speaker": None,
                          "confidence": confidence, "low_confidence": is_low_confidence(confidence)})
     segments.sort(key=lambda segment: segment["start"])
-    segments, dropped = filter_hallucinations(segments)
+    segments, dropped = filter_hallucinations(segments, prompt=prompt)
     params = {"prompt": prompt, "hotwords": hotwords, "language": getattr(engine, "language", "zh"),
               "beam_size": getattr(engine, "beam_size", None),
               "vad": True}

@@ -63,7 +63,7 @@ def test_hallucinations_and_repetition():
         "小柴胡湯。小柴胡汤。小柴胡湯。",
     ])]
     kept, dropped = filter_hallucinations(segments)
-    assert [segment["text_raw"] for segment in kept] == ["桂枝湯", "正常內容"]
+    assert [segment["text_raw"] for segment in kept] == ["桂枝湯", "正常內容", "小柴胡湯。"]
     assert len(dropped) == 7
     assert sum("重複" in item["reason"] for item in dropped) == 4
     assert any("幻聽詞" in item["reason"] for item in dropped)
@@ -84,9 +84,87 @@ def test_long_repetition_is_hallucination():
     segments.extend(example_segment(index, index + 0.5, "這個條文大家看清楚。")
                     for index in range(1, 4))
     kept, dropped = filter_hallucinations(segments)
-    assert kept == []
+    assert [segment["text_raw"] for segment in kept] == ["我們來看一下。"]
+    assert kept[0]["filtered"] is True
+    assert kept[0]["low_confidence"] is True
     assert len(dropped) == 4
     assert all("重複" in item["reason"] for item in dropped)
+
+
+def test_actual_whisper_loop_keeps_the_real_opening():
+    raw = ("旁邊是冷的,那你問病人啊,你怎麼知道,好,你問病人啊,你怎麼知道,好,"
+           "你怎麼知道,好,你怎麼知道,好,你怎麼知道,好,你怎麼知道,好,你怎麼知道,好")
+    segment = example_segment(0, 30, raw)
+    segment["confidence"] = {"avg_logprob": -1.1, "no_speech_prob": 0.1,
+                             "compression_ratio": 1.0}
+    segment["low_confidence"] = True
+    kept, dropped = filter_hallucinations([segment])
+    assert len(kept) == len(dropped) == 1
+    assert kept[0]["text_raw"].startswith("旁邊是冷的,那你問病人啊,你怎麼知道")
+    assert kept[0]["text_raw"].count("你怎麼知道") == 1
+    assert kept[0]["filtered"] is True
+    assert kept[0]["low_confidence"] is True
+    assert dropped[0]["reason"] == "段內重複迴圈"
+    assert raw == kept[0]["text_raw"] + dropped[0]["text_raw"]
+    assert kept[0]["start"] == dropped[0]["start"] == 0
+    assert kept[0]["end"] == dropped[0]["end"] == 30
+    validate(create("影片/八綱.mp4", 30, engine_info(), kept, dropped=dropped))
+
+
+def test_actual_batched_prompt_leak_is_dropped_entirely():
+    prompt = "倪海廈老師演講《八綱辨證》，正體中文逐字稿：陰陽、表裡、寒熱、虛實、問診、經方、漢唐中醫。"
+    raw = "中文逐字稿：" + "陰陽、表裡、寒熱、虛實、問診：" * 10
+    segment = example_segment(81.46, 110.4, raw)
+    segment["confidence"] = {"avg_logprob": -0.1, "no_speech_prob": 0.1,
+                             "compression_ratio": 6.6}
+    segment["low_confidence"] = True
+    kept, dropped = filter_hallucinations([segment], prompt=prompt)
+    assert kept == []
+    assert dropped == [{"start": 81.46, "end": 110.4, "text_raw": raw, "reason": "提示詞外洩"}]
+
+
+def test_prompt_leak_keeps_text_before_first_match():
+    segment = example_segment(0, 3, "先說桂枝湯。中文逐字稿：陰陽、表裡、寒熱、虛實。")
+    kept, dropped = filter_hallucinations([segment], prompt="正體中文逐字稿：陰陽、表裡、寒熱、虛實")
+    assert kept[0]["text_raw"] == "先說桂枝湯。"
+    assert kept[0]["filtered"] is True
+    assert dropped[0]["text_raw"] == "中文逐字稿：陰陽、表裡、寒熱、虛實。"
+    assert dropped[0]["reason"] == "提示詞外洩"
+
+
+def test_prompt_leak_with_only_leading_punctuation_drops_whole_segment():
+    raw = "，中文逐字稿：陰陽、表裡、寒熱、虛實"
+    segment = example_segment(text=raw)
+    kept, dropped = filter_hallucinations([segment], prompt="正體中文逐字稿：陰陽、表裡、寒熱、虛實")
+    assert kept == []
+    assert dropped[0]["text_raw"] == raw
+
+
+@pytest.mark.parametrize("raw", [
+    "好，好，好，我們今天講桂枝湯", "對，對，對",
+    "桂枝湯、麻黃湯、葛根湯", "陰陽、表裡、寒熱、虛實",
+])
+def test_normal_speech_survives_without_prompt(raw):
+    segment = example_segment(text=raw)
+    assert filter_hallucinations([segment]) == ([segment], [])
+
+
+def test_prompt_overlap_shorter_than_eight_survives():
+    segment = example_segment(text="陰陽、表裡、寒熱、虛實")
+    assert filter_hallucinations([segment], prompt="八綱辨證：陰陽、表裡、寒熱、實證") == ([segment], [])
+
+
+def test_filtered_schema_is_optional_but_required_for_rewritten_low_confidence():
+    old = example_segment()
+    validate(create("影片/甲.mp4", 2, engine_info("sensevoice"), [old]))
+    changed = {**old, "low_confidence": True, "filtered": True}
+    validate(create("影片/甲.mp4", 2, engine_info("sensevoice"), [changed]))
+    normal_score = {"avg_logprob": -0.1, "no_speech_prob": 0.1, "compression_ratio": 1.0}
+    validate(create("影片/甲.mp4", 2, engine_info(), [{**changed, "confidence": normal_score}]))
+    with pytest.raises(ValueError, match="沒有信心分數"):
+        create("影片/甲.mp4", 2, engine_info("sensevoice"), [{**old, "low_confidence": True}])
+    with pytest.raises(ValueError, match="filtered"):
+        create("影片/甲.mp4", 2, engine_info(), [{**old, "filtered": "true"}])
 
 
 def test_course_longest_prefix():
@@ -268,6 +346,27 @@ class FakeEngine:
         return [{"start": 0, "end": 0.5, "text_raw": "桂枝汤",
                  "confidence": {"avg_logprob": -0.1, "no_speech_prob": 0.1,
                                 "compression_ratio": 1.0}}], 0.01
+
+
+def test_transcribe_passes_prompt_to_filter_and_respects_no_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr("scripts.transcribe.audio_duration", lambda _audio: 1.0)
+    prompt = "倪海廈老師演講《八綱辨證》，正體中文逐字稿：陰陽、表裡、寒熱、虛實、問診。"
+    raw = "中文逐字稿：陰陽、表裡、寒熱、虛實"
+
+    class PromptEngine(FakeEngine):
+        def transcribe(self, audio, used_prompt, hotwords):
+            return [{"start": 0, "end": 1, "text_raw": raw, "confidence": None}], 0.01
+
+    prompts = {"default": {"prompt": prompt, "hotwords": []}, "courses": []}
+    with_prompt = tmp_path / "with.json"
+    without_prompt = tmp_path / "without.json"
+    transcribe_one(tmp_path / "unused.flac", "影片/八綱.mp4", with_prompt, PromptEngine(), prompts)
+    transcribe_one(tmp_path / "unused.flac", "影片/八綱.mp4", without_prompt,
+                   PromptEngine(), prompts, no_prompt=True)
+    assert load(with_prompt)["segments"] == []
+    assert load(with_prompt)["dropped"][0]["reason"] == "提示詞外洩"
+    assert load(without_prompt)["segments"][0]["text_raw"] == raw
+    assert load(without_prompt)["dropped"] == []
 
 
 def test_batch_filter_and_resume(tmp_path):

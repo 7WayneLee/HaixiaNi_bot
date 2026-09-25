@@ -17,6 +17,7 @@
 | VM 的 rclone | v1.75.0；remote 叫 `gdrive`（Drive）和 `gcs`（GCS，`env_auth`），跟腳本預設一樣，不用設 `DRIVE_REMOTE`／`GCS_REMOTE`。Drive 的 token 在 2026-09-25 過期過，使用者已重新授權 |
 | VM 的 GCS 權限 | access scope 是 `cloud-platform`，可以寫 GCS，不用停機改設定。服務帳號是預設的 Compute Engine 服務帳號 |
 | VM 的限制 | 這台 VM 還跑著其他常駐服務（包括用同一個 `gdrive` remote 的 WebDAV），可用記憶體只有約 300MB。第一步搬資料時暫停過這些服務，2026-09-25 第一步完成後已全部恢復（指令記在 VM 的 `~/haixia-stopped-services.txt`）。之後的重工作都在 GPU VM 上跑，不要再佔用這台。repo clone 在 VM 的 `~/HaixiaNi_bot`，`setup_worker.sh` 已跑過（tmux、ffmpeg、fuse3 已安裝） |
+| GPU VM | `haixia-gpu`，us-central1-a，g2-standard-4（1 張 L4，23GB），**一般計費（STANDARD）**，映像檔 `common-cu129-ubuntu-2404-nvidia-580`，200GB 開機磁碟，network tag `haixia-gpu`。2026-09-25 的經過：第一台 Spot 開機 11 分鐘就被收回；改成一般計費後，us-central1-a 的 L4 又整區缺貨；刪掉重建時，b、c 兩區的 L4 和 a、b、c、f 四區的 T4 也都缺貨，最後在 a 區有容量時建成。專案的防火牆預設只允許使用者家裡的 IP 連 SSH，所以另外建了規則 `haixia-gpu-ssh-from-movie-nas`：只允許 movie-nas 內部 IP 連 tcp:22，只套用到有 `haixia-gpu` tag 的 VM。操作方式：在 movie-nas 上 `gcloud compute ssh haixia-gpu --zone us-central1-a --internal-ip`。長時間工作一定要用會回報失敗狀態的監視（VM 狀態、工作程序、log 是否更新、SSH、log 裡新的「失敗」）。**DLVM 映像檔開機約 30 分鐘後會自動跑 unattended-upgrades，連 systemd 都會重新載入、重啟一批服務，把 tmux 裡的工作殺掉（2026-09-25 發生過）**：所以 setup 之後要先 `sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service`，長時間工作要用 `sudo systemd-run --unit=<名稱> --uid=… --working-directory=…` 以 systemd 服務的方式跑，不要放在 SSH 連線底下的 tmux 裡。（已寫進 setup_gpu.sh，長時間工作用 `scripts/gpu_job.sh start <名稱> -- <指令>`）刪 VM 時一併刪掉這條規則 |
 | GitHub | `7WayneLee/HaixiaNi_bot`（公開 repo）。第一步的腳本與文件已 push（2026-09-25） |
 
 ## 已定案的架構
@@ -70,7 +71,9 @@
   - [x] 準備：影片截圖總覽 `scripts/sample_frames.py`，用來判斷畫面上有沒有燒進去的字幕（sol 撰寫，已審查）
   - [x] 計畫已確認（2026-09-25）：轉錄人紀影片、八綱辨證、臨牀案例、天紀、六壬，共 220.9 小時；「MP3 人紀全」與人紀影片重複，不轉；梁冬對話倪海廈用現成 `.lrc`；國學堂其他非倪師內容不轉、不進索引；GPU 用 us-central1 的 L4 Spot
   - [x] 第二步的程式（2026-09-25，程式由 sol 撰寫；最後一輪修正時 Codex 額度用完、改由 Claude 直接審查驗收）：`scripts/extract_audio.py`、`scripts/transcribe.py`、`scripts/lrc_to_transcript.py`、`scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py`、`scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh`、`haixia/transcript.py`、`docs/02-transcribe.md`；163 個測試通過。模型只從官方來源下載（ModelScope `iic/…`，或 Hugging Face 的 FunAudioLLM、funasr 官方倉庫），不用社群鏡像
-  - [ ] 小規模比較：4 段各 10 分鐘，比較 Whisper large-v3（有／無提示詞）、SenseVoice、SeACo-Paraformer（熱詞）；使用者校對 15 分鐘當標準答案，比字錯率與中醫詞正確率，並實測速度
+  - [x] 小規模比較已跑完（2026-09-25，L4 一般計費）：25 份結果在 `gs://haixiani-bot-data-507014/bakeoff/`。速度（RTF）：whisper-prompt 0.078、whisper-noprompt 0.080、whisper-batched 0.029（但每 10 分鐘只切 16–22 段，時間點太粗）、sensevoice 0.031、paraformer 0.054。發現兩種要加進過濾器的幻聽：whisper 夾著「好」的重複迴圈（「你怎麼知道，好，你怎麼知道……」）、batched 把提示詞吐出來（「中文逐字稿：陰陽、表裡……」重複）。「說白傷寒論」確認是梁冬對話郭生白，不轉
+  - [ ] 使用者校對 15 分鐘參考答案（草稿與 mp3 在 Mac 桌面「倪師校對」），再用 `bakeoff_score.py` 評分、選模型。評分時已會忽略語助詞、把數字轉成中文念法、把症／證視為同字（2026-09-25）。幻聽過濾已補上段內重複迴圈與提示詞外洩（用 25 份實際結果驗證，只動到真正的幻聽）
+  - [ ] 全量抽音訊：影片資料夾 440 個檔轉 16kHz FLAC（2026-09-25 進行中，GPU VM 的 systemd 服務 `haixia-extract`），完成後上傳 `audio/`、停機
   - [ ] 全量轉錄
 - [ ] 第三步：校對、切段、建索引
 - [ ] 第四步：Claude 問答

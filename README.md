@@ -40,7 +40,8 @@
 | `scripts/transcribe.py` | 轉錄：Whisper large-v3、SenseVoice、SeACo-Paraformer，輸出帶時間與信心分數的逐字稿 JSON |
 | `scripts/lrc_to_transcript.py` | 把現成的 `.lrc` 字幕轉成同格式的逐字稿 |
 | `scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py` | 小規模比較：跑 5 種設定、算字錯率與中醫詞召回率 |
-| `scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh` | 建立 L4 Spot GPU VM（預設只預覽）、安裝轉錄環境 |
+| `scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh` | 建立 L4 GPU VM（預設一般計費、只預覽）、安裝轉錄環境並關掉自動更新 |
+| `scripts/gpu_job.sh` | 在 GPU VM 上以 systemd 服務跑長時間工作（start／status／log／stop） |
 | `haixia/transcript.py` | 逐字稿格式、驗證、幻聽過濾 |
 | `haixia/textnorm.py` | 簡轉正體（含中醫詞典與台灣用字）與搜尋比對鍵 |
 | `data/` | 中醫正體詞表與轉換規則 |
