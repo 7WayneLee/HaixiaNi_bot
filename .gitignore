@@ -1,0 +1,15 @@
+# 機密資訊
+.env
+rclone.conf
+
+# 盤點與執行產生的檔案
+manifest*.csv
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Claude Code 本機設定（權限規則等）
+.claude/settings.local.json
