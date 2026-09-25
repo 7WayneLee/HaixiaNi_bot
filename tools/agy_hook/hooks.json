@@ -1,0 +1,12 @@
+{
+  "haixia-web-only": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 gate.py", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

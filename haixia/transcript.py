@@ -272,3 +272,78 @@ def course_for(source, prompts):
             prompts = json.load(file)
     matches = (course for course in prompts["courses"] if source.startswith(course["prefix"]))
     return max(matches, key=lambda course: len(course["prefix"]), default=prompts["default"])
+
+
+CORRECTED_SCHEMA = "haixia.corrected/1"
+
+
+def validate_corrected(document):
+    """驗證校正版；原始逐字稿的 validate 行為保持不變。"""
+    if not isinstance(document, dict) or document.get("schema") != CORRECTED_SCHEMA:
+        raise ValueError("校正版逐字稿 schema 不正確")
+    correction = document.get("correction")
+    fields = {"tool", "model", "max_search", "created_at", "prompt_sha256", "chunks"}
+    if not isinstance(correction, dict) or set(correction) != fields:
+        raise ValueError("correction 欄位錯誤")
+    if correction["tool"] != "antigravity-cli" or not isinstance(correction["model"], str) or not correction["model"]:
+        raise ValueError("correction 工具或模型不正確")
+    if type(correction["max_search"]) is not int or correction["max_search"] < 0:
+        raise ValueError("correction.max_search 必須是非負整數")
+    if not isinstance(correction["prompt_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", correction["prompt_sha256"]):
+        raise ValueError("correction.prompt_sha256 不正確")
+    try:
+        datetime.fromisoformat(correction["created_at"].replace("Z", "+00:00"))
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError("correction.created_at 必須是 ISO 8601 時間") from None
+    if not isinstance(correction["chunks"], list):
+        raise ValueError("correction.chunks 必須是陣列")
+    for index, chunk in enumerate(correction["chunks"], 1):
+        if not isinstance(chunk, dict) or set(chunk) != {"start", "end", "status", "attempts", "searches", "elapsed_sec", "fallback_lines"}:
+            raise ValueError(f"correction.chunks 第 {index} 段欄位錯誤")
+        if (not _number(chunk["start"]) or not _number(chunk["end"]) or
+                chunk["start"] < 0 or chunk["end"] < chunk["start"]):
+            raise ValueError(f"correction.chunks 第 {index} 段時間錯誤")
+        if chunk["status"] not in {"ok", "partial", "failed"}:
+            raise ValueError(f"correction.chunks 第 {index} 段狀態錯誤")
+        if (type(chunk["attempts"]) is not int or chunk["attempts"] < 0 or
+                type(chunk["searches"]) is not int or chunk["searches"] < 0 or
+                type(chunk["fallback_lines"]) is not int or chunk["fallback_lines"] < 0 or
+                not _number(chunk["elapsed_sec"]) or chunk["elapsed_sec"] < 0):
+            raise ValueError(f"correction.chunks 第 {index} 段計數錯誤")
+    original = {key: value for key, value in document.items() if key != "correction"}
+    original["schema"] = SCHEMA
+    if not isinstance(original.get("segments"), list):
+        raise ValueError("segments 必須是陣列")
+    clean_segments = []
+    for index, segment in enumerate(original["segments"], 1):
+        if not isinstance(segment, dict) or "text_asr" not in segment or "corrected" not in segment:
+            raise ValueError(f"segments 第 {index} 段缺少校正欄位")
+        if not isinstance(segment["text_asr"], str) or type(segment["corrected"]) is not bool:
+            raise ValueError(f"segments 第 {index} 段校正欄位錯誤")
+        if not segment["corrected"] and segment.get("text") != segment["text_asr"]:
+            raise ValueError(f"segments 第 {index} 段未校正文字與 ASR 不符")
+        clean_segments.append({key: value for key, value in segment.items()
+                               if key not in {"text_asr", "corrected"}})
+    original["segments"] = clean_segments
+    validate(original)
+    return document
+
+
+def save_corrected(document, path):
+    """驗證並原子寫入校正版逐字稿。"""
+    validate_corrected(document)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as output:
+            temp_path = Path(output.name)
+            json.dump(document, output, ensure_ascii=False, indent=1)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)

@@ -42,6 +42,9 @@
 | `scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py` | 小規模比較：跑 5 種設定、算字錯率與中醫詞召回率 |
 | `scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh` | 建立 L4 GPU VM（預設一般計費、只預覽）、安裝轉錄環境並關掉自動更新 |
 | `scripts/gpu_job.sh` | 在 GPU VM 上以 systemd 服務跑長時間工作（start／status／log／stop） |
+| `scripts/correct_transcripts.py` | 在 Mac 上用 Antigravity CLI 批次校正逐字稿，可續跑與監看狀態 |
+| `scripts/sync_transcripts.sh` | 經由 movie-nas 複製 ASR 與校正版逐字稿；操作見 [docs/03-correct.md](docs/03-correct.md) |
+| `haixia/correction.py`、`tools/agy_hook/` | 校正核心邏輯、提示詞與工具閘門 |
 | `haixia/transcript.py` | 逐字稿格式、驗證、幻聽過濾 |
 | `haixia/textnorm.py` | 簡轉正體（含中醫詞典與台灣用字）與搜尋比對鍵 |
 | `data/` | 中醫正體詞表與轉換規則 |
