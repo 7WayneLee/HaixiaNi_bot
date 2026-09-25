@@ -73,7 +73,7 @@
   - [x] 第二步的程式（2026-09-25，程式由 sol 撰寫；最後一輪修正時 Codex 額度用完、改由 Claude 直接審查驗收）：`scripts/extract_audio.py`、`scripts/transcribe.py`、`scripts/lrc_to_transcript.py`、`scripts/run_bakeoff.sh`、`scripts/bakeoff_score.py`、`scripts/create_gpu_vm.sh`、`scripts/setup_gpu.sh`、`haixia/transcript.py`、`docs/02-transcribe.md`；163 個測試通過。模型只從官方來源下載（ModelScope `iic/…`，或 Hugging Face 的 FunAudioLLM、funasr 官方倉庫），不用社群鏡像
   - [x] 小規模比較已跑完（2026-09-25，L4 一般計費）：25 份結果在 `gs://haixiani-bot-data-507014/bakeoff/`。速度（RTF）：whisper-prompt 0.078、whisper-noprompt 0.080、whisper-batched 0.029（但每 10 分鐘只切 16–22 段，時間點太粗）、sensevoice 0.031、paraformer 0.054。發現兩種要加進過濾器的幻聽：whisper 夾著「好」的重複迴圈（「你怎麼知道，好，你怎麼知道……」）、batched 把提示詞吐出來（「中文逐字稿：陰陽、表裡……」重複）。「說白傷寒論」確認是梁冬對話郭生白，不轉
   - [ ] 使用者校對 15 分鐘參考答案（草稿與 mp3 在 Mac 桌面「倪師校對」），再用 `bakeoff_score.py` 評分、選模型。評分時已會忽略語助詞、把數字轉成中文念法、把症／證視為同字（2026-09-25）。幻聽過濾已補上段內重複迴圈與提示詞外洩（用 25 份實際結果驗證，只動到真正的幻聽）
-  - [ ] 全量抽音訊：影片資料夾 440 個檔轉 16kHz FLAC（2026-09-25 進行中，GPU VM 的 systemd 服務 `haixia-extract`），完成後上傳 `audio/`、停機
+  - [x] 全量抽音訊：影片資料夾 440 個檔轉 16kHz 單聲道 FLAC，放在 `gs://haixiani-bot-data-507014/audio/<raw 相對路徑>.flac`（440 個、23.6 GiB，0 個失敗；2026-09-25 完成後 GPU VM 已停機）
   - [ ] 全量轉錄
 - [ ] 第三步：校對、切段、建索引
 - [ ] 第四步：Claude 問答
