@@ -35,6 +35,10 @@
 | `scripts/setup_worker.sh` | 在 VM 上安裝 rclone、ffmpeg 等工具 |
 | `scripts/transfer.sh` | 把 Drive 資料夾複製到 GCS |
 | `scripts/inventory.py` | 盤點檔案類型、大小與影音時數 |
+| `scripts/sample_frames.py` | 每門課抽幾部影片截圖，拼成總覽圖，檢查有沒有燒進畫面的字幕 |
+| `haixia/textnorm.py` | 簡轉正體（含中醫詞典與台灣用字）與搜尋比對鍵 |
+| `data/` | 中醫正體詞表與轉換規則 |
+| `tests/` | 測試（`python -m pytest`） |
 
 ## 注意
 
