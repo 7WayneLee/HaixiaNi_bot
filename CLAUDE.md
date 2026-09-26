@@ -120,6 +120,16 @@
       - 帳號的電子郵件不寫進 repo，因為 repo 是公開的。
     - 11:56 依使用者要求重新加入 Codex gpt-6-sol（medium），以接力模式在 Antigravity 沒額度時補空檔，週額度 80%、5 小時額度 85% 的上限不變。
     - 執行參數：`--engines agy,codex --codex-mode relay --agy-jobs 4 --codex-jobs 4 --quota-poll-min 10`。
+    - 2026-09-26 14:48，Codex 回報「Your workspace is out of credits. Add credits to continue.」：
+      - 當時 Orca 顯示 5 小時額度 71%、本週 62%，看不出點數已用完；
+      - 請使用者確認是否有扣到付費點數；
+      - Codex 批次先停用；
+      - 程式把這個錯誤當成一般錯誤一直重試，重新開 Codex 前要先改成遇到就停用 Codex。
+    - 16:06 依使用者要求**暫停校正**，等使用者回家換 Gemini 帳號。
+      - 暫停時的狀態：A 本週額度用完，約 9/28 12:28 重設；B 用完，10/3 重設；C 還有約 83%。
+      - 已完成 112/440 檔、913 段，全部 ok：Antigravity 596 段、Codex 317 段。
+      - 校正版已備份到 `gs://haixiani-bot-data-507014/transcripts/corrected/`（112 個，rclone check 相符）。
+      - 恢復時要重啟校正程式和監視程式：監視程式看到 aborted 就會自行結束。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
