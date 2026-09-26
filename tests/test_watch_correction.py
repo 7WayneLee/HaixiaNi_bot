@@ -164,3 +164,38 @@ def test_terminal_status_sends_once_and_exits(monitor, state, subject, capsys):
     if state == "finished":
         assert "影片/甲.rm" in output and "影片/乙.rm" in output
     assert len(sent(calls)) == 1 and "status" in sent(calls)[0]
+
+
+def test_weekly_quota_asks_to_switch_account(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    weekly = 'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 52h20m12s."}'
+    status.update(state="paused", paused_until=(current[0] + timedelta(minutes=40)).isoformat(),
+                  engines={"agy": {"state": "paused", "reason": weekly}})
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "ALERT" in output and "Antigravity 週額度用完" in output and "約 52 小時" in output
+    assert len(sent(calls)) == 1
+
+    def later(hours):  # 程式每小時重試一次、再次暫停
+        current[0] += timedelta(hours=hours)
+        status["paused_until"] = (current[0] + timedelta(minutes=40)).isoformat()
+        save()
+
+    later(1)
+    watcher.check_once()
+    assert len(sent(calls)) == 1
+    later(6)
+    watcher.check_once()
+    assert len(sent(calls)) == 2
+    status["engines"]["agy"]["reason"] = weekly.replace("52h20m12s", "30m23s")
+    later(7)
+    watcher.check_once()
+    assert len(sent(calls)) == 2
+
+
+def test_long_reset_hours_parses_units():
+    assert watch.long_reset_hours("Resets in 2h31m45s") is None
+    assert round(watch.long_reset_hours("Resets in 52h20m12s")) == 52
+    assert watch.long_reset_hours("Resets in 2d4h") == 52
+    assert watch.long_reset_hours("") is None

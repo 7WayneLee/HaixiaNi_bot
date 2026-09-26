@@ -26,6 +26,20 @@ def parse_time(value, tz):
         return None
 
 
+LONG_RESET = re.compile(r"Resets\s+in\s+((?:\d+[dhms])+)", re.I)
+
+
+def long_reset_hours(text):
+    """額度錯誤的重設倒數超過 6 小時（通常是週額度）時回傳小時數，否則回傳 None。"""
+    longest = 0
+    for match in LONG_RESET.finditer(text or ""):
+        units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+        seconds = sum(int(number) * units[unit.lower()]
+                      for number, unit in re.findall(r"(\d+)([dhms])", match.group(1), re.I))
+        longest = max(longest, seconds)
+    return longest / 3600 if longest > 6 * 3600 else None
+
+
 def pid_alive(pid):
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
@@ -213,6 +227,17 @@ class CorrectionWatcher:
             self.last_quota_pause = quota_key
         if state != "paused":
             self.last_quota_pause = None
+
+        # 週額度用完時請使用者換 Gemini 帳號；同一類通知 6 小時內只送一次。
+        agy = (status.get("engines") or {}).get("agy") or {}
+        agy_paused = agy.get("state") == "paused" if agy else state == "paused"
+        weekly = long_reset_hours(str(agy.get("reason") or status.get("last_error") or "")) if agy_paused else None
+        kind = "Antigravity 週額度用完"
+        previous = self.last_alert.get(kind)
+        if weekly is not None and (previous is None or now - previous >= timedelta(hours=6)):
+            self.active_alerts.discard(kind)
+            self.alert(kind, f"錯誤訊息顯示約 {weekly:.0f} 小時後才重設，請切換到另一個 Gemini 帳號；"
+                             "換好後校正程式最慢一小時內會自動接上", now)
 
         if (self.daily_status_hour >= 0 and now.hour >= self.daily_status_hour
                 and self.last_daily_date != now.date()):
