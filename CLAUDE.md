@@ -139,6 +139,11 @@
       - 每次 agy 呼叫加 `--log-file`（根層級旗標，要放在 `-p`／`models` 前面），解析 `applyAuthResult` 記下實際帳號。
       - `<work-dir>/expected-account` 寫預期帳號；不符就暫停 Antigravity 並通知，每 2 分鐘用不耗額度的 `agy models` 檢查，恢復後繼續。
       - 換帳號接力時，指揮要同時更新 expected-account；電子郵件只放在本機的 work-dir，不進 repo。
+    - 2026-09-26 20:07（台灣時間）依使用者要求**暫停**：
+      - 進度：已完成 151/440 檔、75.9/220.9 小時音訊，已輸出 1,209 段全部 ok（Antigravity 718、Codex 491）；另有部分段落在快取。
+      - 校正版已備份到 GCS（151 個，rclone check 相符）。
+      - 額度：Codex 本週到 81%（週上限 80% 已自動停用，10/2 08:40 重設）；C 帳號 5 小時額度 21:54 重設、週額度約剩 7 成；A 帳號 9/28 12:28 重設；B 帳號 10/3 重設。
+      - 恢復時照原參數重啟校正程式（`--engines agy,codex --codex-mode relay … --quota-poll-min 10`）和監視程式（`--interval-min 2`），expected-account 設成要用的帳號。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
