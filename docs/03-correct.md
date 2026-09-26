@@ -71,7 +71,7 @@ Codex 在 repo 外的 `工作目錄/codex-ws/` 空資料夾執行，stdin 關閉
 
 Antigravity 的額度每 5 小時重設一次，所有模型共用。額度錯誤若提供 `Resets in` 倒數，Antigravity worker 會暫停至預計重設時間再加 2 分鐘（加了 `--quota-poll-min` 時最多只停那麼久，見下方「換 Gemini 帳號接力」）；多個 worker 回報不同時間時取最晚的。倒數缺失或不合理時，才從 5 分鐘起指數退避，最多 60 分鐘。額度暫停不扣段落重試次數。網路錯誤、空輸出或其他 CLI 錯誤若連續三次出現，也會啟動該引擎的斷路暫停；暫停中其他 worker 回報的錯誤不會提高退避等級。成功呼叫會清除連續錯誤計數。`工作目錄/logs/correct.log` 有每段結果、仍有 failed 段的檔名和每五分鐘進度；`工作目錄/status.json` 有 `running`、`paused`、`finished`、`aborted` 狀態、PID、啟動時間、最後完成段落時間、已知額度重設時間、下次嘗試時間、計數與最後錯誤。
 
-雙引擎模式下，額度暫停、斷路器和連線錯誤各自計算，不會暫停另一個引擎。`status.json` 的 `engines` 區塊記錄各引擎狀態、暫停時間、原因、完成段數與平均耗時；Codex 另記最近的 session／weekly 使用百分比。`codex_mode` 和 `active_engines` 顯示接力／並行模式及目前正在呼叫的引擎。監視程式對非額度原因停止的引擎發警報；Codex 達週上限僅記 INFO。
+雙引擎模式下，額度暫停、斷路器和連線錯誤各自計算，不會暫停另一個引擎。`status.json` 的 `engines` 區塊記錄各引擎狀態、暫停時間、原因、完成段數與平均耗時；Codex 另記最近的 session／weekly 使用百分比。`codex_mode` 和 `active_engines` 顯示接力／並行模式及目前正在呼叫的引擎。監視程式對非額度原因停止的引擎發警報；停止原因是額度錯誤（含 `RESOURCE_EXHAUSTED`、`429`、`quota` 或「額度」）時只記 INFO，Codex 達週上限也只記 INFO。校正程式中止或結束時，狀態檔會把各引擎標成 stopped 並沿用最後一次的錯誤，所以整體狀態是 `aborted` 或 `finished` 時不檢查引擎停止，只送結束通知。
 
 建議在**另一個 Orca 終端機分頁**啟動不用 AI 的監視程式，檢查 PID、進度、log 與磁碟。它只讀校正資料，僅寫自己的 `logs/watch.log`；異常才發 ALERT。可選擇將警報及每日摘要送到 Orca Run；先把 `RUN_ID` 設成目標 Run ID：
 
@@ -85,6 +85,8 @@ Antigravity 的額度每 5 小時重設一次，所有模型共用。額度錯�
 ```
 
 預設每 10 分鐘檢查一次；帳號接力時建議 `--interval-min 2`，額度用完的通知才夠即時。另可用 `--min-free-gb` 設磁碟警戒值、`--orca-bin` 指定 Orca 執行檔。每天 9 點後首次檢查會送進度摘要；用 `--daily-status-hour -1` 關閉。執行結束或手動中止時，監視程式會送最後狀態並自行結束。
+
+送到 Orca 的訊息一律用 `status` 類型：監視程式不是 Orca worker，送 `escalation` 會被拒收（`sender_not_assignee`）。所以用標題區分：警報是「校正監視警報：<類型>」（例如「校正監視警報：Antigravity 額度用完，請切換 Gemini 帳號」），每日進度是「校正每日進度」，結束時是「校正執行結束」或「校正已手動中止」。
 
 ## Antigravity 額度用完時換 Gemini 帳號接力
 

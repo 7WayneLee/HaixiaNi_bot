@@ -58,6 +58,45 @@ def test_engine_stops_weekly_info_other_alert(monitor, capsys):
     assert len(sent(calls)) == 1
 
 
+AGY_QUOTA = ('AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. '
+             'Resets in 2h16m17s."}')
+
+
+@pytest.mark.parametrize("state,subject", [("finished", "校正執行結束"), ("aborted", "校正已手動中止")])
+def test_terminal_state_skips_engine_stop_alerts(monitor, state, subject, capsys):
+    watcher, status, save, _current, _free, calls = monitor
+    status.update(state=state, pid=0,
+                  engines={"agy": {"state": "stopped", "reason": AGY_QUOTA},
+                           "codex": {"state": "stopped", "reason": "CLI 損壞"}})
+    save()
+    assert watcher.check_once()
+    output = capsys.readouterr().out
+    assert "ALERT" not in output and "引擎停止" not in output
+    assert [call[7] for call in sent(calls)] == [subject]
+
+
+@pytest.mark.parametrize("reason", [AGY_QUOTA, "RESOURCE_EXHAUSTED", "HTTP 429 Too Many Requests",
+                                    "Quota exceeded for this model", "Antigravity 額度用完"])
+def test_engine_stop_for_quota_is_info_only(monitor, reason, capsys):
+    watcher, status, save, _current, _free, calls = monitor
+    status["engines"] = {"agy": {"state": "stopped", "reason": reason}}
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "INFO" in output and "agy 引擎因額度停止" in output
+    assert "ALERT" not in output and not sent(calls)
+
+
+@pytest.mark.parametrize("reason", ["CLI 損壞", "連線逾時 5 次", "PID 4290 無回應"])
+def test_engine_stop_for_other_errors_still_alerts(monitor, reason, capsys):
+    watcher, status, save, _current, _free, calls = monitor
+    status["engines"] = {"agy": {"state": "stopped", "reason": reason}}
+    save()
+    watcher.check_once()
+    assert f"ALERT 2026-09-26 08:00:00 agy 引擎停止：{reason}" in capsys.readouterr().out
+    assert [call[5:8] for call in sent(calls)] == [["status", "--subject", "校正監視警報：agy 引擎停止"]]
+
+
 @pytest.mark.parametrize("kind", ["程式意外結束", "卡住", "暫停逾時", "新的失敗段", "斷路器暫停", "磁碟空間不足"])
 def test_every_alert_uses_fake_orca(monitor, kind, capsys):
     watcher, status, save, current, free, calls = monitor
@@ -83,7 +122,20 @@ def test_every_alert_uses_fake_orca(monitor, kind, capsys):
     calls_data = sent(calls)
     assert len(calls_data) == 1
     assert calls_data[0][:5] == ["orchestration", "send", "--to", "run:run_fake", "--type"]
-    assert calls_data[0][5] == "escalation" and calls_data[0][-1] == "--json"
+    assert calls_data[0][5] == "status" and calls_data[0][-1] == "--json"
+    assert calls_data[0][6:8] == ["--subject", f"校正監視警報：{kind}"]
+
+
+def test_alert_uses_status_type_with_alert_subject(monitor):
+    watcher, status, save, current, _free, calls = monitor
+    watcher.daily_status_hour = 8
+    status["pid"] = 43
+    save()
+    watcher.check_once()
+    alert, daily = sent(calls)
+    assert alert[4:8] == ["--type", "status", "--subject", "校正監視警報：程式意外結束"]
+    assert "escalation" not in alert
+    assert daily[4:8] == ["--type", "status", "--subject", "校正每日進度"]
 
 
 def test_alert_dedup_resend_and_clear(monitor):
@@ -217,8 +269,8 @@ def test_quota_round_alerts_once_per_round(monitor, capsys):
     assert "5 小時額度用完" in output and "預計 09/26 10:31 重設（約 2.5 小時後）" in output
     assert "/logout" in output and str(watcher.work_dir / "resume-now") in output
     assert "最多 10 分鐘" in output and "額度暫停" not in output
-    assert len(sent(calls)) == 1 and sent(calls)[0][5] == "escalation"
-    assert "校正監視：Antigravity 額度用完，請切換 Gemini 帳號" in sent(calls)[0]
+    assert len(sent(calls)) == 1 and sent(calls)[0][5] == "status"
+    assert "校正監視警報：Antigravity 額度用完，請切換 Gemini 帳號" in sent(calls)[0]
 
     # 同一輪：試探中、再次暫停、訊息更新都不重送。
     for state in ("running", "paused"):

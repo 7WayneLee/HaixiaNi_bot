@@ -28,6 +28,7 @@ def parse_time(value, tz):
 
 LONG_RESET = re.compile(r"Resets\s+in\s+((?:\d+[dhms])+)", re.I)
 QUOTA_ROUND = "Antigravity 額度用完，請切換 Gemini 帳號"
+QUOTA_ERROR = re.compile(r"RESOURCE_EXHAUSTED|\b429\b|quota|額度", re.I)
 
 
 def reset_seconds(text):
@@ -113,7 +114,8 @@ class CorrectionWatcher:
         if kind in self.active_alerts and previous and now - previous < timedelta(hours=6):
             return False
         self.write("ALERT", now, kind, description)
-        self.notify("escalation", f"校正監視：{kind}", description, now)
+        # 監視程式不是 Orca worker，escalation 會被拒收；改用 status，靠 subject 區分警報。
+        self.notify("status", f"校正監視警報：{kind}", description, now)
         self.active_alerts.add(kind)
         self.last_alert[kind] = now
         return True
@@ -192,18 +194,6 @@ class CorrectionWatcher:
             self.alert("狀態讀取失敗", str(error), now)
             return False
         self.alert("狀態讀取失敗", "", now, False)
-        for engine, detail in status.get("engines", {}).items():
-            if detail.get("state") != "stopped":
-                continue
-            reason = str(detail.get("reason") or "")
-            key = (engine, reason)
-            if key in self.engine_stops_seen:
-                continue
-            self.engine_stops_seen.add(key)
-            if engine == "codex" and "週額度" in reason:
-                self.write("INFO", now, "Codex 週額度停止", reason)
-            elif reason != "執行結束":
-                self.alert(f"{engine} 引擎停止", reason, now)
         state = status.get("state")
         if state == "finished":
             names = self.failed_filenames(status)
@@ -216,6 +206,22 @@ class CorrectionWatcher:
             self.write("STATUS", now, "校正已手動中止", body)
             self.notify("status", "校正已手動中止", body, now)
             return True
+
+        # 中止或結束時，狀態檔會把引擎都標成 stopped 並沿用最後的錯誤，所以只在執行中檢查。
+        for engine, detail in status.get("engines", {}).items():
+            if detail.get("state") != "stopped":
+                continue
+            reason = str(detail.get("reason") or "")
+            key = (engine, reason)
+            if key in self.engine_stops_seen:
+                continue
+            self.engine_stops_seen.add(key)
+            if engine == "codex" and "週額度" in reason:
+                self.write("INFO", now, "Codex 週額度停止", reason)
+            elif QUOTA_ERROR.search(reason):
+                self.write("INFO", now, f"{engine} 引擎因額度停止", reason)
+            elif reason != "執行結束":
+                self.alert(f"{engine} 引擎停止", reason, now)
 
         self.alert("程式意外結束", f'PID {status.get("pid")} 已不存在，state={state}', now,
                    not self.pid_alive_fn(status.get("pid")))
