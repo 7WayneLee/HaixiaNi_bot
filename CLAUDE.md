@@ -113,6 +113,13 @@
       - `touch ~/haixia-correct-work/resume-now` 可以立刻重試。
       - 監視程式用 `--interval-min 2` 執行：每一輪額度用完（5 小時或週額度）都送一次「Antigravity 額度用完，請切換 Gemini 帳號」。
       - 指揮收到後轉告使用者；使用者在 agy 互動模式 `/logout` 換帳號後，指揮 `touch resume-now`。
+    - 2026-09-26 帳號狀況：
+      - A 帳號週額度剩約 17%。
+      - B 帳號的週額度很小，只跑了 22 段就用完，要到 10/3 才重設，請使用者確認方案。
+      - C 帳號週額度剩約 93%。
+      - 帳號的電子郵件不寫進 repo，因為 repo 是公開的。
+    - 11:56 依使用者要求重新加入 Codex gpt-6-sol（medium），以接力模式在 Antigravity 沒額度時補空檔，週額度 80%、5 小時額度 85% 的上限不變。
+    - 執行參數：`--engines agy,codex --codex-mode relay --agy-jobs 4 --codex-jobs 4 --quota-poll-min 10`。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
