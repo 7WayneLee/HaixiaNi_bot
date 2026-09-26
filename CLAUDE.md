@@ -144,6 +144,9 @@
       - 校正版已備份到 GCS（151 個，rclone check 相符）。
       - 額度：Codex 本週到 81%（週上限 80% 已自動停用，10/2 08:40 重設）；C 帳號 5 小時額度 21:54 重設、週額度約剩 7 成；A 帳號 9/28 12:28 重設；B 帳號 10/3 重設。
       - 恢復時照原參數重啟校正程式（`--engines agy,codex --codex-mode relay … --quota-poll-min 10`）和監視程式（`--interval-min 2`），expected-account 設成要用的帳號。
+    - 2026-09-26 20:41 使用者新增第 4 個 Gemini 帳號 D（週額度、5 小時額度都是 100%），expected-account 改成 D 後恢復校正，剩 289 檔、2,294 段。
+      - Orca 在這之前重新啟動過：分頁代號變了，scratchpad 被清空，等待用的小程式已重建。
+      - 校正分頁、監視分頁沿用原本的兩個空分頁，並重新命名。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
