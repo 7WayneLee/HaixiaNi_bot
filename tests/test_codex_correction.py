@@ -42,7 +42,8 @@ def fake(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("mode,attempts", [("normal", 1), ("missing_once", 2),
-                                           ("disconnect_once", 2), ("usage_limit_once", 2)])
+                                           ("disconnect_once", 2), ("usage_limit_once", 2),
+                                           ("out_of_credits_once", 2)])
 def test_codex_attempts(fake, monkeypatch, mode, attempts):
     args, output, tmp = fake
     monkeypatch.setenv("FAKE_CODEX_MODE", mode)
@@ -56,7 +57,7 @@ def test_codex_attempts(fake, monkeypatch, mode, attempts):
     assert doc["correction"]["chunks"][0]["attempts"] == attempts
     assert doc["correction"]["tool"] == "codex-cli"
     attempt = next((tmp / "work/chunks").rglob("*.attempt1.json"))
-    if mode not in {"disconnect_once", "usage_limit_once"}:
+    if mode not in {"disconnect_once", "usage_limit_once", "out_of_credits_once"}:
         assert json.loads(attempt.read_text())["usage"]["input_tokens"] == 100
     if mode == "disconnect_once":
         for path in (tmp / "work/chunks").rglob("*.attempt*.json"):
@@ -152,3 +153,97 @@ def test_codex_quota_pause_does_not_stop_agy(fake, monkeypatch):
     doc = validate_corrected(json.loads(output.read_text()))
     assert all(chunk["engine"] == "antigravity-cli" for chunk in doc["correction"]["chunks"])
     assert json.loads((tmp / "work/status.json").read_text())["engines"]["codex"]["state"] == "paused"
+
+
+CREDITS = "Your workspace is out of credits. Add credits to continue."
+
+
+def credits_response():
+    """run_codex 的回傳格式：stdout 的 JSON 事件接在 stderr 後面。"""
+    stdout = "\n".join(json.dumps(event) for event in (
+        {"type": "error", "message": CREDITS},
+        {"type": "turn.failed", "error": {"message": CREDITS}}))
+    return {"output": "", "stderr": "\n" + stdout, "exit_code": 1, "elapsed_sec": 3.5,
+            "searches": 0, "usage": {}, "command_executions": 0}
+
+
+@pytest.mark.parametrize("message", [CREDITS, "out of credits", "Add credits to continue."])
+def test_out_of_credits_is_quota(message):
+    response = dict(credits_response(), stderr=message)
+    assert cli.error_kind(response)[0] == "quota"
+    assert cli.error_kind(credits_response())[0] == "quota"
+
+
+def test_out_of_credits_pauses_codex_until_session_reset(fake, monkeypatch):
+    _args, _output, tmp = fake
+    monkeypatch.setenv("FAKE_ORCA_RESET_OFFSET", "600")
+    shared = cli.SharedState(tmp / "quota", 1, 1.0)
+    state = cli.CodexState(shared, __import__("logging").getLogger("fake"), 80, 85)
+    shared.engines["codex"] = state
+    before = cli.time.time()
+    kind, reason = cli.error_kind(credits_response())
+    assert state.note_error(kind, reason)
+    assert state.state == "paused" and state.errors == 0
+    assert before + 720 <= state.pause_until <= cli.time.time() + 721
+    assert state.reason == "Codex 回報額度用完"
+    # Antigravity 的暫停與斷路器不受影響。
+    assert shared.pause_until == 0 and shared.consecutive_errors == 0 and shared.quota_since is None
+
+
+def test_out_of_credits_not_failure_or_breaker(fake, monkeypatch):
+    args, output, tmp = fake
+    monkeypatch.setenv("FAKE_CODEX_MODE", "out_of_credits")
+    monkeypatch.setenv("FAKE_CODEX_FAILS", "3")
+    monkeypatch.setenv("FAKE_CODEX_COUNTER", str(tmp / "counter"))
+    monkeypatch.setenv("FAKE_ORCA_RESET_OFFSET", "-121")
+    # --retries 0：算成段落失敗的話，第一次錯誤就會讓這段 failed。
+    assert cli.main(args + ["--retries", "0"]) == 0
+    doc = validate_corrected(json.loads(output.read_text()))
+    assert all(chunk["status"] == "ok" for chunk in doc["correction"]["chunks"])
+    assert doc["correction"]["chunks"][0]["attempts"] == 4
+    status = json.loads((tmp / "work/status.json").read_text())
+    assert status["chunks_failed"] == 0 and status["retries"] == 0
+    log = (tmp / "work/logs/correct.log").read_text()
+    assert log.count("呼叫錯誤（quota）") == 3 and "Codex 暫停：Codex 額度錯誤" in log
+    assert "呼叫錯誤（other）" not in log and "連續" not in log
+
+
+def test_relay_agy_unaffected_by_codex_credits(fake, monkeypatch):
+    args, output, tmp = fake
+    monkeypatch.setenv("FAKE_CODEX_MODE", "out_of_credits")
+    monkeypatch.setenv("FAKE_CODEX_CALL_LOG", str(tmp / "codex.calls"))
+    monkeypatch.setenv("FAKE_ORCA_RESET_OFFSET", "-121")
+    both = args[:]
+    both[both.index("codex")] = "agy,codex"
+    assert cli.main(both + ["--agy-jobs", "1"]) == 0
+    doc = validate_corrected(json.loads(output.read_text()))
+    assert all(chunk["engine"] == "antigravity-cli" and chunk["status"] == "ok"
+               for chunk in doc["correction"]["chunks"])
+    assert not (tmp / "codex.calls").exists()
+    status = json.loads((tmp / "work/status.json").read_text())
+    assert status["codex_mode"] == "relay" and status["chunks_failed"] == 0
+    assert status["agy_quota_exhausted_since"] is None and status["consecutive_errors"] == 0
+
+
+def test_relay_codex_credits_requeues_to_agy(fake, monkeypatch):
+    args, output, tmp = fake
+    monkeypatch.setenv("FAKE_AGY_MODE", "quota_once")
+    monkeypatch.setenv("FAKE_AGY_FLAG", str(tmp / "agy.flag"))
+    monkeypatch.setenv("FAKE_CODEX_MODE", "out_of_credits")
+    monkeypatch.setenv("FAKE_CODEX_CALL_LOG", str(tmp / "codex.calls"))
+    monkeypatch.setenv("FAKE_ORCA_RESET_OFFSET", "600")
+    monkeypatch.setenv("HAIXIA_BACKOFF_BASE_SEC", "0.3")
+    monkeypatch.setenv("HAIXIA_BACKOFF_MAX_SEC", "0.3")
+    both = args[:]
+    both[both.index("codex")] = "agy,codex"
+    assert cli.main(both + ["--agy-jobs", "1", "--retries", "0"]) == 0
+    doc = validate_corrected(json.loads(output.read_text()))
+    assert all(chunk["engine"] == "antigravity-cli" and chunk["status"] == "ok"
+               for chunk in doc["correction"]["chunks"])
+    assert (tmp / "codex.calls").read_text().split() == ["1"]
+    status = json.loads((tmp / "work/status.json").read_text())
+    assert status["chunks_failed"] == 0
+    assert status["engines"]["codex"]["state"] == "paused"
+    assert status["engines"]["codex"]["reason"] == "Codex 回報額度用完"
+    assert status["agy_quota_exhausted_since"] is None
+    assert "連續" not in (tmp / "work/logs/correct.log").read_text()

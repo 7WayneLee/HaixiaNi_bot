@@ -24,7 +24,9 @@ from haixia.correction import (build_prompt, choose_result, corrected_document, 
 from haixia.transcript import save_corrected, validate, validate_corrected
 
 ROOT = Path(__file__).resolve().parents[1]
-QUOTA = re.compile(r"RESOURCE_EXHAUSTED|\b429\b|quota|rate.?limit|too many requests|usage limit|額度|限速", re.I)
+# Codex 額度用完時回「Your workspace is out of credits. Add credits to continue.」（2026-09-26 實測，5 小時額度重設後恢復）。
+QUOTA = re.compile(r"RESOURCE_EXHAUSTED|\b429\b|quota|rate.?limit|too many requests|usage limit|"
+                   r"out of credits|add credits|額度|限速", re.I)
 NETWORK = re.compile(r"connection|network|dns|timed? ?out|unreachable|unavailable|socket|ECONN|ENET|連線|網路", re.I)
 SECRET = re.compile(r"sk-[A-Za-z0-9*_\-]+")
 OUTPUT_LINE = re.compile(r"^\s*\[\d+(?:\.\d+)?\]", re.M)

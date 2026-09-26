@@ -38,6 +38,14 @@ if mode == "usage_limit_once" and number == 1:
     print("Usage limit reached. You've reached your usage limit.", file=sys.stderr)
     print(json.dumps({"type": "turn.failed"}))
     sys.exit(1)
+# 2026-09-26 實際遇到的 Codex 額度用完：error 事件接 turn.failed，結束碼 1。
+# out_of_credits 在前 FAKE_CODEX_FAILS 次呼叫（沒設定時每次）都失敗。
+if ((mode == "out_of_credits_once" and number == 1) or
+        (mode == "out_of_credits" and number <= int(os.environ.get("FAKE_CODEX_FAILS", sys.maxsize)))):
+    message = "Your workspace is out of credits. Add credits to continue."
+    print(json.dumps({"type": "error", "message": message}))
+    print(json.dumps({"type": "turn.failed", "error": {"message": message}}))
+    sys.exit(1)
 prompt = sys.argv[-1]
 body = prompt.split("## 要校正的行（共 ", 1)[1].split("\n", 1)[1].split("\n## 後文", 1)[0]
 lines = [line.replace("麻黄", "麻黃") for line in body.splitlines()

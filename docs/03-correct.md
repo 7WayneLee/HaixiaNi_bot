@@ -63,7 +63,7 @@ caffeinate -i .venv/bin/python scripts/correct_transcripts.py \
 
 每段只由一個引擎持有並完成重試。額度暫停是例外：尚未成功的段會放回佇列前端，供另一個引擎從頭處理。兩個引擎使用完全相同的校正提示詞。每段中繼資料記錄 `engine`、`model`、`effort`；一份檔案若由兩個引擎完成，`correction.tool` 為 `mixed`。
 
-Codex 在 repo 外的 `工作目錄/codex-ws/` 空資料夾執行，stdin 關閉，網路搜尋設為 `cached`；這台機器的 `live` 搜尋會遇到授權錯誤。Codex 每次呼叫前檢查 Orca 額度，最多每 60 秒查一次。週額度達 `--codex-weekly-max`（預設 80%）時，本次執行停用 Codex，Antigravity 繼續；session 達 `--codex-session-max`（預設 85%）時，Codex 暫停到 `resetsAt` 後 2 分鐘。Codex 自己回報 usage limit 或 HTTP 429 也按 session 重設時間暫停；資料讀不到時保守暫停 15 分鐘。websocket 斷線後接 401 的錯誤視為暫時性連線錯誤重試，並非額度用完。錯誤訊息內的 `sk-` 金鑰字串會在 log、狀態與快取中遮蔽。
+Codex 在 repo 外的 `工作目錄/codex-ws/` 空資料夾執行，stdin 關閉，網路搜尋設為 `cached`；這台機器的 `live` 搜尋會遇到授權錯誤。Codex 每次呼叫前檢查 Orca 額度，最多每 60 秒查一次。週額度達 `--codex-weekly-max`（預設 80%）時，本次執行停用 Codex，Antigravity 繼續；session 達 `--codex-session-max`（預設 85%）時，Codex 暫停到 `resetsAt` 後 2 分鐘。Codex 自己回報 usage limit、HTTP 429，或「Your workspace is out of credits. Add credits to continue.」（2026-09-26 實測是 5 小時額度用完，重設後就恢復），都算額度錯誤：按 session 重設時間加 2 分鐘暫停，重設時間不明時用指數退避；不算段落失敗，也不觸發斷路器。資料讀不到時保守暫停 15 分鐘。websocket 斷線後接 401 的錯誤視為暫時性連線錯誤重試，並非額度用完。錯誤訊息內的 `sk-` 金鑰字串會在 log、狀態與快取中遮蔽。
 
 ## 暫停、續跑與監看
 
