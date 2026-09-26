@@ -17,7 +17,7 @@
 | VM 的 rclone | v1.75.0；remote 叫 `gdrive`（Drive）和 `gcs`（GCS，`env_auth`），跟腳本預設一樣，不用設 `DRIVE_REMOTE`／`GCS_REMOTE`。Drive 的 token 在 2026-09-25 過期過，使用者已重新授權 |
 | VM 的 GCS 權限 | access scope 是 `cloud-platform`，可以寫 GCS，不用停機改設定。服務帳號是預設的 Compute Engine 服務帳號 |
 | VM 的限制 | 這台 VM 還跑著其他常駐服務（包括用同一個 `gdrive` remote 的 WebDAV），可用記憶體只有約 300MB。第一步搬資料時暫停過這些服務，2026-09-25 第一步完成後已全部恢復（指令記在 VM 的 `~/haixia-stopped-services.txt`）。之後的重工作都在 GPU VM 上跑，不要再佔用這台。repo clone 在 VM 的 `~/HaixiaNi_bot`，`setup_worker.sh` 已跑過（tmux、ffmpeg、fuse3 已安裝） |
-| GPU VM | `haixia-gpu`，us-central1-a，g2-standard-4（1 張 L4，23GB），**一般計費（STANDARD）**，映像檔 `common-cu129-ubuntu-2404-nvidia-580`，200GB 開機磁碟，network tag `haixia-gpu`。2026-09-25 的經過：第一台 Spot 開機 11 分鐘就被收回；改成一般計費後，us-central1-a 的 L4 又整區缺貨；刪掉重建時，b、c 兩區的 L4 和 a、b、c、f 四區的 T4 也都缺貨，最後在 a 區有容量時建成。專案的防火牆預設只允許使用者家裡的 IP 連 SSH，所以另外建了規則 `haixia-gpu-ssh-from-movie-nas`：只允許 movie-nas 內部 IP 連 tcp:22，只套用到有 `haixia-gpu` tag 的 VM。操作方式：在 movie-nas 上 `gcloud compute ssh haixia-gpu --zone us-central1-a --internal-ip`。長時間工作一定要用會回報失敗狀態的監視（VM 狀態、工作程序、log 是否更新、SSH、log 裡新的「失敗」）。**DLVM 映像檔開機約 30 分鐘後會自動跑 unattended-upgrades，連 systemd 都會重新載入、重啟一批服務，把 tmux 裡的工作殺掉（2026-09-25 發生過）**：所以 setup 之後要先 `sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service`，長時間工作要用 `sudo systemd-run --unit=<名稱> --uid=… --working-directory=…` 以 systemd 服務的方式跑，不要放在 SSH 連線底下的 tmux 裡。（已寫進 setup_gpu.sh，長時間工作用 `scripts/gpu_job.sh start <名稱> -- <指令>`）刪 VM 時一併刪掉這條規則 |
+| GPU VM | **2026-09-26 全量轉錄完成後，經使用者同意刪除**，連同 200GB 磁碟和防火牆規則 `haixia-gpu-ssh-from-movie-nas`。之後需要時（例如第三步算 embedding，也可以改用 CPU VM）用 `scripts/create_gpu_vm.sh` 重建，並重建防火牆規則。以下是當時的設定與經驗：`haixia-gpu`，us-central1-a，g2-standard-4（1 張 L4，23GB），**一般計費（STANDARD）**，映像檔 `common-cu129-ubuntu-2404-nvidia-580`，200GB 開機磁碟，network tag `haixia-gpu`。2026-09-25 的經過：第一台 Spot 開機 11 分鐘就被收回；改成一般計費後，us-central1-a 的 L4 又整區缺貨；刪掉重建時，b、c 兩區的 L4 和 a、b、c、f 四區的 T4 也都缺貨，最後在 a 區有容量時建成。專案的防火牆預設只允許使用者家裡的 IP 連 SSH，所以另外建了規則 `haixia-gpu-ssh-from-movie-nas`：只允許 movie-nas 內部 IP 連 tcp:22，只套用到有 `haixia-gpu` tag 的 VM。操作方式：在 movie-nas 上 `gcloud compute ssh haixia-gpu --zone us-central1-a --internal-ip`。長時間工作一定要用會回報失敗狀態的監視（VM 狀態、工作程序、log 是否更新、SSH、log 裡新的「失敗」）。**DLVM 映像檔開機約 30 分鐘後會自動跑 unattended-upgrades，連 systemd 都會重新載入、重啟一批服務，把 tmux 裡的工作殺掉（2026-09-25 發生過）**：所以 setup 之後要先 `sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service`，長時間工作要用 `sudo systemd-run --unit=<名稱> --uid=… --working-directory=…` 以 systemd 服務的方式跑，不要放在 SSH 連線底下的 tmux 裡。（已寫進 setup_gpu.sh，長時間工作用 `scripts/gpu_job.sh start <名稱> -- <指令>`）刪 VM 時一併刪掉這條規則 |
 | GitHub | `7WayneLee/HaixiaNi_bot`（公開 repo）。第一步的腳本與文件已 push（2026-09-25） |
 
 ## 已定案的架構
@@ -129,6 +129,8 @@
 - 架設整個系統（第一步到第六步）的總預算約 **1,100 台幣**（約 34 美元，以 1 美元 ≈ 32 台幣估算），**不含**之後 bot 問答用的 Claude API 費用。
 - 2026-09-25 估算：已花約 97 台幣（跨區傳輸、GPU 約 2 小時）；第二步只跑 Whisper 約 450 台幣，加跑 Paraformer 再多約 290 台幣；GCS 每月約 64 台幣。
 - 因為預算緊，有三個原則：(1) 大量的 LLM 校正用訂閱額度（Antigravity 的 Gemini），不走付費 API；(2) GPU VM 不用就刪掉，停機時 200GB 磁碟每天約 21 台幣；(3) 使用者要求 GCS 上保留一份原始資料，所以 `raw/` 不刪（原本打算第二步後刪掉），而且維持標準儲存等級，不轉封存（2026-09-25 使用者決定；每月約 46 台幣）。音訊第三步後再決定。
+- 2026-09-26 粗估：已花約 580 台幣（搬資料與跨區傳輸約 100、GPU 轉錄與 bakeoff 約 20 小時約 450，另有零星的磁碟與儲存費），實際以帳單為準。GPU VM 已刪除。
+- 之後持續的費用：GCS 每月約 61 台幣。movie-nas 是使用者原本就有的，不算在這個專案裡。
 - 任何會增加花費的新做法，先估算、先問使用者。
 
 ## 工作守則
