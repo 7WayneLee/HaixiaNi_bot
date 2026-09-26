@@ -199,3 +199,89 @@ def test_long_reset_hours_parses_units():
     assert round(watch.long_reset_hours("Resets in 52h20m12s")) == 52
     assert watch.long_reset_hours("Resets in 2d4h") == 52
     assert watch.long_reset_hours("") is None
+
+
+def test_quota_round_alerts_once_per_round(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    five = 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h31m45s'
+    since = (current[0] - timedelta(minutes=1)).isoformat()
+    status.update(state="paused", paused_until=(current[0] + timedelta(minutes=9)).isoformat(),
+                  quota_resets_at=(current[0] + timedelta(hours=2, minutes=31)).isoformat(),
+                  agy_quota_exhausted_since=since, agy_quota_message=five, agy_quota_kind="five_hour",
+                  agy_quota_resets_at=(current[0] + timedelta(hours=2, minutes=31)).isoformat(),
+                  engines={"agy": {"state": "paused", "reason": five, "quota_poll_min": 10}})
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "ALERT" in output and "Antigravity 額度用完，請切換 Gemini 帳號" in output
+    assert "5 小時額度用完" in output and "預計 09/26 10:31 重設（約 2.5 小時後）" in output
+    assert "/logout" in output and str(watcher.work_dir / "resume-now") in output
+    assert "最多 10 分鐘" in output and "額度暫停" not in output
+    assert len(sent(calls)) == 1 and sent(calls)[0][5] == "escalation"
+    assert "校正監視：Antigravity 額度用完，請切換 Gemini 帳號" in sent(calls)[0]
+
+    # 同一輪：試探中、再次暫停、訊息更新都不重送。
+    for state in ("running", "paused"):
+        current[0] += timedelta(minutes=10)
+        status.update(state=state, updated_at=current[0].isoformat(),
+                      agy_quota_message=five.replace("2h31m45s", "2h21m"),
+                      paused_until=(current[0] + timedelta(minutes=10)).isoformat() if state == "paused" else None)
+        save()
+        watcher.check_once()
+    assert len(sent(calls)) == 1
+
+    # 換帳號後 agy 成功，欄位清空；不通知。
+    current[0] += timedelta(minutes=5)
+    status.update(state="running", paused_until=None, quota_resets_at=None, updated_at=current[0].isoformat(),
+                  last_progress_at=current[0].isoformat(), agy_quota_exhausted_since=None,
+                  agy_quota_message=None, agy_quota_kind=None, agy_quota_resets_at=None,
+                  engines={"agy": {"state": "running", "reason": None, "quota_poll_min": 10}})
+    save()
+    watcher.check_once()
+    assert len(sent(calls)) == 1
+
+    # 下一輪（週額度）即使在 6 小時內也再通知一次，文字不同。
+    weekly = five.replace("2h31m45s", "52h20m12s")
+    current[0] += timedelta(hours=1)
+    status.update(state="paused", paused_until=(current[0] + timedelta(minutes=10)).isoformat(),
+                  updated_at=current[0].isoformat(), last_progress_at=current[0].isoformat(),
+                  agy_quota_exhausted_since=current[0].isoformat(), agy_quota_message=weekly,
+                  agy_quota_kind="weekly", agy_quota_resets_at=(current[0] + timedelta(hours=52)).isoformat(),
+                  engines={"agy": {"state": "paused", "reason": weekly, "quota_poll_min": 10}})
+    save()
+    capsys.readouterr()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert len(sent(calls)) == 2
+    assert "週額度用完" in output and "約 52.0 小時後" in output and "5 小時額度" not in output
+    assert output.count("ALERT") == 1 and "錯誤訊息顯示約" not in output  # 舊版週額度警報不再另外送
+    watcher.check_once()
+    assert len(sent(calls)) == 2
+
+
+def test_quota_round_without_poll_or_reset_time(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    status.update(state="paused", agy_quota_exhausted_since=current[0].isoformat(),
+                  agy_quota_message="RESOURCE_EXHAUSTED", agy_quota_kind="five_hour",
+                  agy_quota_resets_at=None, engines={"agy": {"state": "paused", "quota_poll_min": None}})
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "重設時間不明" in output and "沒有設 --quota-poll-min" in output
+    assert len(sent(calls)) == 1
+
+
+def test_codex_quota_pause_does_not_ask_to_switch_account(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    status.update(state="paused", agy_quota_exhausted_since=None, agy_quota_message=None,
+                  agy_quota_kind=None, agy_quota_resets_at=None,
+                  engines={"codex": {"state": "paused", "reason": "Codex session 額度 90% 已達上限 85%",
+                                     "paused_until": (current[0] + timedelta(hours=2)).isoformat()}})
+    save()
+    watcher.check_once()
+    status["engines"]["codex"].update(state="stopped", reason="Codex 週額度 85% 已達上限 80%")
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "ALERT" not in output and "Codex 週額度停止" in output
+    assert not sent(calls)

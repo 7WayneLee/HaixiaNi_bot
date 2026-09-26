@@ -27,16 +27,23 @@ def parse_time(value, tz):
 
 
 LONG_RESET = re.compile(r"Resets\s+in\s+((?:\d+[dhms])+)", re.I)
+QUOTA_ROUND = "Antigravity 額度用完，請切換 Gemini 帳號"
 
 
-def long_reset_hours(text):
-    """額度錯誤的重設倒數超過 6 小時（通常是週額度）時回傳小時數，否則回傳 None。"""
+def reset_seconds(text):
+    """額度錯誤裡最長的重設倒數（秒）；沒有時回傳 0。"""
     longest = 0
     for match in LONG_RESET.finditer(text or ""):
         units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
         seconds = sum(int(number) * units[unit.lower()]
                       for number, unit in re.findall(r"(\d+)([dhms])", match.group(1), re.I))
         longest = max(longest, seconds)
+    return longest
+
+
+def long_reset_hours(text):
+    """額度錯誤的重設倒數超過 6 小時（通常是週額度）時回傳小時數，否則回傳 None。"""
+    longest = reset_seconds(text)
     return longest / 3600 if longest > 6 * 3600 else None
 
 
@@ -77,6 +84,7 @@ class CorrectionWatcher:
         self.last_quota_pause = None
         self.last_daily_date = None
         self.engine_stops_seen = set()
+        self.quota_round = None
 
     def write(self, level, now, kind, description):
         line = f"{level} {now:%Y-%m-%d %H:%M:%S} {kind}：{description}"
@@ -152,6 +160,27 @@ class CorrectionWatcher:
                 f'failed {status.get("chunks_failed", 0)}；'
                 f'音訊 {status.get("audio_hours_done", 0)}/{status.get("audio_hours_total", 0)} 小時')
 
+    def quota_round_alert(self, status, now):
+        """每一輪 Antigravity 額度用完只通知一次，以 agy_quota_exhausted_since 辨識同一輪。"""
+        since = status.get("agy_quota_exhausted_since")
+        if not since or since == self.quota_round:
+            return
+        self.quota_round = since
+        message = str(status.get("agy_quota_message") or "")
+        reset = parse_time(status.get("agy_quota_resets_at"), now.tzinfo)
+        if reset is None and reset_seconds(message):
+            reset = now + timedelta(seconds=reset_seconds(message))
+        when = (f"預計 {reset:%m/%d %H:%M} 重設（約 {max(0.0, (reset - now).total_seconds()) / 3600:.1f} 小時後）"
+                if reset else "重設時間不明")
+        poll = ((status.get("engines") or {}).get("agy") or {}).get("quota_poll_min")
+        wait = (f"或等最多 {poll:g} 分鐘自動接上" if isinstance(poll, (int, float)) and poll > 0 else
+                "否則要等到重設時間（校正程式沒有設 --quota-poll-min）")
+        kind = "週額度" if status.get("agy_quota_kind") == "weekly" else "5 小時額度"
+        body = (f"Antigravity {kind}用完，{when}。請在 agy 互動模式 /logout 後登入另一個 Gemini 帳號，"
+                f"再 touch {self.work_dir / 'resume-now'} 立即接上，{wait}。錯誤訊息：{message}")
+        self.active_alerts.discard(QUOTA_ROUND)
+        self.alert(QUOTA_ROUND, body, now)
+
     def check_once(self):
         now = self.now_fn()
         lines = self.new_log_lines()
@@ -219,25 +248,30 @@ class CorrectionWatcher:
         except OSError as error:
             self.alert("磁碟檢查失敗", str(error), now)
 
-        quota = status.get("quota_resets_at") if state == "paused" else None
-        quota_lines = [line for line in lines if "暫停：Antigravity 額度用完" in line]
-        quota_key = quota or (quota_lines[-1] if quota_lines else None)
-        if quota_key and quota_key != self.last_quota_pause:
-            self.write("INFO", now, "額度暫停", f'預計 {quota or status.get("paused_until")} 重試')
-            self.last_quota_pause = quota_key
-        if state != "paused":
-            self.last_quota_pause = None
+        if "agy_quota_exhausted_since" in status:
+            # 每一輪額度用完（5 小時或週額度）都請使用者換 Gemini 帳號，同一輪只通知一次。
+            self.quota_round_alert(status, now)
+        else:
+            # 舊版狀態檔沒有額度輪次欄位：沿用原本的額度暫停 INFO 與週額度警報。
+            quota = status.get("quota_resets_at") if state == "paused" else None
+            quota_lines = [line for line in lines if "暫停：Antigravity 額度用完" in line]
+            quota_key = quota or (quota_lines[-1] if quota_lines else None)
+            if quota_key and quota_key != self.last_quota_pause:
+                self.write("INFO", now, "額度暫停", f'預計 {quota or status.get("paused_until")} 重試')
+                self.last_quota_pause = quota_key
+            if state != "paused":
+                self.last_quota_pause = None
 
-        # 週額度用完時請使用者換 Gemini 帳號；同一類通知 6 小時內只送一次。
-        agy = (status.get("engines") or {}).get("agy") or {}
-        agy_paused = agy.get("state") == "paused" if agy else state == "paused"
-        weekly = long_reset_hours(str(agy.get("reason") or status.get("last_error") or "")) if agy_paused else None
-        kind = "Antigravity 週額度用完"
-        previous = self.last_alert.get(kind)
-        if weekly is not None and (previous is None or now - previous >= timedelta(hours=6)):
-            self.active_alerts.discard(kind)
-            self.alert(kind, f"錯誤訊息顯示約 {weekly:.0f} 小時後才重設，請切換到另一個 Gemini 帳號；"
-                             "換好後校正程式最慢一小時內會自動接上", now)
+            # 週額度用完時請使用者換 Gemini 帳號；同一類通知 6 小時內只送一次。
+            agy = (status.get("engines") or {}).get("agy") or {}
+            agy_paused = agy.get("state") == "paused" if agy else state == "paused"
+            weekly = long_reset_hours(str(agy.get("reason") or status.get("last_error") or "")) if agy_paused else None
+            kind = "Antigravity 週額度用完"
+            previous = self.last_alert.get(kind)
+            if weekly is not None and (previous is None or now - previous >= timedelta(hours=6)):
+                self.active_alerts.discard(kind)
+                self.alert(kind, f"錯誤訊息顯示約 {weekly:.0f} 小時後才重設，請切換到另一個 Gemini 帳號；"
+                                 "換好後校正程式最慢一小時內會自動接上", now)
 
         if (self.daily_status_hour >= 0 and now.hour >= self.daily_status_hour
                 and self.last_daily_date != now.date()):

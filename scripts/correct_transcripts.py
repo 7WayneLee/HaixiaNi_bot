@@ -30,6 +30,30 @@ SECRET = re.compile(r"sk-[A-Za-z0-9*_\-]+")
 OUTPUT_LINE = re.compile(r"^\s*\[\d+(?:\.\d+)?\]", re.M)
 RESET_TIME = re.compile(r"Resets\s+in\s+(\d+(?:h|m|s)(?:\d+(?:h|m|s))*)(?=$|[\s\"',.!?}\]])", re.I)
 RESET_PARTS = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", re.I)
+RESET_ANY = re.compile(r"Resets\s+in\s+((?:\d+[dhms])+)", re.I)
+WEEKLY_RESET_SEC = 6 * 3600
+
+
+def reset_countdown(text):
+    """額度錯誤裡最長的重設倒數（秒）；不設上限、可含天數，沒有時回傳 None。"""
+    units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    values = [sum(int(number) * units[unit.lower()]
+                  for number, unit in re.findall(r"(\d+)([dhms])", match.group(1), re.I))
+              for match in RESET_ANY.finditer(text or "")]
+    return max(values, default=None)
+
+
+def quota_details(result):
+    """回傳額度錯誤的 short_error（已遮蔽金鑰；沒有時為 None）與不設上限的重設倒數。"""
+    message = None
+    match = re.search(r"AGY_ERROR:\s*(\{[^\n]+\})", result["stderr"])
+    if match:
+        try:
+            message = json.loads(match.group(1)).get("short_error")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    message = redact(message) if isinstance(message, str) and message.strip() else None
+    return message, reset_countdown(result["stderr"] + "\n" + result["output"])
 
 
 def quota_reset_seconds(result):
@@ -248,6 +272,17 @@ class SharedState:
         self.agy_elapsed = 0.0
         self.agy_reason = None
         self.agy_stopped = False
+        # 帳號接力：quota_poll 是額度暫停的上限（秒，None 表示不限）；
+        # quota_since 起到 agy 再次成功之前算同一輪額度用完。
+        self.quota_poll = None
+        self.quota_since = None
+        self.quota_message = None
+        self.quota_kind = None
+        self.quota_reset_estimate = None
+        # 試探中只放行一個 worker；fresh_after 之前就開始的呼叫回報的額度錯誤視為舊消息。
+        self.probing = False
+        self.probe_owner = None
+        self.fresh_after = 0.0
         self.status("running")
 
     def status(self, state=None):
@@ -263,12 +298,17 @@ class SharedState:
                                       "paused" if self.pause_until > time.time() else "running",
                                       "paused_until": timestamp(self.pause_until) if self.pause_until > time.time() else None,
                                       "reason": redact(self.agy_reason), "chunks_done": self.agy_done,
-                                      "average_sec": round(self.agy_elapsed / self.agy_done, 2) if self.agy_done else 0}
+                                      "average_sec": round(self.agy_elapsed / self.agy_done, 2) if self.agy_done else 0,
+                                      "probing": self.probing,
+                                      "quota_poll_min": self.quota_poll / 60 if self.quota_poll is not None else None}
             for name, item in self.engines.items():
                 engine_data[name] = item.snapshot()
             data = {"pid": os.getpid(), "started_at": self.started_at,
                     "last_progress_at": self.last_progress_at,
                     "quota_resets_at": timestamp(self.quota_resets_at) if self.quota_resets_at else None,
+                    "agy_quota_exhausted_since": timestamp(self.quota_since) if self.quota_since else None,
+                    "agy_quota_message": redact(self.quota_message), "agy_quota_kind": self.quota_kind,
+                    "agy_quota_resets_at": timestamp(self.quota_reset_estimate) if self.quota_reset_estimate else None,
                     "updated_at": now(), "state": state,
                     "paused_until": None if self.pause_until <= time.time() else
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.pause_until)),
@@ -279,7 +319,9 @@ class SharedState:
                     "active_engines": [name for name, count in self.active_calls.items() if count > 0]}
             atomic_json(self.work_dir / "status.json", data)
 
-    def wait_if_paused(self):
+    def wait_if_paused(self, requeue=False, log=None):
+        """等 agy 暫停結束。試探中只放行一個 worker；requeue 為真（雙引擎）時不佔著段等待。"""
+        me = threading.get_ident()
         while True:
             with self.lock:
                 remaining = self.pause_until - time.time()
@@ -287,20 +329,79 @@ class SharedState:
                     if self.pause_until:
                         self.pause_until = 0.0
                         self.quota_resets_at = 0.0
+                        if self.quota_poll is not None and self.quota_since is not None:
+                            self.start_probe()
                         self.status("running")
-                    return not self.stop.is_set()
+                    if self.stop.is_set():
+                        return False
+                    if not self.probing or self.probe_owner == me:
+                        return True
+                    if self.probe_owner is None:
+                        self.probe_owner = me
+                        if log:
+                            log.info("額度試探：先由一個 worker 呼叫一次，其餘等結果")
+                        return True
+                    remaining = 1.0
+                if requeue:
+                    return "requeue"
             if self.stop.wait(min(remaining, 1.0)):
                 return False
 
-    def note_error(self, kind, reason, log, reset_seconds=None):
+    def start_probe(self):
+        """進入試探；在此之前就開始的呼叫回報的額度錯誤不再採信。呼叫端須持有 lock。"""
+        self.probing = True
+        self.fresh_after = time.time()
+
+    def release_probe(self):
         with self.lock:
+            if self.probe_owner == threading.get_ident():
+                self.probe_owner = None
+
+    def limit_quota_pause(self, until):
+        return min(until, time.time() + self.quota_poll) if self.quota_poll is not None else until
+
+    def check_resume_now(self, log):
+        """<work-dir>/resume-now 存在時立即解除 agy 的額度暫停，改由一個 worker 試探，並刪除該檔。"""
+        path = self.work_dir / "resume-now"
+        if not path.exists():
+            return False
+        with self.lock:
+            if getattr(self, "agy_enabled", True) and self.quota_since is not None:
+                log.warning("收到 resume-now，立即重試")
+                self.pause_until = 0.0
+                self.quota_resets_at = 0.0
+                self.start_probe()
+                self.status()
+            else:
+                log.info("收到 resume-now；Antigravity 目前沒有額度暫停，不需處理")
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                log.error("無法刪除 %s：%s", path, error)
+        return True
+
+    def note_error(self, kind, reason, log, reset_seconds=None, message=None, countdown=None, started=None):
+        with self.lock:
+            if self.probe_owner == threading.get_ident():
+                self.probe_owner = None
+            if kind == "quota" and started is not None and started < self.fresh_after:
+                log.warning("試探開始前就送出的呼叫回報額度用完（可能是換帳號前的舊呼叫），不暫停，直接重試")
+                return True
             self.last_error = redact(reason)
             self.agy_reason = redact(reason)
+            if kind == "quota":
+                noted = time.time()
+                if self.quota_since is None:
+                    self.quota_since = noted
+                self.quota_message = redact(message or reason)
+                self.quota_kind = "weekly" if countdown is not None and countdown > WEEKLY_RESET_SEC else "five_hour"
+                self.quota_reset_estimate = noted + countdown if countdown else None
+                self.probing = False
             if kind == "quota" and reset_seconds is not None:
                 reset_at = time.time() + reset_seconds
                 if reset_at > self.quota_resets_at:
                     self.quota_resets_at = reset_at
-                    self.pause_until = reset_at + 120
+                    self.pause_until = self.limit_quota_pause(reset_at + 120)
                     self.pause_level = 0
                     reset_clock = time.strftime("%H:%M", time.localtime(reset_at))
                     retry_clock = time.strftime("%H:%M", time.localtime(self.pause_until))
@@ -316,6 +417,8 @@ class SharedState:
                 delay = min(self.backoff_max, self.backoff_base * 2 ** self.pause_level)
                 self.pause_level += 1
                 self.pause_until = time.time() + delay
+                if kind == "quota":
+                    self.pause_until = self.limit_quota_pause(self.pause_until)
                 self.quota_resets_at = 0.0
                 clock = time.strftime("%H:%M", time.localtime(self.pause_until))
                 cause = ("Antigravity 額度用完或被限速" if kind == "quota" else
@@ -326,11 +429,24 @@ class SharedState:
             self.status()
             return False
 
-    def note_success(self):
+    def note_success(self, started=None, log=None):
         with self.lock:
             self.consecutive_errors = 0
             self.pause_level = 0
             self.agy_reason = None
+            if self.probe_owner == threading.get_ident():
+                self.probe_owner = None
+            # 額度用完之前就送出的呼叫晚到的成功，不代表額度已恢復。
+            if self.quota_since is None or (started is not None and started < self.quota_since):
+                return
+            if self.probing:
+                self.probing = False
+                self.pause_until = 0.0
+                self.quota_resets_at = 0.0
+                if log:
+                    log.info("額度試探成功：Antigravity 恢復，所有 worker 繼續")
+            self.quota_since = self.quota_message = self.quota_kind = self.quota_reset_estimate = None
+            self.status()
 
     def register_process(self, process, engine="agy"):
         with self.lock:
@@ -595,10 +711,15 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
                 return "requeue"
             if not control.ready():
                 return None
-        if not (control.wait_if_paused() if engine == "agy" else control.ready()):
+        ready = (control.wait_if_paused("codex" in shared.engines, log) if engine == "agy" else
+                 control.ready())
+        if ready == "requeue":
+            return "requeue"
+        if not ready:
             return None
         sequence += 1
         label = f"{source}#{number}#{time.time_ns()}-{sequence}"
+        started = time.time()
         try:
             response = (run_agy(prompt, model, args.print_timeout, ws, label, args.max_search, shared)
                         if engine == "agy" else
@@ -620,8 +741,13 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
         kind, reason = error_kind(response)
         if kind:
             log.warning("%s 第 %d 段第 %d 次呼叫錯誤（%s）：%s", source, number, sequence, kind, reason)
-            paused = (shared.note_error(kind, reason, log, quota_reset_seconds(response) if kind == "quota" else None)
-                      if engine == "agy" else control.note_error(kind, reason))
+            if engine == "agy":
+                message, countdown = quota_details(response) if kind == "quota" else (None, None)
+                paused = shared.note_error(kind, reason, log,
+                                           quota_reset_seconds(response) if kind == "quota" else None,
+                                           message, countdown, started)
+            else:
+                paused = control.note_error(kind, reason)
             if kind == "quota" and "codex" in shared.engines and getattr(shared, "agy_enabled", False):
                 return "requeue"
             if paused:
@@ -632,7 +758,10 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
                 continue
             failures += 1
         else:
-            control.note_success()
+            if engine == "agy":
+                shared.note_success(started, log)
+            else:
+                control.note_success()
             attempts.append(response)
             if response["evaluation"]["valid"]:
                 break
@@ -751,14 +880,17 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--quota-poll-min", type=float,
+                        help="Antigravity 額度暫停最多幾分鐘就由一個 worker 試探；不給則等到重設時間")
     args = parser.parse_args(argv)
     engines = args.engines.split(",")
     if not engines or len(set(engines)) != len(engines) or any(engine not in {"agy", "codex"} for engine in engines):
         parser.error("--engines 必須是 agy、codex 或 agy,codex")
     if (args.agy_jobs < 1 or args.codex_jobs < 1 or args.max_search < 0 or args.retries < 0 or
             args.print_timeout < 1 or (args.limit_hours is not None and args.limit_hours <= 0) or
-            not 0 <= args.codex_weekly_max <= 100 or not 0 <= args.codex_session_max <= 100):
-        parser.error("jobs、print-timeout、limit-hours 必須為正數；max-search、retries 不可為負數")
+            not 0 <= args.codex_weekly_max <= 100 or not 0 <= args.codex_session_max <= 100 or
+            (args.quota_poll_min is not None and not args.quota_poll_min > 0)):
+        parser.error("jobs、print-timeout、limit-hours、quota-poll-min 必須為正數；max-search、retries 不可為負數")
     args.in_dir, args.out_dir, args.work_dir = (item.resolve() for item in (args.in_dir, args.out_dir, args.work_dir))
     (args.work_dir / "logs").mkdir(parents=True, exist_ok=True)
     log = log_setup(args.work_dir)
@@ -812,6 +944,11 @@ def main(argv=None):
     shared = SharedState(args.work_dir, len(jobs), hours, len(documents), base, maximum)
     shared.agy_enabled = "agy" in engines
     shared.codex_mode = args.codex_mode
+    if args.quota_poll_min is not None:
+        shared.quota_poll = args.quota_poll_min * 60
+        if "agy" in engines:
+            log.info("Antigravity 額度暫停最多 %g 分鐘就試探一次；換好帳號後 touch %s 可立即重試",
+                     args.quota_poll_min, args.work_dir / "resume-now")
     if "codex" in engines:
         shared.engines["codex"] = CodexState(shared, log, args.codex_weekly_max,
                                                args.codex_session_max)
@@ -878,7 +1015,8 @@ def main(argv=None):
                 if not waiting and inflight == 0:
                     return
                 if engine == "agy":
-                    available = shared.pause_until <= time.time()
+                    available = (shared.pause_until <= time.time() and
+                                 not (shared.probing and shared.probe_owner is not None))
                 else:
                     if control.state == "stopped":
                         return
@@ -901,6 +1039,9 @@ def main(argv=None):
                                        shared, log, digest, engine)
             except Exception as error:
                 result = error
+            finally:
+                if engine == "agy":
+                    shared.release_probe()
             with condition:
                 inflight -= 1
                 if result == "requeue":
@@ -921,6 +1062,8 @@ def main(argv=None):
                 record(job, result, engine)
             except queue.Empty:
                 pass
+            if shared.agy_enabled:
+                shared.check_resume_now(log)
             if time.monotonic() >= next_progress:
                 shared.progress(log)
                 next_progress = time.monotonic() + 300

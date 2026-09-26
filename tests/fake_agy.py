@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """測試用 Antigravity 替身；不連網。"""
+import atexit
+import json
 import os
 import re
 import signal
@@ -20,6 +22,8 @@ if mode == "hang_ignore_term":
 if started:
     Path(started).write_text(str(os.getpid()))
 label = os.environ.get("HAIXIA_AGY_LABEL", "")
+began = time.time()
+outcome = "ok"
 call_log = os.environ.get("FAKE_AGY_CALL_LOG")
 if call_log:
     with Path(call_log).open("a") as output:
@@ -36,6 +40,24 @@ if counter:
         output.write(str(number))
         output.flush()
         flock(output, LOCK_UN)
+timeline = os.environ.get("FAKE_AGY_TIMELINE")
+if timeline:
+    def write_timeline():
+        with Path(timeline).open("a") as output:
+            output.write(f"{number} {began:.6f} {time.time():.6f} {outcome}\n")
+    atexit.register(write_timeline)
+if mode == "account":
+    # 模擬帳號額度：前 FAKE_AGY_QUOTA_CALLS 次，或 FAKE_AGY_SWITCH 檔不存在（還沒換帳號）時回 429。
+    switch = os.environ.get("FAKE_AGY_SWITCH")
+    limit = int(os.environ.get("FAKE_AGY_QUOTA_CALLS", "0"))
+    if (limit and number <= limit) or (switch and not Path(switch).exists()):
+        outcome = "quota"
+        time.sleep(0.2)
+        resets = os.environ.get("FAKE_AGY_RESETS", "2h31m45s")
+        short = "RESOURCE_EXHAUSTED (code 429): Individual quota reached." + (f" Resets in {resets}" if resets else "")
+        print("AGY_ERROR: " + json.dumps({"short_error": short, "status": 429}), file=sys.stderr)
+        sys.exit(3)
+    time.sleep(float(os.environ.get("FAKE_AGY_SLEEP", "0")))
 if mode == "quota_once" and flag and not Path(flag).exists():
     Path(flag).write_text("1")
     print('AGY_ERROR: {"retryable": true, "status": 429, "code": "RESOURCE_EXHAUSTED"}', file=sys.stderr)

@@ -111,7 +111,8 @@ def test_legacy_validation_and_redaction(fake):
     assert cli.redact("Incorrect API key provided: sk-ABC*123") == "Incorrect API key provided: sk-***"
 
 
-def test_relay_requeues_quota_chunk_and_agy_resumes(fake, monkeypatch):
+@pytest.mark.parametrize("extra", [[], ["--quota-poll-min", "0.005"]])
+def test_relay_requeues_quota_chunk_and_agy_resumes(fake, monkeypatch, extra):
     args, output, tmp = fake
     monkeypatch.setenv("FAKE_AGY_MODE", "quota_once")
     monkeypatch.setenv("FAKE_AGY_FLAG", str(tmp / "agy.flag"))
@@ -120,13 +121,15 @@ def test_relay_requeues_quota_chunk_and_agy_resumes(fake, monkeypatch):
     monkeypatch.setenv("HAIXIA_BACKOFF_MAX_SEC", "0.3")
     both = args[:]
     both[both.index("codex") + 0] = "agy,codex"
-    assert cli.main(both + ["--agy-jobs", "1"]) == 0
+    assert cli.main(both + ["--agy-jobs", "1"] + extra) == 0
     doc = validate_corrected(json.loads(output.read_text()))
     assert {chunk["engine"] for chunk in doc["correction"]["chunks"]} == {"antigravity-cli", "codex-cli"}
     assert doc["correction"]["tool"] == "mixed"
     assert len(doc["correction"]["chunks"]) == 2
     status = json.loads((tmp / "work/status.json").read_text())
     assert status["codex_mode"] == "relay" and status["chunks_done"] == 2
+    assert status["agy_quota_exhausted_since"] is None
+    assert ("額度試探成功" in (tmp / "work/logs/correct.log").read_text()) == bool(extra)
 
 
 def test_parallel_workers_both_take_chunks(fake, monkeypatch):
