@@ -100,9 +100,10 @@ caffeinate -i .venv/bin/python scripts/correct_transcripts.py \
 
 流程：
 
-1. 監視程式發「Antigravity 額度用完，請切換 Gemini 帳號」通知，內容寫明是 5 小時額度還是週額度、預計何時重設。同一輪額度用完只通知一次；agy 恢復並成功完成一次呼叫後，下一次用完才算新的一輪。
-2. 在 `agy` 互動模式輸入 `/logout`，再登入另一個 Gemini 帳號。
-3. `touch "$HOME/haixia-correct-work/resume-now"`：校正程式立刻解除額度暫停、試探一次，並刪除這個檔（log 會印「收到 resume-now，立即重試」）。不 touch 的話，最多等 `--quota-poll-min` 分鐘也會自動接上。
+1. 監視程式發「Antigravity 額度用完，請切換 Gemini 帳號」通知，內容寫明是 5 小時額度還是週額度、預計何時重設，以及目前登入的帳號（`agy_account`）。同一輪額度用完只通知一次；agy 恢復並成功完成一次呼叫後，下一次用完才算新的一輪。
+2. 在 `agy` 互動模式輸入 `/logout`，再登入另一個 Gemini 帳號。其他開著的 agy 互動視窗要關掉或登入同一個帳號，否則它們更新登入資料時會把帳號改回去（見下一節）。
+3. 如果有設定預期帳號，把新帳號寫進 `expected-account`（見下一節），例如 `echo c@example.com > "$HOME/haixia-correct-work/expected-account"`。
+4. `touch "$HOME/haixia-correct-work/resume-now"`：校正程式立刻解除額度暫停、試探一次，並刪除這個檔（log 會印「收到 resume-now，立即重試」）。不 touch 的話，最多等 `--quota-poll-min` 分鐘也會自動接上。
 
 有 `--quota-poll-min N` 時，Antigravity 因額度暫停最多只停 N 分鐘；到時先只讓**一個** worker 試探呼叫，其餘 worker 等結果，避免 4 個 worker 同時再打出 429。試探成功就解除暫停、全部 worker 恢復；仍是額度錯誤就再暫停最多 N 分鐘。試探開始前就送出的舊呼叫（例如換帳號前送出、晚到的 429）不再造成暫停，該段直接重試。`resume-now` 不論有沒有 `--quota-poll-min` 都有效；沒有額度暫停時收到這個檔，只會刪除並記一行 log。
 
@@ -116,6 +117,71 @@ caffeinate -i .venv/bin/python scripts/correct_transcripts.py \
 - `agy_quota_resets_at`：依最近一次錯誤的倒數推算的重設時間（週額度也算）。
 
 `engines.agy` 另有 `probing`（是否正在試探）和 `quota_poll_min`。Codex 的額度暫停或停用不會發換帳號通知，Codex 達週上限只記 INFO。舊版校正程式寫的狀態檔沒有 `agy_quota_exhausted_since`，監視程式遇到時沿用舊的判斷：額度暫停記 INFO，週額度用完才發「Antigravity 週額度用完」警報，6 小時內只送一次。
+
+## Antigravity 實際登入的帳號與帳號不符的暫停
+
+### 根本原因：所有 agy 程序共用同一份登入資料
+
+- 所有 agy 程序共用 macOS 鑰匙圈裡的同一份登入資料（agy 的 log 裡是 `keyringAuth`）。
+- 長時間開著的互動式 agy 大約每小時自動更新登入資料（log：`token refreshed, new expiry=…`），並寫回鑰匙圈。
+- 所以在一個 agy 視窗切到另一個帳號之後，只要另一個還登入原帳號的 agy 視窗更新登入資料，共用的登入資料就變回原帳號。
+- 校正程式每一段都開新的 agy 程序，啟動時從鑰匙圈讀登入資料，於是會**不知不覺改用別的帳號的額度**。2026-09-26 發生過 4 次。
+
+所以換帳號時，其他開著的 agy 互動視窗要關掉或登入同一個帳號。校正程式另外逐次記錄實際用的帳號，帳號不對就暫停。
+
+### 記錄每次呼叫實際登入的帳號
+
+- 每次 agy 呼叫都加 `--log-file <work-dir>/agy-logs/<時間>-call-<執行緒>.log`。`--log-file` 是根層級旗標，要放在 `-p` 或子命令前面：`agy --log-file X models` 可以，`agy models --log-file X` 會回「flags provided but not defined」。
+- 每個 agy 程序的 log 都有一行 `applyAuthResult: email=<帳號>, authMethod=…`。呼叫結束後，程式從 log 取出帳號，寫進該次嘗試的快取（`chunks/…/NNNNN.attemptK.json` 的 `agy_account`）。解析不到帳號時記 `null`，這一段照常處理，不算失敗。
+- `agy-logs/` 只保留最新 500 個檔，舊的自動刪除。這些 log 含帳號，只放在 repo 外的工作目錄。
+- `status.json` 的 `agy_account` 是最後一次看到的帳號，以最晚送出的呼叫或檢查為準。
+
+### 預期帳號
+
+有兩種設定方式，兩者都有時以檔案為準：
+
+- `--expected-agy-account a@example.com`；
+- `<work-dir>/expected-account` 檔，內容是帳號（只取第一個非空白字串）。**每次檢查都重讀這個檔**，改了不必重啟校正程式。程式發現檔案改了會記一行「預期的 Antigravity 帳號改為 …」，並立刻用 `agy models` 檢查一次。
+
+```bash
+echo a@example.com > "$HOME/haixia-correct-work/expected-account"
+```
+
+帳號比對不分大小寫。兩者都沒有設定時只記錄 `agy_account`、不管控，其他行為和以前相同。
+
+### 帳號不符時
+
+- 某次 agy 呼叫的實際帳號和預期不同時，**立刻暫停 Antigravity**，不再派新的 agy 呼叫。已經在跑的呼叫照常跑完。
+- 發現不符的那次呼叫，結果照常驗收、照常採用：品質沒問題，只是用了別的帳號的額度。
+- 暫停期間每 2 分鐘用 `agy --log-file … models` 檢查目前登入的帳號。這不耗模型額度。符合預期就解除暫停、記一行「Antigravity 帳號已符合預期（…），解除帳號不符的暫停，繼續派送」，然後繼續跑。
+- `touch <work-dir>/resume-now` 會立即檢查一次，改了 `expected-account` 也會。
+- 帳號恢復之前就送出的呼叫晚到、回報舊帳號時，不會再次暫停。
+- 帳號不符的暫停和額度暫停互相獨立：
+  - 帳號對了但沒額度，照原本的額度邏輯處理（`--quota-poll-min`、試探）；
+  - 額度暫停到期但帳號仍不符，繼續暫停。
+- 雙引擎接力（`--codex-mode relay`）時，帳號不符的暫停也讓 Codex 接手；Antigravity 恢復後，Codex 照原本的規則停止取新段。
+- **啟動時**：有設定預期帳號時，程式啟動時本來就會跑 `agy models` 確認模型，這時一併確認帳號。不符就直接進入帳號不符的暫停，log 會印出實際帳號、預期帳號和處理方式。
+
+`status.json` 的欄位：
+
+- `agy_account`：最後一次看到的實際帳號；
+- `agy_expected_account`：目前的預期帳號，沒設定時是 `null`；
+- `agy_account_mismatch`：`true`／`false`；
+- `agy_account_mismatch_since`：這一輪帳號不符的開始時間，監視程式用它辨識同一輪。
+
+暫停期間 `engines.agy.state` 是 `paused`。只用 Antigravity 時，整體 `state` 也是 `paused`，但 `paused_until` 是 `null`，因為要等帳號對了才恢復，沒有預定時間。
+
+### 監視程式的通知
+
+- `agy_account_mismatch` 從 false 變 true 時，送一次「校正監視警報：Antigravity 帳號不符」。同一輪（`agy_account_mismatch_since` 相同）只送一次；帳號對了之後再不符，算新的一輪。
+- 通知內容有預期帳號、實際帳號和處理方式：請在 agy 視窗登入預期的帳號；如果要改用實際的帳號，請告訴指揮更新 `expected-account`。
+- 帳號恢復時，只在 `logs/watch.log` 記一行 INFO，不送通知。
+- 額度用完的警報也會寫出目前帳號（`agy_account`）。
+
+收到帳號不符的通知時，有兩種處理方式：
+
+1. 要繼續用預期的帳號：在 agy 視窗登入預期的帳號，並關掉其他登入別的帳號的 agy 視窗。校正程式 2 分鐘內會自動接上，也可以 `touch resume-now` 立即檢查。
+2. 要改用實際的帳號：由指揮更新 `expected-account`（例如 `echo b@example.com > "$HOME/haixia-correct-work/expected-account"`）。程式會立刻檢查，符合就繼續。
 
 ## 驗收
 

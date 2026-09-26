@@ -28,6 +28,7 @@ def parse_time(value, tz):
 
 LONG_RESET = re.compile(r"Resets\s+in\s+((?:\d+[dhms])+)", re.I)
 QUOTA_ROUND = "Antigravity 額度用完，請切換 Gemini 帳號"
+ACCOUNT_MISMATCH = "Antigravity 帳號不符"
 QUOTA_ERROR = re.compile(r"RESOURCE_EXHAUSTED|\b429\b|quota|額度", re.I)
 
 
@@ -86,6 +87,7 @@ class CorrectionWatcher:
         self.last_daily_date = None
         self.engine_stops_seen = set()
         self.quota_round = None
+        self.mismatch_round = None
 
     def write(self, level, now, kind, description):
         line = f"{level} {now:%Y-%m-%d %H:%M:%S} {kind}：{description}"
@@ -178,10 +180,33 @@ class CorrectionWatcher:
         wait = (f"或等最多 {poll:g} 分鐘自動接上" if isinstance(poll, (int, float)) and poll > 0 else
                 "否則要等到重設時間（校正程式沒有設 --quota-poll-min）")
         kind = "週額度" if status.get("agy_quota_kind") == "weekly" else "5 小時額度"
-        body = (f"Antigravity {kind}用完，{when}。請在 agy 互動模式 /logout 後登入另一個 Gemini 帳號，"
+        account = status.get("agy_account") or "不明"
+        body = (f"Antigravity {kind}用完（目前帳號：{account}），{when}。請在 agy 互動模式 /logout 後登入另一個 Gemini 帳號，"
                 f"再 touch {self.work_dir / 'resume-now'} 立即接上，{wait}。錯誤訊息：{message}")
         self.active_alerts.discard(QUOTA_ROUND)
         self.alert(QUOTA_ROUND, body, now)
+
+    def account_mismatch_alert(self, status, now):
+        """每一輪 Antigravity 帳號不符只通知一次，以 agy_account_mismatch_since 辨識同一輪。"""
+        since = status.get("agy_account_mismatch_since")
+        if not status.get("agy_account_mismatch"):
+            if self.mismatch_round is not None:
+                self.write("INFO", now, "Antigravity 帳號已符合", f'目前帳號：{status.get("agy_account") or "不明"}')
+                self.mismatch_round = None
+            return
+        if not since or since == self.mismatch_round:
+            return
+        self.mismatch_round = since
+        began = parse_time(since, now.tzinfo)
+        when = f"{began:%m/%d %H:%M} 起" if began else ""
+        body = (f'預期帳號：{status.get("agy_expected_account") or "（未設定）"}；'
+                f'實際帳號：{status.get("agy_account") or "不明"}。'
+                f"{when}校正程式已暫停 Antigravity，發現不符的那次呼叫結果照常採用。"
+                "請在 agy 視窗登入預期的帳號；如果要改用實際的帳號，請告訴指揮更新 expected-account"
+                f"（{self.work_dir / 'expected-account'}）。校正程式每 2 分鐘會用 agy models 自動檢查，"
+                f"帳號對了就繼續；touch {self.work_dir / 'resume-now'} 可立即檢查。")
+        self.active_alerts.discard(ACCOUNT_MISMATCH)
+        self.alert(ACCOUNT_MISMATCH, body, now)
 
     def check_once(self):
         now = self.now_fn()
@@ -278,6 +303,9 @@ class CorrectionWatcher:
                 self.active_alerts.discard(kind)
                 self.alert(kind, f"錯誤訊息顯示約 {weekly:.0f} 小時後才重設，請切換到另一個 Gemini 帳號；"
                                  "換好後校正程式最慢一小時內會自動接上", now)
+
+        # 帳號不符：每一輪只通知一次。
+        self.account_mismatch_alert(status, now)
 
         if (self.daily_status_hour >= 0 and now.hour >= self.daily_status_hour
                 and self.last_daily_date != now.date()):

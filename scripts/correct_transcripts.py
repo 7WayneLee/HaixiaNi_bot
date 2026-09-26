@@ -32,6 +32,9 @@ RESET_TIME = re.compile(r"Resets\s+in\s+(\d+(?:h|m|s)(?:\d+(?:h|m|s))*)(?=$|[\s\
 RESET_PARTS = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", re.I)
 RESET_ANY = re.compile(r"Resets\s+in\s+((?:\d+[dhms])+)", re.I)
 WEEKLY_RESET_SEC = 6 * 3600
+# 每個 agy 程序的 log 都有一行 applyAuthResult，記錄這次實際登入的帳號。
+AUTH_EMAIL = re.compile(r"applyAuthResult:\s*email=([^,\s]*)")
+AGY_LOG_KEEP = 500
 
 
 def reset_countdown(text):
@@ -121,11 +124,61 @@ def check_hook(ws, max_search):
             raise RuntimeError(f"hook 自我測試失敗：{tool}：{result.stderr}")
 
 
-def check_model(model):
-    result = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=60)
+def agy_log_path(work_dir, kind):
+    """每次 agy 呼叫各用一個 log 檔；檔名以時間開頭，依檔名排序即是先後順序。"""
+    directory = Path(work_dir) / "agy-logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{datetime.now():%Y%m%d-%H%M%S-%f}-{kind}-{threading.get_ident()}.log"
+
+
+def prune_agy_logs(work_dir):
+    """agy-logs 只保留最新 AGY_LOG_KEEP 個檔。"""
+    try:
+        logs = sorted((Path(work_dir) / "agy-logs").glob("*.log"))
+    except OSError:
+        return
+    for path in logs[:max(0, len(logs) - AGY_LOG_KEEP)]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def agy_account(log_file):
+    """從 agy log 的 applyAuthResult 取出實際登入的帳號；讀不到或沒有時回傳 None。"""
+    try:
+        text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    accounts = [email for email in AUTH_EMAIL.findall(text) if email]
+    return accounts[-1] if accounts else None
+
+
+def same_account(first, second):
+    return (first or "").strip().lower() == (second or "").strip().lower()
+
+
+def check_model(model, log_file):
+    """確認 agy 看得到指定模型，並回傳這次登入的帳號（agy models 不耗額度）。"""
+    result = subprocess.run(["agy", "--log-file", str(log_file), "models"],
+                            capture_output=True, text=True, timeout=60)
     available = {line.split()[0] for line in result.stdout.splitlines() if line.split()}
     if result.returncode or model not in available:
         raise RuntimeError(f"agy models 看不到指定模型：{model}；{result.stderr.strip()}")
+    return agy_account(log_file)
+
+
+def check_account(work_dir):
+    """用 agy models（不耗額度）確認目前登入的帳號；讀不到時回傳 None。"""
+    log_file = agy_log_path(work_dir, "models")
+    try:
+        subprocess.run(["agy", "--log-file", str(log_file), "models"],
+                       capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    account = agy_account(log_file)
+    prune_agy_logs(work_dir)
+    return account
 
 
 def search_count(audit, label):
@@ -144,7 +197,9 @@ def search_count(audit, label):
 
 
 def run_agy(prompt, model, timeout, ws, label, max_search, shared):
-    args = ["agy", "-p", prompt, "--model", model, "--output-format", "text",
+    # --log-file 是根層級旗標，要放在 -p 或子命令前面。
+    log_file = agy_log_path(shared.work_dir, "call")
+    args = ["agy", "--log-file", str(log_file), "-p", prompt, "--model", model, "--output-format", "text",
             "--print-timeout", f"{timeout}s", "--disable-slash-commands"]
     env = dict(os.environ, HAIXIA_AGY_LABEL=label, HAIXIA_AGY_MAX_SEARCH=str(max_search))
     began = time.monotonic()
@@ -165,9 +220,12 @@ def run_agy(prompt, model, timeout, ws, label, max_search, shared):
             stderr += "\nAntigravity 呼叫逾時"
     finally:
         shared.unregister_process(process, "agy")
+    account = agy_account(log_file)
+    prune_agy_logs(shared.work_dir)
     return {"output": stdout, "stderr": stderr, "exit_code": code,
             "elapsed_sec": round(time.monotonic() - began, 2),
-            "searches": search_count(ws / ".agents/audit.jsonl", label)}
+            "searches": search_count(ws / ".agents/audit.jsonl", label),
+            "agy_account": account, "agy_log": log_file.name}
 
 
 def run_codex(prompt, model, effort, timeout, ws, shared):
@@ -283,19 +341,34 @@ class SharedState:
         self.probing = False
         self.probe_owner = None
         self.fresh_after = 0.0
+        # 帳號管控：所有 agy 程序共用鑰匙圈裡的登入資料，別的 agy 視窗更新登入資料就會換掉帳號。
+        # 帳號不符的暫停和額度暫停互相獨立；account_resumed_at 之前就送出的呼叫不再觸發暫停。
+        self.expected_arg = None
+        self.account = None
+        self.account_started = 0.0
+        self.account_expected = None
+        self.account_mismatch_since = None
+        self.account_resumed_at = 0.0
+        self.account_poll = 120.0
+        self.account_check_at = 0.0
+        self.account_check_note = None
         self.status("running")
+
+    def agy_paused(self):
+        """agy 是否暫停派送：額度或斷路器暫停中，或帳號不符。"""
+        return self.pause_until > time.time() or self.account_mismatch_since is not None
 
     def status(self, state=None):
         with self.lock:
             if state is None:
-                states = (["stopped" if self.agy_stopped else "paused" if self.pause_until > time.time() else "running"]
+                states = (["stopped" if self.agy_stopped else "paused" if self.agy_paused() else "running"]
                           if getattr(self, "agy_enabled", True) else [])
                 states += [item.state for item in self.engines.values()]
                 state = "paused" if states and all(item != "running" for item in states) else "running"
             engine_data = {}
             if getattr(self, "agy_enabled", True):
                 engine_data["agy"] = {"state": "stopped" if self.agy_stopped else
-                                      "paused" if self.pause_until > time.time() else "running",
+                                      "paused" if self.agy_paused() else "running",
                                       "paused_until": timestamp(self.pause_until) if self.pause_until > time.time() else None,
                                       "reason": redact(self.agy_reason), "chunks_done": self.agy_done,
                                       "average_sec": round(self.agy_elapsed / self.agy_done, 2) if self.agy_done else 0,
@@ -309,6 +382,10 @@ class SharedState:
                     "agy_quota_exhausted_since": timestamp(self.quota_since) if self.quota_since else None,
                     "agy_quota_message": redact(self.quota_message), "agy_quota_kind": self.quota_kind,
                     "agy_quota_resets_at": timestamp(self.quota_reset_estimate) if self.quota_reset_estimate else None,
+                    "agy_account": self.account, "agy_expected_account": self.account_expected,
+                    "agy_account_mismatch": self.account_mismatch_since is not None,
+                    "agy_account_mismatch_since": (timestamp(self.account_mismatch_since)
+                                                   if self.account_mismatch_since is not None else None),
                     "updated_at": now(), "state": state,
                     "paused_until": None if self.pause_until <= time.time() else
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.pause_until)),
@@ -320,7 +397,8 @@ class SharedState:
             atomic_json(self.work_dir / "status.json", data)
 
     def wait_if_paused(self, requeue=False, log=None):
-        """等 agy 暫停結束。試探中只放行一個 worker；requeue 為真（雙引擎）時不佔著段等待。"""
+        """等 agy 暫停結束（額度／斷路器暫停與帳號不符各自獨立）。
+        試探中只放行一個 worker；requeue 為真（雙引擎）時不佔著段等待。"""
         me = threading.get_ident()
         while True:
             with self.lock:
@@ -331,17 +409,20 @@ class SharedState:
                         self.quota_resets_at = 0.0
                         if self.quota_poll is not None and self.quota_since is not None:
                             self.start_probe()
-                        self.status("running")
+                        self.status()
                     if self.stop.is_set():
                         return False
-                    if not self.probing or self.probe_owner == me:
+                    if self.account_mismatch_since is not None:
+                        remaining = 1.0
+                    elif not self.probing or self.probe_owner == me:
                         return True
-                    if self.probe_owner is None:
+                    elif self.probe_owner is None:
                         self.probe_owner = me
                         if log:
                             log.info("額度試探：先由一個 worker 呼叫一次，其餘等結果")
                         return True
-                    remaining = 1.0
+                    else:
+                        remaining = 1.0
                 if requeue:
                     return "requeue"
             if self.stop.wait(min(remaining, 1.0)):
@@ -361,23 +442,101 @@ class SharedState:
         return min(until, time.time() + self.quota_poll) if self.quota_poll is not None else until
 
     def check_resume_now(self, log):
-        """<work-dir>/resume-now 存在時立即解除 agy 的額度暫停，改由一個 worker 試探，並刪除該檔。"""
+        """<work-dir>/resume-now 存在時立即解除 agy 的額度暫停，改由一個 worker 試探；
+        帳號不符時立即檢查一次登入帳號。處理後刪除該檔。"""
         path = self.work_dir / "resume-now"
         if not path.exists():
             return False
         with self.lock:
-            if getattr(self, "agy_enabled", True) and self.quota_since is not None:
+            enabled = getattr(self, "agy_enabled", True)
+            if enabled and self.account_mismatch_since is not None:
+                log.warning("收到 resume-now，立即檢查 Antigravity 登入的帳號")
+                self.account_check_at = 0.0
+            if enabled and self.quota_since is not None:
                 log.warning("收到 resume-now，立即重試")
                 self.pause_until = 0.0
                 self.quota_resets_at = 0.0
                 self.start_probe()
                 self.status()
-            else:
-                log.info("收到 resume-now；Antigravity 目前沒有額度暫停，不需處理")
+            elif not enabled or self.account_mismatch_since is None:
+                log.info("收到 resume-now；Antigravity 目前沒有額度暫停或帳號不符，不需處理")
             try:
                 path.unlink(missing_ok=True)
             except OSError as error:
                 log.error("無法刪除 %s：%s", path, error)
+        return True
+
+    def expected_account(self):
+        """預期帳號：<work-dir>/expected-account 優先（每次都重讀，換帳號不必重啟），其次 --expected-agy-account。"""
+        try:
+            words = (self.work_dir / "expected-account").read_text(encoding="utf-8").split()
+        except OSError:
+            words = []
+        return words[0] if words else self.expected_arg
+
+    def refresh_expected(self, log):
+        """重讀預期帳號，有變動時記一行 log；回傳（預期帳號, 是否變動）。呼叫端須持有 lock。"""
+        expected = self.expected_account()
+        changed = not same_account(expected, self.account_expected)
+        if changed:
+            log.warning("預期的 Antigravity 帳號改為 %s", expected or "（未設定，只記錄、不管控）")
+            self.account_check_note = None
+        self.account_expected = expected
+        return expected, changed
+
+    def note_account(self, account, started, log, context):
+        """記錄 agy 實際登入的帳號並和預期帳號比對。context 為「呼叫」時只會進入帳號不符的暫停
+        （這次的結果照常驗收、採用）；「啟動檢查」「檢查」（agy models）確認帳號符合才解除暫停。"""
+        with self.lock:
+            expected, _ = self.refresh_expected(log)
+            if account is not None and started >= self.account_started:
+                self.account, self.account_started = account, started
+            mismatch = self.account_mismatch_since is not None
+            note = ((expected or "").lower(), (account or "").lower())
+            if expected is None or (account is not None and same_account(account, expected)):
+                if mismatch and context != "呼叫":
+                    self.account_mismatch_since = None
+                    self.account_resumed_at = time.time()
+                    self.account_check_note = None
+                    if expected is None:
+                        log.warning("已不再設定預期的 Antigravity 帳號，解除帳號不符的暫停，繼續派送")
+                    else:
+                        log.warning("Antigravity 帳號已符合預期（%s），解除帳號不符的暫停，繼續派送", account)
+            elif account is None:
+                if context == "呼叫" or self.account_check_note != note:
+                    self.account_check_note = note
+                    log.warning("%s：無法從 agy log 解析登入的帳號，這次沒有檢查帳號", context)
+            elif not mismatch:
+                if started < self.account_resumed_at:
+                    log.info("帳號恢復前就送出的 agy 呼叫用的是 %s，不再暫停", account)
+                else:
+                    self.account_mismatch_since = time.time()
+                    self.account_check_at = time.time() + self.account_poll
+                    self.account_check_note = note
+                    found = ("agy 呼叫實際登入的帳號是 %s，不是預期的 %s（這次的結果照常驗收、採用）"
+                             if context == "呼叫" else f"{context}發現目前登入的帳號是 %s，不是預期的 %s")
+                    log.warning("暫停 Antigravity：" + found + "。請在 agy 視窗登入預期的帳號；"
+                                "如果要改用這個帳號，把它寫進 %s。之後每 %g 分鐘用 agy models 檢查一次，"
+                                "touch %s 可立即檢查", account, expected, self.work_dir / "expected-account",
+                                self.account_poll / 60, self.work_dir / "resume-now")
+            elif context != "呼叫" and self.account_check_note != note:
+                self.account_check_note = note
+                log.warning("Antigravity 帳號仍不符：預期 %s，目前登入 %s；每 %g 分鐘再檢查",
+                            expected, account, self.account_poll / 60)
+            self.status()
+
+    def poll_account(self, log):
+        """主迴圈呼叫：預期帳號改變時，或帳號不符的暫停中每 account_poll 秒（resume-now 會立即觸發），
+        用 agy models（不耗額度）檢查目前登入的帳號。"""
+        with self.lock:
+            if self.stop.is_set():
+                return False
+            _, changed = self.refresh_expected(log)
+            if not changed and (self.account_mismatch_since is None or time.time() < self.account_check_at):
+                return False
+            self.account_check_at = time.time() + self.account_poll
+        started = time.time()
+        self.note_account(check_account(self.work_dir), started, log, "檢查")
         return True
 
     def note_error(self, kind, reason, log, reset_seconds=None, message=None, countdown=None, started=None):
@@ -702,7 +861,7 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
     control = shared if engine == "agy" else shared.engines["codex"]
     transient_retries = 0
     while failures <= args.retries and not shared.stop.is_set():
-        if engine == "agy" and "codex" in shared.engines and shared.pause_until > time.time():
+        if engine == "agy" and "codex" in shared.engines and shared.agy_paused():
             return "requeue"
         if engine == "codex" and shared.agy_enabled and control.state in {"paused", "stopped"}:
             return "requeue"
@@ -729,6 +888,8 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
                         "elapsed_sec": 0.0, "searches": 0, "usage": {}}
         if shared.stop.is_set():
             return None
+        if engine == "agy":
+            shared.note_account(response.get("agy_account"), started, log, "呼叫")
         response["evaluation"] = evaluate(response["output"], labels, original)
         response["label"] = label
         if response.get("command_executions"):
@@ -882,7 +1043,10 @@ def main(argv=None):
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--quota-poll-min", type=float,
                         help="Antigravity 額度暫停最多幾分鐘就由一個 worker 試探；不給則等到重設時間")
+    parser.add_argument("--expected-agy-account", metavar="EMAIL",
+                        help="預期 agy 登入的帳號，不符就暫停 Antigravity；<work-dir>/expected-account 檔優先，每次檢查都重讀")
     args = parser.parse_args(argv)
+    args.expected_agy_account = (args.expected_agy_account or "").strip() or None
     engines = args.engines.split(",")
     if not engines or len(set(engines)) != len(engines) or any(engine not in {"agy", "codex"} for engine in engines):
         parser.error("--engines 必須是 agy、codex 或 agy,codex")
@@ -937,13 +1101,26 @@ def main(argv=None):
             log.error("仍有失敗段落的檔案：%s", "、".join(sorted(failed_files)))
         return 1 if failed_files else 0
     if "agy" in engines:
-        check_model(args.model)
+        account_started = time.time()
+        startup_account = check_model(args.model, agy_log_path(args.work_dir, "models"))
+        prune_agy_logs(args.work_dir)
         check_hook(ws, args.max_search)
     base = float(os.environ.get("HAIXIA_BACKOFF_BASE_SEC", "300"))
     maximum = float(os.environ.get("HAIXIA_BACKOFF_MAX_SEC", "3600"))
     shared = SharedState(args.work_dir, len(jobs), hours, len(documents), base, maximum)
     shared.agy_enabled = "agy" in engines
     shared.codex_mode = args.codex_mode
+    if "agy" in engines:
+        shared.expected_arg = args.expected_agy_account
+        shared.account_poll = float(os.environ.get("HAIXIA_ACCOUNT_POLL_SEC", "120"))
+        with shared.lock:
+            shared.account_expected = shared.expected_account()
+        if shared.account_expected:
+            log.info("預期的 Antigravity 帳號：%s；帳號不符就暫停 Antigravity。要換預期帳號就改 %s（不必重啟）",
+                     shared.account_expected, args.work_dir / "expected-account")
+        else:
+            log.info("沒有設定預期的 Antigravity 帳號：只記錄每次呼叫實際登入的帳號，不管控")
+        shared.note_account(startup_account, account_started, log, "啟動檢查")
     if args.quota_poll_min is not None:
         shared.quota_poll = args.quota_poll_min * 60
         if "agy" in engines:
@@ -1015,14 +1192,14 @@ def main(argv=None):
                 if not waiting and inflight == 0:
                     return
                 if engine == "agy":
-                    available = (shared.pause_until <= time.time() and
+                    available = (not shared.agy_paused() and
                                  not (shared.probing and shared.probe_owner is not None))
                 else:
                     if control.state == "stopped":
                         return
                     available = (control.pause_until <= time.time() and
                                  (args.codex_mode == "parallel" or not shared.agy_enabled or
-                                  shared.pause_until > time.time()))
+                                  shared.agy_paused()))
                 if not waiting or not available:
                     condition.wait(.2)
                     continue
@@ -1030,7 +1207,7 @@ def main(argv=None):
                 continue
             with condition:
                 if not waiting or (engine == "codex" and args.codex_mode == "relay" and
-                                   shared.agy_enabled and shared.pause_until <= time.time()):
+                                   shared.agy_enabled and not shared.agy_paused()):
                     continue
                 job = waiting.popleft()
                 inflight += 1
@@ -1064,6 +1241,7 @@ def main(argv=None):
                 pass
             if shared.agy_enabled:
                 shared.check_resume_now(log)
+                shared.poll_account(log)
             if time.monotonic() >= next_progress:
                 shared.progress(log)
                 next_progress = time.monotonic() + 300

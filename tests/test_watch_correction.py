@@ -337,3 +337,70 @@ def test_codex_quota_pause_does_not_ask_to_switch_account(monitor, capsys):
     output = capsys.readouterr().out
     assert "ALERT" not in output and "Codex 週額度停止" in output
     assert not sent(calls)
+
+
+def test_account_mismatch_alerts_once_per_round(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    since = (current[0] - timedelta(minutes=1)).isoformat()
+    status.update(state="paused", agy_account="a@example.com", agy_expected_account="c@example.com",
+                  agy_account_mismatch=True, agy_account_mismatch_since=since,
+                  engines={"agy": {"state": "paused", "reason": None}})
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "ALERT" in output and "Antigravity 帳號不符" in output
+    assert "預期帳號：c@example.com" in output and "實際帳號：a@example.com" in output
+    assert "請在 agy 視窗登入預期的帳號；如果要改用實際的帳號，請告訴指揮更新 expected-account" in output
+    assert str(watcher.work_dir / "expected-account") in output and str(watcher.work_dir / "resume-now") in output
+    assert [call[5:8] for call in sent(calls)] == [["status", "--subject", "校正監視警報：Antigravity 帳號不符"]]
+
+    # 同一輪（since 相同）不再送，即使實際帳號變了。
+    for actual in ("a@example.com", "b@example.com"):
+        current[0] += timedelta(minutes=2)
+        status.update(updated_at=current[0].isoformat(), agy_account=actual)
+        save()
+        watcher.check_once()
+    assert len(sent(calls)) == 1
+
+    # 帳號符合後只記 INFO、不通知；下一輪（新的 since）即使在 6 小時內也再通知一次。
+    current[0] += timedelta(minutes=2)
+    status.update(state="running", agy_account="c@example.com", agy_account_mismatch=False,
+                  agy_account_mismatch_since=None, engines={"agy": {"state": "running"}})
+    save()
+    capsys.readouterr()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "INFO" in output and "Antigravity 帳號已符合" in output and "ALERT" not in output
+    assert len(sent(calls)) == 1
+    current[0] += timedelta(minutes=30)
+    status.update(state="paused", agy_account="a@example.com", agy_account_mismatch=True,
+                  agy_account_mismatch_since=current[0].isoformat(), updated_at=current[0].isoformat(),
+                  engines={"agy": {"state": "paused"}})
+    save()
+    watcher.check_once()
+    watcher.check_once()
+    assert len(sent(calls)) == 2
+
+
+def test_no_mismatch_alert_without_mismatch(monitor, capsys):
+    watcher, status, save, _current, _free, calls = monitor
+    status.update(agy_account="a@example.com", agy_expected_account=None,
+                  agy_account_mismatch=False, agy_account_mismatch_since=None)
+    save()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert "帳號不符" not in output and "帳號已符合" not in output and not sent(calls)
+
+
+def test_quota_alert_includes_current_account(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    five = 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h31m45s'
+    status.update(state="paused", agy_account="c@example.com",
+                  agy_quota_exhausted_since=current[0].isoformat(), agy_quota_message=five,
+                  agy_quota_kind="five_hour", agy_quota_resets_at=None,
+                  engines={"agy": {"state": "paused", "quota_poll_min": 10}})
+    save()
+    watcher.check_once()
+    assert "5 小時額度用完（目前帳號：c@example.com）" in capsys.readouterr().out
+    body = sent(calls)[0][sent(calls)[0].index("--body") + 1]
+    assert "目前帳號：c@example.com" in body

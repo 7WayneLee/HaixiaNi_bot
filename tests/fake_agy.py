@@ -10,8 +10,53 @@ import time
 from pathlib import Path
 from fcntl import LOCK_EX, LOCK_UN, flock
 
-if sys.argv[1:] == ["models"]:
-    print("gemini-3.8-flash-high")
+
+def bump(path):
+    """跨程序遞增計數檔，回傳新值。"""
+    with Path(path).open("a+") as output:
+        flock(output, LOCK_EX)
+        output.seek(0)
+        value = int(output.read() or "0") + 1
+        output.seek(0)
+        output.truncate()
+        output.write(str(value))
+        output.flush()
+        flock(output, LOCK_UN)
+    return value
+
+
+def current_account():
+    """模擬鑰匙圈裡的登入帳號：FAKE_AGY_ACCOUNT_FILE 優先（測試可中途改寫），其次 FAKE_AGY_ACCOUNT；空字串表示 log 裡沒有帳號。"""
+    path = os.environ.get("FAKE_AGY_ACCOUNT_FILE")
+    if path and Path(path).exists():
+        return Path(path).read_text().strip()
+    return os.environ.get("FAKE_AGY_ACCOUNT", "a@example.com")
+
+
+def write_log(account):
+    """像真的 agy 一樣把 applyAuthResult 寫進 --log-file（根層級旗標）。"""
+    if not log_file:
+        return
+    with Path(log_file).open("a") as output:
+        output.write("I0926 17:42:37.562615     264 keyring.go:64] keyringAuth: loaded token, expired=false\n")
+        if account:
+            output.write(f"I0926 17:42:37.562708       1 server_oauth.go:196] applyAuthResult: "
+                         f"email={account}, authMethod=consumer, quotaProject=\n")
+
+
+argv = sys.argv[1:]
+log_file = None
+if argv[:1] == ["--log-file"]:
+    log_file, argv = argv[1], argv[2:]
+if argv[:1] == ["models"]:
+    if argv[1:]:
+        # 真的 agy：models 子命令不認得 --log-file 等旗標。
+        print("Error: flags provided but not defined: " + argv[1], file=sys.stderr)
+        sys.exit(2)
+    if os.environ.get("FAKE_AGY_MODELS_COUNTER"):
+        bump(os.environ["FAKE_AGY_MODELS_COUNTER"])
+    write_log(current_account())
+    print("gemini-3.8-flash-high\tGemini 3.8 Flash (High)")
     sys.exit(0)
 
 mode = os.environ.get("FAKE_AGY_MODE", "normal")
@@ -31,15 +76,12 @@ if call_log:
 number = 0
 counter = os.environ.get("FAKE_AGY_COUNTER")
 if counter:
-    with Path(counter).open("a+") as output:
-        flock(output, LOCK_EX)
-        output.seek(0)
-        number = int(output.read() or "0") + 1
-        output.seek(0)
-        output.truncate()
-        output.write(str(number))
-        output.flush()
-        flock(output, LOCK_UN)
+    number = bump(counter)
+# 模擬另一個 agy 視窗更新登入資料：第 FAKE_AGY_FLIP_AT 次呼叫開始時，鑰匙圈的帳號被換成 FAKE_AGY_FLIP_TO。
+flip_at = os.environ.get("FAKE_AGY_FLIP_AT")
+if flip_at and number == int(flip_at):
+    Path(os.environ["FAKE_AGY_ACCOUNT_FILE"]).write_text(os.environ["FAKE_AGY_FLIP_TO"] + "\n")
+write_log(current_account())
 timeline = os.environ.get("FAKE_AGY_TIMELINE")
 if timeline:
     def write_timeline():

@@ -130,6 +130,15 @@
       - 已完成 112/440 檔、913 段，全部 ok：Antigravity 596 段、Codex 317 段。
       - 校正版已備份到 `gs://haixiani-bot-data-507014/transcripts/corrected/`（112 個，rclone check 相符）。
       - 恢復時要重啟校正程式和監視程式：監視程式看到 aborted 就會自行結束。
+    - **帳號被悄悄換掉的根本原因**（2026-09-26 查明）：
+      - 所有 agy 共用 macOS 鑰匙圈裡同一份登入資料；長時間開著的互動式 agy 每小時會自動更新登入資料並寫回鑰匙圈（log：`token refreshed`）。
+      - 當時另外兩個 agy 分頁登入 A，每小時 18、19 分更新時把登入資料改回 A；批次每段都開新的 agy，就在 10:18、11:18、12:19、17:19 被切回 A。
+      - 所以早上兩次「5 小時額度用完、13:15 重設」其實是 A。使用者同意後關掉那兩個 agy。
+      - 規則：同一時間只留一個 agy 登入；登入別的帳號查 `/usage` 後要馬上登入回來。
+    - 帳號保險（2026-09-26，Claude Code worker 撰寫，285 個測試通過）：
+      - 每次 agy 呼叫加 `--log-file`（根層級旗標，要放在 `-p`／`models` 前面），解析 `applyAuthResult` 記下實際帳號。
+      - `<work-dir>/expected-account` 寫預期帳號；不符就暫停 Antigravity 並通知，每 2 分鐘用不耗額度的 `agy models` 檢查，恢復後繼續。
+      - 換帳號接力時，指揮要同時更新 expected-account；電子郵件只放在本機的 work-dir，不進 repo。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
