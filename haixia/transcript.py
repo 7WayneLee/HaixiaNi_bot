@@ -285,7 +285,7 @@ def validate_corrected(document):
     fields = {"tool", "model", "max_search", "created_at", "prompt_sha256", "chunks"}
     if not isinstance(correction, dict) or set(correction) != fields:
         raise ValueError("correction 欄位錯誤")
-    if correction["tool"] not in {"antigravity-cli", "codex-cli", "mixed"} or not isinstance(correction["model"], str) or not correction["model"]:
+    if correction["tool"] not in {"antigravity-cli", "codex-cli", "claude-cli", "mixed"} or not isinstance(correction["model"], str) or not correction["model"]:
         raise ValueError("correction 工具或模型不正確")
     if type(correction["max_search"]) is not int or correction["max_search"] < 0:
         raise ValueError("correction.max_search 必須是非負整數")
@@ -302,7 +302,7 @@ def validate_corrected(document):
         modern = legacy | {"engine", "model", "effort"}
         if not isinstance(chunk, dict) or set(chunk) not in (legacy, modern):
             raise ValueError(f"correction.chunks 第 {index} 段欄位錯誤")
-        if set(chunk) == modern and (chunk["engine"] not in {"antigravity-cli", "codex-cli"}
+        if set(chunk) == modern and (chunk["engine"] not in {"antigravity-cli", "codex-cli", "claude-cli"}
                                      or not isinstance(chunk["model"], str) or not chunk["model"]
                                      or chunk["effort"] is not None and not isinstance(chunk["effort"], str)):
             raise ValueError(f"correction.chunks 第 {index} 段引擎欄位錯誤")

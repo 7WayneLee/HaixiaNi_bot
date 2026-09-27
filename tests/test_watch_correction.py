@@ -404,3 +404,29 @@ def test_quota_alert_includes_current_account(monitor, capsys):
     assert "5 小時額度用完（目前帳號：c@example.com）" in capsys.readouterr().out
     body = sent(calls)[0][sent(calls)[0].index("--body") + 1]
     assert "目前帳號：c@example.com" in body
+
+
+def test_claude_quota_pause_is_info_other_stop_alerts(monitor, capsys):
+    watcher, status, save, current, _free, calls = monitor
+    until = (current[0] + timedelta(hours=2)).isoformat()
+    status["engines"] = {"claude": {"state": "paused", "reason": "Claude session 額度 81% 已達上限 80%",
+                                    "paused_until": until, "session_used_percent": 81}}
+    save()
+    watcher.check_once()
+    watcher.check_once()
+    output = capsys.readouterr().out
+    assert output.count("claude 引擎因額度暫停") == 1 and "ALERT" not in output
+    status["engines"]["claude"].update(reason="Claude 回報額度用完（five_hour）",
+                                       paused_until=(current[0] + timedelta(hours=3)).isoformat())
+    save()
+    watcher.check_once()
+    assert "claude 引擎因額度暫停" in capsys.readouterr().out and not sent(calls)
+    status["engines"]["claude"].update(state="stopped", reason="Claude 週額度 95% 已達上限 90%")
+    save()
+    watcher.check_once()
+    assert "claude 引擎因額度停止" in capsys.readouterr().out and not sent(calls)
+    status["engines"]["claude"].update(state="stopped", reason="claude 找不到執行檔")
+    save()
+    watcher.check_once()
+    assert "ALERT" in capsys.readouterr().out
+    assert [call for call in sent(calls) if "claude 引擎停止" in " ".join(call)]

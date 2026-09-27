@@ -86,6 +86,7 @@ class CorrectionWatcher:
         self.last_quota_pause = None
         self.last_daily_date = None
         self.engine_stops_seen = set()
+        self.engine_pauses_seen = set()
         self.quota_round = None
         self.mismatch_round = None
 
@@ -247,6 +248,17 @@ class CorrectionWatcher:
                 self.write("INFO", now, f"{engine} 引擎因額度停止", reason)
             elif reason != "執行結束":
                 self.alert(f"{engine} 引擎停止", reason, now)
+
+        # Codex、Claude 因額度暫停只記 INFO，每次暫停記一行；斷路器暫停另由 log 的「連續 N 次呼叫失敗」發警報。
+        for engine, detail in status.get("engines", {}).items():
+            if engine == "agy" or detail.get("state") != "paused":
+                continue
+            reason = str(detail.get("reason") or "")
+            key = (engine, detail.get("paused_until"))
+            if key in self.engine_pauses_seen or not QUOTA_ERROR.search(reason):
+                continue
+            self.engine_pauses_seen.add(key)
+            self.write("INFO", now, f"{engine} 引擎因額度暫停", f'{reason}；預計 {detail.get("paused_until")} 再試')
 
         self.alert("程式意外結束", f'PID {status.get("pid")} 已不存在，state={state}', now,
                    not self.pid_alive_fn(status.get("pid")))

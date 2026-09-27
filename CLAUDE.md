@@ -147,6 +147,13 @@
     - 2026-09-26 20:41 使用者新增第 4 個 Gemini 帳號 D（週額度、5 小時額度都是 100%），expected-account 改成 D 後恢復校正，剩 289 檔、2,294 段。
       - Orca 在這之前重新啟動過：分頁代號變了，scratchpad 被清空，等待用的小程式已重建。
       - 校正分頁、監視分頁沿用原本的兩個空分頁，並重新命名。
+    - 加入 Claude 引擎（2026-09-27，使用者要求在 Gemini 帳號都沒額度的空檔，用 Claude Opus 5.5 medium 接手；Claude Code worker 撰寫，317 個測試通過）：
+      - `claude -p`：只開 WebSearch、PreToolUse hook 每段最多 5 次搜尋、`--setting-sources ""`、空 MCP、不保存 session；`--bare` 會讓訂閱登入失效，所以不用。
+      - 5 小時額度 80% 暫停，週額度不設限（使用者有重設券）；另有 `--claude-timeout 300` 和 `--claude-max-budget-usd 1`。
+      - 實測針灸5（2）8 段全部 ok：字錯率 19.0%、召回 92%（Antigravity 18.7%／100%）。
+      - 正常的一段約占 5 小時額度 1.5%、週額度 0.25% 以下，一個 5 小時週期最多約 50 段。
+      - 有一次呼叫卡了 930 秒，期間 5 小時額度漲了約 23 個百分點。
+      - 指揮與 worker 共用同一個 Claude 額度。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試

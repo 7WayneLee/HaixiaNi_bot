@@ -6,6 +6,7 @@
 
 - 安裝並登入 Antigravity CLI；`agy models` 應列出 `gemini-3.8-flash-high`。
 - 若使用 Codex，安裝並登入 Codex CLI，並確認 `orca account list --json` 能讀取 Codex 的 session 與 weekly 額度。
+- 若使用 Claude，Claude Code CLI 要用訂閱帳號登入（`claude auth`），並確認 `orca account list --json` 能讀取 `claude` 的 session 與 weekly 額度。
 - 使用本專案的 `.venv`，並確認磁碟有空間存 ASR、校正版和工作快取。
 - 在 repo 外指定 `--work-dir`，例如 `/tmp/haixia-correct-work`。程式會建立 `ws/.agents/` 的 hook 設定；`ws/` 不放逐字稿或其他檔。
 
@@ -65,13 +66,79 @@ caffeinate -i .venv/bin/python scripts/correct_transcripts.py \
 
 Codex 在 repo 外的 `工作目錄/codex-ws/` 空資料夾執行，stdin 關閉，網路搜尋設為 `cached`；這台機器的 `live` 搜尋會遇到授權錯誤。Codex 每次呼叫前檢查 Orca 額度，最多每 60 秒查一次。週額度達 `--codex-weekly-max`（預設 80%）時，本次執行停用 Codex，Antigravity 繼續；session 達 `--codex-session-max`（預設 85%）時，Codex 暫停到 `resetsAt` 後 2 分鐘。Codex 自己回報 usage limit、HTTP 429，或「Your workspace is out of credits. Add credits to continue.」（2026-09-26 實測是 5 小時額度用完，重設後就恢復），都算額度錯誤：按 session 重設時間加 2 分鐘暫停，重設時間不明時用指數退避；不算段落失敗，也不觸發斷路器。資料讀不到時保守暫停 15 分鐘。websocket 斷線後接 401 的錯誤視為暫時性連線錯誤重試，並非額度用完。錯誤訊息內的 `sk-` 金鑰字串會在 log、狀態與快取中遮蔽。
 
+## Claude Code 接手（Claude Opus 5.5）
+
+Antigravity 沒額度的空檔，也可以讓 Claude Code CLI 接手。`--engines` 可以是 `agy`、`codex`、`claude` 以逗號分隔的任意組合，例如：
+
+```bash
+caffeinate -i .venv/bin/python scripts/correct_transcripts.py \
+  --in-dir "$HOME/haixia-asr" --out-dir "$HOME/haixia-corrected" \
+  --work-dir "$HOME/haixia-correct-work" --engines agy,codex,claude --codex-mode relay \
+  --agy-jobs 4 --codex-jobs 4 --claude-jobs 4 --quota-poll-min 10
+```
+
+參數：`--claude-jobs`（預設 4）、`--claude-model`（預設 `claude-opus-5-5`）、`--claude-effort`（預設 `medium`）、`--claude-session-max`（預設 80）、`--claude-weekly-max`（預設 100，也就是不設限）、`--claude-timeout`（預設 300 秒）、`--claude-max-budget-usd`（預設 1.0）。提示詞和 Antigravity、Codex 完全相同，`prompt_sha256` 不變。
+
+### 2026-09-27 實測（針灸5（2），8 段，`--claude-jobs 2`）
+
+- 8 段全部 ok。正常的段每段 8–70 秒（多半 30–45 秒），只有 1 段搜尋 1 次；1 段第一次少一行，重跑後合格。
+- 第 1 段的第一次呼叫**卡了 15 分鐘沒有結果**（當時的逾時是 900 秒），重跑 34 秒就完成。卡住的這段時間 5 小時額度從 38% 漲到 61%，同時間只有它在跑批次（指揮和 worker 也在用同一個額度，分不開），所以失控的呼叫可能很耗額度。因此 Claude 另設 `--claude-timeout`（預設 300 秒）和 `--claude-max-budget-usd`（預設 1 美元）。`--max-budget-usd` 在訂閱登入下也有效，但每輪回應結束才檢查，擋不住單一回應一直不結束，那種情況靠逾時。
+- 評分（原檔 10:00–14:00，字錯率／中醫詞召回）：原始 ASR 27.5%／15%，Antigravity 18.7%／100%，Claude 19.0%／92%（漏 1 個「壓痛點」）。
+- 額度：正常段依 API 牌價估算每段約 0.08–0.23 美元（平均約 0.15）。串流回報的 5 小時用量在前 8 次呼叫完成期間從 26% 漲到 38%，含卡住的呼叫與其他 session，所以每段最多約 1.5%；週額度同一期間從 72% 到 73%（只有整數精度），每段約 0.25% 以下。
+
+### 接力
+
+`--codex-mode` 同時管 Codex 和 Claude。relay（預設）時，Codex 和 Claude 只在 Antigravity 暫停（額度、斷路器、帳號不符）或沒啟用時取新段；Antigravity 恢復後，它們做完手上的段就停止取新段。Codex 和 Claude 都能用時，兩者都會取段。三個引擎的暫停互相獨立：某個引擎因額度暫停時，手上還沒成功的段放回佇列前端，由其他引擎接手。暫停時間到了，該引擎會先確認額度再恢復取段。
+
+### 呼叫方式與隔離
+
+每段呼叫一次：
+
+```
+claude -p --model claude-opus-5-5 --effort medium --no-session-persistence \
+  --output-format stream-json --verbose --max-budget-usd 1 \
+  --setting-sources "" --settings '{"autoMemoryEnabled": false, "hooks": {"PreToolUse": …gate.py…}}' \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --tools WebSearch --allowedTools WebSearch --permission-mode dontAsk \
+  --disable-slash-commands --no-chrome -- <提示詞>
+```
+
+- 工作目錄是 repo 外的空資料夾 `工作目錄/claude-ws/`，stdin 接 `/dev/null`，不保存 session。
+- `--setting-sources ""`：不載入使用者、專案的設定檔，所以使用者的 hooks（例如 Orca 的狀態回報）和外掛都不會載入；`--strict-mcp-config` 加空的 MCP 設定，不載入任何 MCP；`--disable-slash-commands` 關掉技能；`autoMemoryEnabled: false` 關掉自動記憶。2026-09-27 實測（Claude Code 2.1.283）：這個組合在訂閱登入（OAuth）下可以正常呼叫，init 事件裡的工具只有 `WebSearch`，沒有使用者的外掛、MCP、技能。
+- **不用 `--bare`**：它只認 `ANTHROPIC_API_KEY`，不讀訂閱登入，實測會回「Not logged in · Please run /login」。也絕對不用 `--dangerously-skip-permissions`。
+- 程式會拿掉呼叫端的 `CLAUDECODE`、`CLAUDE_CODE_SESSION_*` 等 session 變數和 `ORCA_AGENT_*`，避免批次的 claude 被當成外層 session 的一部分。
+- 逾時（`--claude-timeout` 加寬限）與 Ctrl-C 的處理和 Antigravity、Codex 一樣，殺整個程序群組。逾時的嘗試會在快取記下收到幾個事件、最後幾個事件的種類和已輸出的字數。
+- `--max-budget-usd`（`--claude-max-budget-usd`）超過時 result 是 `error_max_budget_usd`，算一般錯誤、照重試次數重跑。
+
+### 工具與搜尋上限
+
+- `--tools WebSearch` 讓模型只看得到網路搜尋；`--permission-mode dontAsk` 加 `--allowedTools WebSearch`，其他需要核准的動作一律自動拒絕。
+- `--settings` 帶 PreToolUse hook（`tools/claude_hook/gate.py`，啟動時複製到 `工作目錄/claude-hook/`）：每個 session 最多放行 `--max-search` 次（預設 5）WebSearch，第 6 次起拒絕並告訴模型直接依聲音與上下文判斷；WebFetch、Bash 等其他工具一律拒絕。Claude 可能在同一則訊息同時搜尋好幾次，所以計數檔有上鎖。每次工具呼叫都記到 `claude-hook/audit.jsonl`。程式啟動前會以假工具呼叫檢查 hook。
+- 搜尋次數從 stream-json 算：`WebSearch` 的 `tool_use` 中沒被拒絕的次數記為 `searches`，被 hook 拒絕的記為 `searches_denied`。每次嘗試的快取（`chunks/…/NNNNN.attemptK.json`）另記 `hook_searches`（稽核紀錄的放行次數）、`queries`（搜尋字串）、`usage`（token 數、`web_search_requests`、`total_cost_usd` 等）和 `rate_limit`（最後一個 rate_limit_event）。出現 WebSearch 以外的工具呼叫時 log 會警告。
+
+### 額度管控
+
+- 每次取段前（最多每 60 秒一次）讀 `orca account list --json` 的 `result.rateLimits.claude.session` 和 `weekly`（`usedPercent`、`resetsAt`）。每次呼叫的 stream-json 也有 `rate_limit_event`（`five_hour`、`seven_day` 的 `utilization`），比 Orca 即時，程式一併採用。同一個額度週期內用量只增不減，所以兩個來源取重設時間較晚的週期，同一週期取較大值。
+- session ≥ `--claude-session-max`（預設 80%）：Claude 暫停到 session 重設時間加 2 分鐘；重設時間已過但資料還沒更新時，一分鐘後再讀。
+- `--claude-weekly-max` 預設 100，表示不設限；設成小於 100 時，週額度達上限就在本次執行停用 Claude。
+- Claude 回報 usage limit、rate limit（例如「You've hit your limit」、`rate_limit_event` 的 `status` 為 `rejected`、HTTP 429）算額度錯誤，不算段落失敗、不觸發斷路器：
+  - 被拒的是 6 小時內會重設的額度（5 小時額度）：暫停到它的重設時間加 2 分鐘；
+  - 被拒的是週額度：從 5 分鐘起指數退避、最長每 60 分鐘重試（使用者可能用重設券，不等到重設時間）；
+  - 沒有重設時間：依 Orca 的 session 重設時間加 2 分鐘暫停，也不知道時就指數退避。
+- 讀不到額度資料時保守暫停 15 分鐘。
+- 注意：已經在跑的呼叫不會被中斷，所以 session 用量可能超過上限最多「同時呼叫數 × 每段用量」。指揮和寫程式的 worker 也用同一個 Claude 額度，需要時可降低 `--claude-jobs` 或 `--claude-session-max`。
+
+### 紀錄
+
+每段中繼資料記 `engine`=`claude-cli`、`model`、`effort`；`correction.tool` 在整份都由 Claude 完成時是 `claude-cli`，混用時是 `mixed`。`status.json` 的 `engines.claude` 有狀態、暫停時間、原因、完成段數、平均耗時，以及最後讀到的 `session_used_percent`、`weekly_used_percent`、`session_resets_at`、`weekly_resets_at`。舊格式（沒有 `engine` 等欄位）的校正版仍然有效。
+
 ## 暫停、續跑與監看
 
 每段、每次嘗試會存到 `工作目錄/chunks/`，完成檔則寫到 `--out-dir`。按 Ctrl-C 後，程式立即停止派新段，向進行中的 CLI 程序群組送出 SIGTERM；5 秒後仍未結束就送 SIGKILL。被中止的段不寫入快取，用同一組目錄重跑即可續跑。退出碼 0 表示無 failed 段，1 表示有 failed 段沿用 ASR 或段落未完成，2 表示手動中止。
 
 Antigravity 的額度每 5 小時重設一次，所有模型共用。額度錯誤若提供 `Resets in` 倒數，Antigravity worker 會暫停至預計重設時間再加 2 分鐘（加了 `--quota-poll-min` 時最多只停那麼久，見下方「換 Gemini 帳號接力」）；多個 worker 回報不同時間時取最晚的。倒數缺失或不合理時，才從 5 分鐘起指數退避，最多 60 分鐘。額度暫停不扣段落重試次數。網路錯誤、空輸出或其他 CLI 錯誤若連續三次出現，也會啟動該引擎的斷路暫停；暫停中其他 worker 回報的錯誤不會提高退避等級。成功呼叫會清除連續錯誤計數。`工作目錄/logs/correct.log` 有每段結果、仍有 failed 段的檔名和每五分鐘進度；`工作目錄/status.json` 有 `running`、`paused`、`finished`、`aborted` 狀態、PID、啟動時間、最後完成段落時間、已知額度重設時間、下次嘗試時間、計數與最後錯誤。
 
-雙引擎模式下，額度暫停、斷路器和連線錯誤各自計算，不會暫停另一個引擎。`status.json` 的 `engines` 區塊記錄各引擎狀態、暫停時間、原因、完成段數與平均耗時；Codex 另記最近的 session／weekly 使用百分比。`codex_mode` 和 `active_engines` 顯示接力／並行模式及目前正在呼叫的引擎。監視程式對非額度原因停止的引擎發警報；停止原因是額度錯誤（含 `RESOURCE_EXHAUSTED`、`429`、`quota` 或「額度」）時只記 INFO，Codex 達週上限也只記 INFO。校正程式中止或結束時，狀態檔會把各引擎標成 stopped 並沿用最後一次的錯誤，所以整體狀態是 `aborted` 或 `finished` 時不檢查引擎停止，只送結束通知。
+雙引擎模式下，額度暫停、斷路器和連線錯誤各自計算，不會暫停另一個引擎。`status.json` 的 `engines` 區塊記錄各引擎狀態、暫停時間、原因、完成段數與平均耗時；Codex 另記最近的 session／weekly 使用百分比。`codex_mode` 和 `active_engines` 顯示接力／並行模式及目前正在呼叫的引擎。監視程式對非額度原因停止的引擎發警報；停止原因是額度錯誤（含 `RESOURCE_EXHAUSTED`、`429`、`quota` 或「額度」）時只記 INFO，Codex 達週上限也只記 INFO。Codex、Claude 因額度暫停時，每次暫停在 `logs/watch.log` 記一行 INFO（「claude 引擎因額度暫停」），不發通知；斷路器暫停照舊由 log 的「連續 N 次呼叫失敗」發警報。校正程式中止或結束時，狀態檔會把各引擎標成 stopped 並沿用最後一次的錯誤，所以整體狀態是 `aborted` 或 `finished` 時不檢查引擎停止，只送結束通知。
 
 建議在**另一個 Orca 終端機分頁**啟動不用 AI 的監視程式，檢查 PID、進度、log 與磁碟。它只讀校正資料，僅寫自己的 `logs/watch.log`；異常才發 ALERT。可選擇將警報及每日摘要送到 Orca Run；先把 `RUN_ID` 設成目標 Run ID：
 

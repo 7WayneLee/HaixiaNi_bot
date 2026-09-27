@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用 Antigravity CLI 並行校正逐字稿，支援斷點續跑。"""
+"""用 Antigravity、Codex、Claude Code CLI 並行校正逐字稿，支援斷點續跑。"""
 
 import argparse
 from collections import deque
@@ -9,6 +9,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -25,9 +26,13 @@ from haixia.transcript import save_corrected, validate, validate_corrected
 
 ROOT = Path(__file__).resolve().parents[1]
 # Codex 額度用完時回「Your workspace is out of credits. Add credits to continue.」（2026-09-26 實測，5 小時額度重設後恢復）。
+# Claude Code 訂閱額度用完時回「You've hit your limit · resets …」或「Claude AI usage limit reached」，
+# stream-json 另有 status 為 rejected 的 rate_limit_event。
 QUOTA = re.compile(r"RESOURCE_EXHAUSTED|\b429\b|quota|rate.?limit|too many requests|usage limit|"
-                   r"out of credits|add credits|額度|限速", re.I)
-NETWORK = re.compile(r"connection|network|dns|timed? ?out|unreachable|unavailable|socket|ECONN|ENET|連線|網路", re.I)
+                   r"out of credits|add credits|hit your (?:\w+ ){0,3}limit|(?:session|weekly|opus) limit|"
+                   r"額度|限速", re.I)
+NETWORK = re.compile(r"connection|network|dns|timed? ?out|unreachable|unavailable|overloaded|socket|"
+                     r"ECONN|ENET|連線|網路", re.I)
 SECRET = re.compile(r"sk-[A-Za-z0-9*_\-]+")
 OUTPUT_LINE = re.compile(r"^\s*\[\d+(?:\.\d+)?\]", re.M)
 RESET_TIME = re.compile(r"Resets\s+in\s+(\d+(?:h|m|s)(?:\d+(?:h|m|s))*)(?=$|[\s\"',.!?}\]])", re.I)
@@ -37,6 +42,12 @@ WEEKLY_RESET_SEC = 6 * 3600
 # 每個 agy 程序的 log 都有一行 applyAuthResult，記錄這次實際登入的帳號。
 AUTH_EMAIL = re.compile(r"applyAuthResult:\s*email=([^,\s]*)")
 AGY_LOG_KEEP = 500
+ENGINE_TOOLS = {"agy": "antigravity-cli", "codex": "codex-cli", "claude": "claude-cli"}
+TOOL_ENGINES = {tool: engine for engine, tool in ENGINE_TOOLS.items()}
+# 批次的 claude 不能沿用呼叫端（Claude Code、Orca）的 session 與 hook 環境變數。
+CLAUDE_ENV_DROP = re.compile(r"^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|"
+                             r"CLAUDE_CODE_(ENTRYPOINT|CHILD_SESSION|EXECPATH|SESSION_\w*|MESSAGING_\w*)|"
+                             r"ORCA_AGENT_\w*)$")
 
 
 def reset_countdown(text):
@@ -279,6 +290,170 @@ def run_codex(prompt, model, effort, timeout, ws, shared):
             "usage": usage, "command_executions": commands}
 
 
+def setup_claude(work_dir):
+    """claude 在空的 <work-dir>/claude-ws 執行；hook 放在 <work-dir>/claude-hook（計數與稽核紀錄也在那裡）。"""
+    work_dir = Path(work_dir).resolve()
+    if work_dir == ROOT or ROOT in work_dir.parents:
+        raise ValueError("--work-dir 必須放在 repo 外面")
+    ws = work_dir / "claude-ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    if any(ws.iterdir()):
+        raise ValueError("claude-ws 工作目錄必須是空的")
+    hook_dir = work_dir / "claude-hook"
+    hook_dir.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / "tools/claude_hook/gate.py", hook_dir / "gate.py")
+    return ws, hook_dir
+
+
+def check_claude_hook(hook_dir, max_search):
+    """以假工具呼叫確認 hook 放行 WebSearch（max_search 為 0 時拒絕）、拒絕其他工具。"""
+    gate = Path(hook_dir) / "gate.py"
+    env = dict(os.environ, HAIXIA_CLAUDE_LABEL="自我測試", HAIXIA_CLAUDE_MAX_SEARCH=str(max_search))
+    for tool, allowed in (("WebSearch", bool(max_search)), ("Bash", False), ("WebFetch", False)):
+        payload = {"session_id": f"selftest-{os.getpid()}-{time.time_ns()}", "hook_event_name": "PreToolUse",
+                   "tool_name": tool, "tool_input": {}}
+        result = subprocess.run([sys.executable, str(gate)], input=json.dumps(payload), text=True,
+                                capture_output=True, cwd=hook_dir, env=env, timeout=10)
+        denied = bool(result.stdout.strip()) and json.loads(result.stdout)["hookSpecificOutput"][
+            "permissionDecision"] == "deny"
+        if result.returncode or denied == allowed:
+            raise RuntimeError(f"Claude hook 自我測試失敗：{tool}：{result.stderr}")
+
+
+def claude_command(prompt, model, effort, hook_dir, budget):
+    """只開 WebSearch；不載入使用者的設定檔（hooks、外掛）、MCP、技能，不保存 session。
+    --bare 會讓訂閱登入失效（只認 ANTHROPIC_API_KEY），所以不用。
+    --max-budget-usd 是依 API 牌價估算的金額（訂閱登入也有），每輪回應結束才檢查，擋得住多輪失控，
+    擋不住單一回應一直不結束；那種情況靠 --claude-timeout。"""
+    gate = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(hook_dir) / 'gate.py'))}"
+    settings = {"autoMemoryEnabled": False,
+                "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                    {"type": "command", "command": gate, "timeout": 10}]}]}}
+    return ["claude", "-p", "--model", model, "--effort", effort, "--no-session-persistence",
+            "--output-format", "stream-json", "--verbose", "--max-budget-usd", f"{budget:g}",
+            "--setting-sources", "", "--settings", json.dumps(settings, ensure_ascii=False),
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--tools", "WebSearch", "--allowedTools", "WebSearch", "--permission-mode", "dontAsk",
+            "--disable-slash-commands", "--no-chrome", "--", prompt]
+
+
+def hook_search_count(audit, label):
+    """claude hook 稽核紀錄裡，這次呼叫放行的 WebSearch 次數。"""
+    count = 0
+    try:
+        with Path(audit).open(encoding="utf-8") as source:
+            for line in source:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                count += item.get("label") == label and item.get("tool") == "WebSearch" and bool(item.get("allow"))
+    except OSError:
+        return 0
+    return count
+
+
+def _json_or_none(line):
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
+def parse_claude_stream(stdout):
+    """解析 claude -p 的 stream-json：最後的回答、錯誤、搜尋次數、用量與 rate_limit_event。"""
+    tools, rejected_tools, queries, notes = {}, set(), [], []
+    result = limits = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            if line.strip():
+                notes.append(line.strip()[-300:])
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        blocks = [block for block in message.get("content") or [] if isinstance(block, dict)] \
+            if isinstance(message.get("content"), list) else []
+        if kind == "assistant":
+            for block in blocks:
+                if block.get("type") == "tool_use":
+                    tools[block.get("id")] = block.get("name")
+                    if block.get("name") == "WebSearch":
+                        queries.append((block.get("input") or {}).get("query"))
+        elif kind == "user":
+            rejected_tools.update(block.get("tool_use_id") for block in blocks
+                                  if block.get("type") == "tool_result" and block.get("is_error"))
+        elif kind == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict):
+            limits = event["rate_limit_info"]
+            if limits.get("status") == "rejected":
+                notes.append(f'Claude rate_limit_event rejected：{limits.get("rateLimitType")}，'
+                             f'resetsAt={limits.get("resetsAt")}')
+        elif kind == "result":
+            result = event
+    output = ""
+    if result is None:
+        # 逾時或中斷時留下線索：收到幾個事件、最後幾個事件的種類、已輸出多少字。
+        kinds = [event.get("type") for event in map(_json_or_none, stdout.splitlines()) if isinstance(event, dict)]
+        text = sum(len(block.get("text") or "") for event in map(_json_or_none, stdout.splitlines())
+                   if isinstance(event, dict) and event.get("type") == "assistant"
+                   for block in ((event.get("message") or {}).get("content") or []) if isinstance(block, dict))
+        notes.append(f"claude 沒有輸出 result 事件（收到 {len(kinds)} 個事件，最後是 {kinds[-5:]}，"
+                     f"回答文字 {text} 字）")
+    elif result.get("is_error") or result.get("subtype") != "success":
+        notes.append(f'claude 回報錯誤（{result.get("subtype")}）：{result.get("result") or ""}')
+    else:
+        output = result.get("result") or ""
+    searches = [tool_id for tool_id, name in tools.items() if name == "WebSearch"]
+    usage = {}
+    if result is not None:
+        tokens = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        models = result.get("modelUsage") if isinstance(result.get("modelUsage"), dict) else {}
+        usage = {"num_turns": result.get("num_turns"), "duration_api_ms": result.get("duration_api_ms"),
+                 "total_cost_usd": result.get("total_cost_usd"),
+                 **{key: tokens.get(key) for key in ("input_tokens", "output_tokens",
+                                                     "cache_read_input_tokens", "cache_creation_input_tokens")},
+                 "web_search_requests": sum(item.get("webSearchRequests") or 0 for item in models.values()
+                                            if isinstance(item, dict))}
+    return {"output": output, "notes": notes, "rate_limit": limits, "usage": usage, "queries": queries,
+            "searches": sum(tool_id not in rejected_tools for tool_id in searches),
+            "searches_denied": sum(tool_id in rejected_tools for tool_id in searches),
+            "other_tool_uses": sum(name != "WebSearch" for name in tools.values())}
+
+
+def run_claude(prompt, model, effort, timeout, ws, hook_dir, label, max_search, shared, budget=1.0):
+    env = {key: value for key, value in os.environ.items() if not CLAUDE_ENV_DROP.match(key)}
+    env.update(HAIXIA_CLAUDE_LABEL=label, HAIXIA_CLAUDE_MAX_SEARCH=str(max_search))
+    began = time.monotonic()
+    process = subprocess.Popen(claude_command(prompt, model, effort, hook_dir, budget), cwd=ws, env=env,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    shared.register_process(process, "claude")
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout + float(os.environ.get("HAIXIA_AGY_TIMEOUT_GRACE_SEC", "30")))
+            code = process.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            code = 124
+            stderr += "\nClaude 呼叫逾時"
+    finally:
+        shared.unregister_process(process, "claude")
+    parsed = parse_claude_stream(stdout)
+    return {"output": parsed["output"], "stderr": "\n".join([stderr.strip(), *parsed["notes"]]).strip(),
+            "exit_code": code, "elapsed_sec": round(time.monotonic() - began, 2),
+            "searches": parsed["searches"], "searches_denied": parsed["searches_denied"],
+            "hook_searches": hook_search_count(Path(hook_dir) / "audit.jsonl", label),
+            "queries": parsed["queries"], "other_tool_uses": parsed["other_tool_uses"],
+            "usage": parsed["usage"], "rate_limit": parsed["rate_limit"]}
+
+
 def error_kind(result):
     if result["exit_code"] == 0 and OUTPUT_LINE.search(result["output"]):
         return None, ""
@@ -312,7 +487,7 @@ class SharedState:
         self.pause_level = 0
         self.consecutive_errors = 0
         self.processes = set()
-        self.active_calls = {"agy": 0, "codex": 0}
+        self.active_calls = {"agy": 0, "codex": 0, "claude": 0}
         self.force_stop = False
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -655,12 +830,14 @@ class SharedState:
             self.counts[f'chunks_{result["status"]}'] += 1
             self.counts["searches"] += result["searches"]
             self.audio_hours_done += audio_hours
-            if result.get("engine", "antigravity-cli") == "antigravity-cli":
+            engine = TOOL_ENGINES.get(result.get("engine", "antigravity-cli"))
+            if engine == "agy":
                 self.agy_done += 1
                 self.agy_elapsed += result["elapsed_sec"]
-            else:
-                self.engines["codex"].done += 1
-                self.engines["codex"].elapsed += result["elapsed_sec"]
+            elif engine in self.engines:
+                # 沿用既有校正版的段可能來自這次沒有啟用的引擎，就不計入引擎統計。
+                self.engines[engine].done += 1
+                self.engines[engine].elapsed += result["elapsed_sec"]
             self.last_progress_at = now()
             self.status()
             log.info("%s 第 %d 段：%d 行，%.1f 秒，搜尋 %d 次，%s", result["source"],
@@ -680,6 +857,8 @@ class SharedState:
 
 
 class CodexState:
+    label = "Codex"
+
     def __init__(self, shared, log, weekly_max, session_max, orca_bin="orca"):
         self.shared = shared
         self.log = log
@@ -710,7 +889,7 @@ class CodexState:
                 self.pause_until = until
             self.state = "paused"
             self.reason = redact(reason)
-            self.log.warning("Codex 暫停：%s；預計 %s 再試", self.reason,
+            self.log.warning("%s 暫停：%s；預計 %s 再試", self.label, self.reason,
                              time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.pause_until)))
             self.shared.status()
 
@@ -800,10 +979,154 @@ class CodexState:
             self.pause_level = 0
             self.reason = None
 
+    def backoff(self):
+        """額度或斷路器的指數退避秒數；呼叫端須持有 lock。"""
+        delay = min(self.shared.backoff_max, self.shared.backoff_base * 2 ** self.pause_level)
+        self.pause_level += 1
+        return delay
+
+
+def is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+class ClaudeState(CodexState):
+    """Claude Code 的訂閱額度。來源有兩個：Orca 的 claude session／weekly（每次呼叫前、最多每 60 秒讀一次），
+    以及每次呼叫 stream-json 的 rate_limit_event（比 Orca 即時）。同一個額度週期內用量只增不減，
+    所以取重設時間較晚的週期，同一週期取較大值。週額度上限 100 表示不設限。"""
+    label = "Claude"
+
+    def __init__(self, shared, log, weekly_max, session_max, orca_bin="orca"):
+        super().__init__(shared, log, weekly_max, session_max, orca_bin)
+        self.weekly_reset = None
+
+    def snapshot(self):
+        data = super().snapshot()
+        data["session_resets_at"] = timestamp(self.session_reset) if self.session_reset else None
+        data["weekly_resets_at"] = timestamp(self.weekly_reset) if self.weekly_reset else None
+        return data
+
+    def merge(self, session_used, session_reset, weekly_used=None, weekly_reset=None):
+        """併入一筆用量；呼叫端須持有 lock。"""
+        def pick(old_used, old_reset, used, reset):
+            if old_reset is None or reset > old_reset + 60:
+                return used, reset
+            if reset >= old_reset - 60:
+                return max(old_used, used), max(old_reset, reset)
+            return old_used, old_reset
+        self.session_percent, self.session_reset = pick(self.session_percent, self.session_reset,
+                                                        session_used, session_reset)
+        if weekly_used is not None:
+            self.weekly_percent, self.weekly_reset = pick(self.weekly_percent, self.weekly_reset,
+                                                          weekly_used, weekly_reset)
+
+    def evaluate(self):
+        """依目前的用量決定能否取段；呼叫端須持有 lock。"""
+        if self.weekly_max < 100 and self.weekly_percent is not None and self.weekly_percent >= self.weekly_max:
+            self.state = "stopped"
+            self.reason = f"Claude 週額度 {self.weekly_percent:g}% 已達上限 {self.weekly_max:g}%"
+            self.log.info(self.reason + "；本次執行不再使用 Claude")
+            self.shared.status()
+            return False
+        if self.session_percent is not None and self.session_percent >= self.session_max:
+            # 重設時間已過但資料還沒更新時，一分鐘後再讀。
+            self.pause(max(time.time() + 60, (self.session_reset or 0) + 120),
+                       f"Claude session 額度 {self.session_percent:g}% 已達上限 {self.session_max:g}%")
+            return False
+        return True
+
+    def check_quota(self, force=False):
+        with self.shared.lock:
+            if self.state == "stopped":
+                return False
+            if not force and self.checked_at and time.time() - self.checked_at < 60:
+                return self.evaluate()
+            self.checked_at = time.time()
+            try:
+                result = subprocess.run([self.orca_bin, "account", "list", "--json"],
+                                        capture_output=True, text=True, timeout=30)
+                if result.returncode:
+                    raise ValueError(result.stderr or result.stdout)
+                limits = json.loads(result.stdout)["result"]["rateLimits"]["claude"]
+                session = limits["session"]
+                session_used, reset = session["usedPercent"], session["resetsAt"]
+                if not is_number(session_used) or not is_number(reset) or reset <= 0:
+                    raise ValueError("額度資料不完整")
+                weekly = limits.get("weekly") if isinstance(limits.get("weekly"), dict) else {}
+                weekly_used, weekly_reset = weekly.get("usedPercent"), weekly.get("resetsAt")
+                if not is_number(weekly_used) or not is_number(weekly_reset):
+                    if self.weekly_max < 100:
+                        raise ValueError("週額度資料不完整")
+                    weekly_used = weekly_reset = None
+            except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+                self.pause(time.time() + 900, f"無法讀取 Claude 額度：{redact(str(error))}")
+                return False
+            self.merge(session_used, reset / 1000, weekly_used,
+                       weekly_reset / 1000 if weekly_reset is not None else None)
+            ready = self.evaluate()
+            self.shared.status()
+            return ready
+
+    def note_limits(self, info):
+        """併入這次呼叫的 rate_limit_event（utilization 是 0 到 1 的比例）；達上限就暫停。"""
+        windows = info.get("unifiedWindows") if isinstance(info, dict) else None
+        if not isinstance(windows, dict):
+            return
+
+        def window(name):
+            item = windows.get(name)
+            if isinstance(item, dict) and is_number(item.get("utilization")) and is_number(item.get("resetsAt")):
+                return round(item["utilization"] * 100, 1), float(item["resetsAt"])
+            return None, None
+
+        session_used, reset = window("five_hour")
+        if session_used is None:
+            return
+        with self.shared.lock:
+            if self.state == "stopped":
+                return
+            self.merge(session_used, reset, *window("seven_day"))
+            if self.state == "running":
+                self.evaluate()
+            self.shared.status()
+
+    def note_error(self, kind, reason, limits=None):
+        if kind != "quota":
+            return super().note_error(kind, reason)
+        with self.shared.lock:
+            self.reason = redact(reason)
+            rejected = isinstance(limits, dict) and limits.get("status") == "rejected"
+            reset = limits.get("resetsAt") if rejected else None
+            if is_number(reset) and time.time() < reset <= time.time() + WEEKLY_RESET_SEC:
+                self.pause(reset + 120, f'Claude 回報額度用完（{limits.get("rateLimitType")}）')
+            elif is_number(reset) and reset > time.time():
+                # 週額度用完：使用者可能用重設券，所以定期重試（最長每 60 分鐘），不等到重設時間。
+                clock = time.strftime("%m/%d %H:%M", time.localtime(reset))
+                self.pause(time.time() + self.backoff(),
+                           f'Claude 週額度用完（{limits.get("rateLimitType")}，預計 {clock} 重設）；定期重試')
+            elif self.check_quota(force=True) and self.session_reset and self.session_reset > time.time():
+                self.pause(self.session_reset + 120, "Claude 回報額度用完")
+            elif self.state not in {"stopped", "paused"}:
+                self.pause(time.time() + self.backoff(), "Claude 額度錯誤；重設時間不明")
+            return True
+
 
 def cache_path(work_dir, source, number):
     ident = hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
     return Path(work_dir) / "chunks" / ident / f"{number:05d}.json"
+
+
+def engine_model(args, engine):
+    return {"agy": args.model, "codex": args.codex_model, "claude": args.claude_model}[engine]
+
+
+def engine_effort(args, engine):
+    return {"agy": None, "codex": args.codex_effort, "claude": args.claude_effort}[engine]
+
+
+def primary_model(args, engines):
+    """校正版整份的 model 欄位：有 agy 用 agy 的模型，其次 codex，再其次 claude。"""
+    return engine_model(args, next(name for name in ENGINE_TOOLS if name in engines))
 
 
 def reuse_existing(source, document, number, chunk, chunk_count, existing, args, digest):
@@ -811,7 +1134,7 @@ def reuse_existing(source, document, number, chunk, chunk_count, existing, args,
     if existing is None or args.force:
         return None
     correction = existing["correction"]
-    expected_model = args.model if "agy" in args.engines.split(",") else args.codex_model
+    expected_model = primary_model(args, args.engines.split(","))
     if (correction["prompt_sha256"] != digest or correction["model"] != expected_model or
             correction["max_search"] != args.max_search or
             len(correction["chunks"]) != chunk_count):
@@ -831,14 +1154,15 @@ def reuse_existing(source, document, number, chunk, chunk_count, existing, args,
 
 
 def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
+    """ws 是該引擎的工作目錄；claude 另外需要 shared.claude_hook（hook 目錄）。"""
     source, document, number, chunk, existing = job
     if shared.stop.is_set():
         return None
     prompt, labels = build_prompt(document, chunk, args.max_search)
     original = document["segments"][chunk["start_index"]:chunk["end_index"]]
     cache = cache_path(args.work_dir, source, number)
-    model = args.model if engine == "agy" else args.codex_model
-    effort = None if engine == "agy" else args.codex_effort
+    model = engine_model(args, engine)
+    effort = engine_effort(args, engine)
     key_material = prompt + "\0" + model + "\0" + digest
     if effort:
         key_material += "\0" + effort
@@ -860,19 +1184,23 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
                          for path in cache.parent.glob(f"{cache.stem}.attempt*.json")
                          if path.stem.rsplit(".attempt", 1)[-1].isdigit()]
     first_attempt_number = max(previous_attempts, default=0)
-    control = shared if engine == "agy" else shared.engines["codex"]
+    control = shared if engine == "agy" else shared.engines[engine]
+    # 多引擎時，暫停中的引擎把段放回佇列，讓其他引擎接手。
+    multi = len(shared.engines) + getattr(shared, "agy_enabled", False) > 1
     transient_retries = 0
     while failures <= args.retries and not shared.stop.is_set():
-        if engine == "agy" and "codex" in shared.engines and shared.agy_paused():
+        if engine == "agy" and shared.engines and shared.agy_paused():
             return "requeue"
-        if engine == "codex" and shared.agy_enabled and control.state in {"paused", "stopped"}:
+        # 暫停時間已過的引擎由 ready() 恢復，不能在這裡放回佇列，否則永遠輪不到它恢復。
+        if engine != "agy" and multi and (control.state == "stopped" or
+                                          control.state == "paused" and control.pause_until > time.time()):
             return "requeue"
-        if engine == "codex" and not control.check_quota():
-            if getattr(shared, "agy_enabled", False):
+        if engine != "agy" and not control.check_quota():
+            if multi:
                 return "requeue"
             if not control.ready():
                 return None
-        ready = (control.wait_if_paused("codex" in shared.engines, log) if engine == "agy" else
+        ready = (control.wait_if_paused(bool(shared.engines), log) if engine == "agy" else
                  control.ready())
         if ready == "requeue":
             return "requeue"
@@ -882,9 +1210,13 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
         label = f"{source}#{number}#{time.time_ns()}-{sequence}"
         started = time.time()
         try:
-            response = (run_agy(prompt, model, args.print_timeout, ws, label, args.max_search, shared)
-                        if engine == "agy" else
-                        run_codex(prompt, model, effort, args.print_timeout, ws, shared))
+            if engine == "agy":
+                response = run_agy(prompt, model, args.print_timeout, ws, label, args.max_search, shared)
+            elif engine == "codex":
+                response = run_codex(prompt, model, effort, args.print_timeout, ws, shared)
+            else:
+                response = run_claude(prompt, model, effort, args.claude_timeout, ws, shared.claude_hook,
+                                      label, args.max_search, shared, args.claude_max_budget_usd)
         except OSError as error:
             response = {"output": "", "stderr": str(error), "exit_code": 127,
                         "elapsed_sec": 0.0, "searches": 0, "usage": {}}
@@ -892,11 +1224,16 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
             return None
         if engine == "agy":
             shared.note_account(response.get("agy_account"), started, log, "呼叫")
+        if engine == "claude":
+            control.note_limits(response.get("rate_limit"))
         response["evaluation"] = evaluate(response["output"], labels, original)
         response["label"] = label
         if response.get("command_executions"):
             log.warning("Codex 出現 %d 次 command_execution 事件：%s 第 %d 段",
                         response["command_executions"], source, number)
+        if response.get("other_tool_uses"):
+            log.warning("Claude 呼叫了 WebSearch 以外的工具 %d 次（hook 會拒絕）：%s 第 %d 段",
+                        response["other_tool_uses"], source, number)
         atomic_json(cache.with_name(f"{cache.stem}.attempt{first_attempt_number + sequence}.json"),
                     {"key": key, **response})
         elapsed += response["elapsed_sec"]
@@ -909,9 +1246,11 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
                 paused = shared.note_error(kind, reason, log,
                                            quota_reset_seconds(response) if kind == "quota" else None,
                                            message, countdown, started)
+            elif engine == "claude":
+                paused = control.note_error(kind, reason, response.get("rate_limit"))
             else:
                 paused = control.note_error(kind, reason)
-            if kind == "quota" and "codex" in shared.engines and getattr(shared, "agy_enabled", False):
+            if kind == "quota" and multi:
                 return "requeue"
             if paused:
                 continue
@@ -941,8 +1280,7 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
               "end": chunk["end"], "status": status, "attempts": sequence,
               "searches": searches, "elapsed_sec": elapsed, "lines": lines,
               "fallback_lines": sum(not corrected for _, corrected in lines),
-              "engine": "antigravity-cli" if engine == "agy" else "codex-cli",
-              "model": model, "effort": effort}
+              "engine": ENGINE_TOOLS[engine], "model": model, "effort": effort}
     atomic_json(cache, {"key": key, "result": result})
     return result
 
@@ -1022,7 +1360,7 @@ def collect(args, log):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="用 Antigravity / Codex CLI 批次校正逐字稿")
+    parser = argparse.ArgumentParser(description="用 Antigravity / Codex / Claude Code CLI 批次校正逐字稿")
     for name in ("in-dir", "out-dir", "work-dir"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--engines", default="agy")
@@ -1030,9 +1368,19 @@ def main(argv=None):
     parser.add_argument("--codex-jobs", type=int, default=4)
     parser.add_argument("--codex-model", default="gpt-6-sol")
     parser.add_argument("--codex-effort", default="medium")
-    parser.add_argument("--codex-mode", choices=("relay", "parallel"), default="relay")
+    parser.add_argument("--codex-mode", choices=("relay", "parallel"), default="relay",
+                        help="Codex 與 Claude 共用：relay 只在 Antigravity 暫停或沒啟用時取段；parallel 隨時取段")
     parser.add_argument("--codex-weekly-max", type=float, default=80)
     parser.add_argument("--codex-session-max", type=float, default=85)
+    parser.add_argument("--claude-jobs", type=int, default=4)
+    parser.add_argument("--claude-model", default="claude-opus-5-5")
+    parser.add_argument("--claude-effort", default="medium")
+    parser.add_argument("--claude-session-max", type=float, default=80)
+    parser.add_argument("--claude-weekly-max", type=float, default=100, help="100 表示不設限")
+    parser.add_argument("--claude-timeout", type=int, default=300,
+                        help="Claude 每次呼叫的逾時秒數；正常一段 10 到 70 秒，失控的呼叫會一直耗額度")
+    parser.add_argument("--claude-max-budget-usd", type=float, default=1.0,
+                        help="Claude 每次呼叫的估算金額上限（依 API 牌價；正常一段約 0.1 到 0.25 美元）")
     parser.add_argument("--model", default="gemini-3.8-flash-high")
     parser.add_argument("--max-search", type=int, default=5)
     parser.add_argument("--retries", type=int, default=2)
@@ -1050,11 +1398,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     args.expected_agy_account = (args.expected_agy_account or "").strip() or None
     engines = args.engines.split(",")
-    if not engines or len(set(engines)) != len(engines) or any(engine not in {"agy", "codex"} for engine in engines):
-        parser.error("--engines 必須是 agy、codex 或 agy,codex")
-    if (args.agy_jobs < 1 or args.codex_jobs < 1 or args.max_search < 0 or args.retries < 0 or
-            args.print_timeout < 1 or (args.limit_hours is not None and args.limit_hours <= 0) or
+    if not engines or len(set(engines)) != len(engines) or any(engine not in ENGINE_TOOLS for engine in engines):
+        parser.error("--engines 是 agy、codex、claude 以逗號分隔的組合，例如 agy,claude")
+    if (args.agy_jobs < 1 or args.codex_jobs < 1 or args.claude_jobs < 1 or args.max_search < 0 or
+            args.retries < 0 or args.print_timeout < 1 or args.claude_timeout < 1 or
+            not args.claude_max_budget_usd > 0 or (args.limit_hours is not None and args.limit_hours <= 0) or
             not 0 <= args.codex_weekly_max <= 100 or not 0 <= args.codex_session_max <= 100 or
+            not 0 <= args.claude_weekly_max <= 100 or not 0 <= args.claude_session_max <= 100 or
             (args.quota_poll_min is not None and not args.quota_poll_min > 0)):
         parser.error("jobs、print-timeout、limit-hours、quota-poll-min 必須為正數；max-search、retries 不可為負數")
     args.in_dir, args.out_dir, args.work_dir = (item.resolve() for item in (args.in_dir, args.out_dir, args.work_dir))
@@ -1068,6 +1418,7 @@ def main(argv=None):
         codex_ws.mkdir(parents=True, exist_ok=True)
         if any(codex_ws.iterdir()):
             raise ValueError("codex-ws 工作目錄必須是空的")
+    claude_ws, claude_hook = setup_claude(args.work_dir) if "claude" in engines else (None, None)
     documents, hours, existing_docs, failed_files = collect(args, log)
     digest = prompt_sha256()
     jobs = [(source, document, number, chunk,
@@ -1076,6 +1427,11 @@ def main(argv=None):
             for number, chunk in enumerate(chunks, 1)]
     log.info("開始：%d 檔，%.2f 音訊小時，%d 段，engines=%s，codex-mode=%s",
              len(documents), hours, len(jobs), args.engines, args.codex_mode)
+    if "claude" in engines:
+        log.info("Claude：model=%s，effort=%s，session 上限 %g%%，週上限 %s，逾時 %d 秒，每次呼叫上限 %g 美元",
+                 args.claude_model, args.claude_effort, args.claude_session_max,
+                 "不設限" if args.claude_weekly_max >= 100 else f"{args.claude_weekly_max:g}%",
+                 args.claude_timeout, args.claude_max_budget_usd)
     if args.dry_run:
         for source, document, number, chunk, _existing in jobs:
             prompt, _ = build_prompt(document, chunk, args.max_search)
@@ -1093,7 +1449,7 @@ def main(argv=None):
         shared.failed_files = failed_files.copy()
         for source in empty_sources:
             relative, original, chunks = documents[source]
-            save_corrected(corrected_document(original, chunks, [], args.model if "agy" in engines else args.codex_model,
+            save_corrected(corrected_document(original, chunks, [], primary_model(args, engines),
                                               args.max_search, digest), args.out_dir / relative)
             shared.counts["files_done"] += 1
             shared.audio_hours_done += original["duration_sec"] / 3600
@@ -1107,6 +1463,8 @@ def main(argv=None):
         startup_account = check_model(args.model, agy_log_path(args.work_dir, "models"))
         prune_agy_logs(args.work_dir)
         check_hook(ws, args.max_search)
+    if "claude" in engines:
+        check_claude_hook(claude_hook, args.max_search)
     base = float(os.environ.get("HAIXIA_BACKOFF_BASE_SEC", "300"))
     maximum = float(os.environ.get("HAIXIA_BACKOFF_MAX_SEC", "3600"))
     shared = SharedState(args.work_dir, len(jobs), hours, len(documents), base, maximum)
@@ -1131,11 +1489,15 @@ def main(argv=None):
     if "codex" in engines:
         shared.engines["codex"] = CodexState(shared, log, args.codex_weekly_max,
                                                args.codex_session_max)
+    if "claude" in engines:
+        shared.engines["claude"] = ClaudeState(shared, log, args.claude_weekly_max,
+                                                 args.claude_session_max)
+        shared.claude_hook = claude_hook
     shared.status()
     shared.failed_files = failed_files.copy()
     for source in empty_sources:
         relative, original, chunks = documents[source]
-        save_corrected(corrected_document(original, chunks, [], args.model if "agy" in engines else args.codex_model,
+        save_corrected(corrected_document(original, chunks, [], primary_model(args, engines),
                                           args.max_search, digest), args.out_dir / relative)
         shared.counts["files_done"] += 1
         shared.audio_hours_done += original["duration_sec"] / 3600
@@ -1158,10 +1520,8 @@ def main(argv=None):
             result = {"source": source, "chunk_number": number, "start": chunk["start"],
                       "end": chunk["end"], "status": status, "attempts": 0,
                       "searches": 0, "elapsed_sec": 0.0, "lines": lines,
-                      "fallback_lines": len(lines),
-                      "engine": "antigravity-cli" if engine == "agy" else "codex-cli",
-                      "model": args.model if engine == "agy" else args.codex_model,
-                      "effort": None if engine == "agy" else args.codex_effort}
+                      "fallback_lines": len(lines), "engine": ENGINE_TOOLS[engine],
+                      "model": engine_model(args, engine), "effort": engine_effort(args, engine)}
         if result is None:
             return
         by_file[source][number] = result
@@ -1174,8 +1534,7 @@ def main(argv=None):
             relative, original, chunks = documents[source]
             corrected = corrected_document(original, chunks,
                                            [by_file[source][i] for i in range(1, len(chunks) + 1)],
-                                           args.model if "agy" in engines else args.codex_model,
-                                           args.max_search, digest)
+                                           primary_model(args, engines), args.max_search, digest)
             save_corrected(corrected, args.out_dir / relative)
             if any(item["status"] == "failed" for item in by_file[source].values()):
                 failed_files.add(source)
@@ -1188,7 +1547,8 @@ def main(argv=None):
 
     def worker(engine):
         nonlocal inflight
-        control = shared if engine == "agy" else shared.engines["codex"]
+        control = shared if engine == "agy" else shared.engines[engine]
+        engine_ws = {"agy": ws, "codex": codex_ws, "claude": claude_ws}[engine]
         while not shared.stop.is_set():
             with condition:
                 if not waiting and inflight == 0:
@@ -1205,17 +1565,16 @@ def main(argv=None):
                 if not waiting or not available:
                     condition.wait(.2)
                     continue
-            if engine == "codex" and not control.check_quota():
+            if engine != "agy" and not control.check_quota():
                 continue
             with condition:
-                if not waiting or (engine == "codex" and args.codex_mode == "relay" and
+                if not waiting or (engine != "agy" and args.codex_mode == "relay" and
                                    shared.agy_enabled and not shared.agy_paused()):
                     continue
                 job = waiting.popleft()
                 inflight += 1
             try:
-                result = correct_chunk(job, args, ws if engine == "agy" else codex_ws,
-                                       shared, log, digest, engine)
+                result = correct_chunk(job, args, engine_ws, shared, log, digest, engine)
             except Exception as error:
                 result = error
             finally:
@@ -1229,8 +1588,9 @@ def main(argv=None):
                     results.put((job, result, engine))
                 condition.notify_all()
 
+    jobs_per_engine = {"agy": args.agy_jobs, "codex": args.codex_jobs, "claude": args.claude_jobs}
     threads = [threading.Thread(target=worker, args=(engine,), daemon=True)
-               for engine in engines for _ in range(args.agy_jobs if engine == "agy" else args.codex_jobs)]
+               for engine in engines for _ in range(jobs_per_engine[engine])]
     try:
         for thread in threads:
             thread.start()
