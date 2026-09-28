@@ -190,6 +190,9 @@
     - 依據：兩個引擎都做過的 13 段（1,574 行）裡，94% 的行結果相同；不同的 99 行中，Antigravity 對約 20 行（多半是照聲音改對，例如督脈、有洞就鑽、怢慄），Claude 對約 5–8 行（多半是背出經文原句），另有約 15 行是 Claude 把語助詞刪掉。
     - 程式：`correct_transcripts.py` 加 `--redo-engine claude-cli`，只重做目標段；新結果 ok 才取代，否則保留原版；被取代的段記在 `replaced`（Claude Code worker 撰寫中）。
     - 使用者同意：寫好、審查、試跑後，有額度就開始跑，只用 Antigravity（不用 Claude、Codex）。
+    - 2026-09-28 23:26 程式完成（commit 51abc92，Claude Code worker 撰寫，經同意也改了 `validate_corrected` 讓它接受 `replaced`；340 個測試通過，`prompt_sha256` 不變）。實際資料 dry-run：56 檔、400 段、25.08 小時，安全檢查全過。
+    - 23:28 用 A 試跑 2 段（内2（1）第 5、7 段）：都 ok 並取代，其他段完全不變；例如 Claude 的「死症」「發音是月」被改成「噦證」「發音是噦」。
+    - 23:32 用 A 開始重做其餘 398 段（`--engines agy --agy-jobs 4 --quota-poll-min 10 --redo-engine claude-cli`），監視程式照舊。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
