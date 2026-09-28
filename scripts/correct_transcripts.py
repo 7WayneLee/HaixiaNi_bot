@@ -1167,10 +1167,14 @@ def correct_chunk(job, args, ws, shared, log, digest, engine="agy"):
     if effort:
         key_material += "\0" + effort
     key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+    # 重做模式：快取裡要重做的那個引擎的結果不算數；partial、failed 也重跑（ok 才會取代原版）。
+    redo = getattr(args, "redo_engine", None)
     if cache.exists() and not args.force:
         try:
             saved = json.loads(cache.read_text(encoding="utf-8"))
-            if saved.get("key") == key and not (args.retry_failed and saved["result"]["status"] in {"partial", "failed"}):
+            if (saved.get("key") == key and
+                    not ((args.retry_failed or redo) and saved["result"]["status"] in {"partial", "failed"}) and
+                    not (redo and saved["result"].get("engine") == redo)):
                 return saved["result"]
         except (ValueError, KeyError):
             pass
@@ -1297,19 +1301,24 @@ def log_setup(work_dir):
     return log
 
 
-def collect(args, log):
+def selected_paths(args, log):
+    """--files 列出的相對路徑（略過不安全的路徑）；沒給 --files 就是 --in-dir 底下全部的 JSON。"""
+    if not args.files:
+        return sorted(item.relative_to(args.in_dir) for item in args.in_dir.rglob("*.json"))
     selected = []
-    if args.files:
-        for line in args.files.read_text(encoding="utf-8").splitlines():
-            relative = Path(line.strip())
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            if relative.is_absolute() or ".." in relative.parts:
-                log.error("略過不安全的檔案路徑：%s", line)
-                continue
-            selected.append(relative)
-    else:
-        selected = sorted(item.relative_to(args.in_dir) for item in args.in_dir.rglob("*.json"))
+    for line in args.files.read_text(encoding="utf-8").splitlines():
+        relative = Path(line.strip())
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if relative.is_absolute() or ".." in relative.parts:
+            log.error("略過不安全的檔案路徑：%s", line)
+            continue
+        selected.append(relative)
+    return selected
+
+
+def collect(args, log):
+    selected = selected_paths(args, log)
     documents = {}
     existing_docs = {}
     failed_files = set()
@@ -1359,6 +1368,108 @@ def collect(args, log):
     return documents, total_hours, existing_docs, failed_files
 
 
+def chunk_audio_hours(document, chunks, number):
+    """第 number 段涵蓋的音訊小時：第一段從片頭算起，最後一段算到片尾。"""
+    offset = document["clip"]["start"] if document["clip"] else 0.0
+    audio_start = offset if number == 1 else chunks[number - 1]["start"]
+    audio_end = chunks[number]["start"] if number < len(chunks) else offset + document["duration_sec"]
+    return max(0, audio_end - audio_start) / 3600
+
+
+def chunk_engine(item):
+    """舊格式（沒有 engine 欄位）的段都是 Antigravity 做的。"""
+    return item.get("engine", "antigravity-cli")
+
+
+def redo_mismatch(document, chunks, existing, digest, max_search):
+    """重做前的安全檢查：既有校正版要跟這次的切段、ASR 原文與設定完全一致；不符時回傳原因。"""
+    correction = existing["correction"]
+    if correction["prompt_sha256"] != digest:
+        return "prompt_sha256 與這次的提示詞不同"
+    if correction["max_search"] != max_search:
+        return f'max_search 是 {correction["max_search"]}，這次是 {max_search}'
+    if len(correction["chunks"]) != len(chunks):
+        return f'段數不符：校正版 {len(correction["chunks"])} 段，重新切段 {len(chunks)} 段'
+    for number, (chunk, prior) in enumerate(zip(chunks, correction["chunks"]), 1):
+        if prior["start"] != chunk["start"] or prior["end"] != chunk["end"]:
+            return f"第 {number} 段的起訖時間不符"
+    if len(existing["segments"]) != len(document["segments"]):
+        return f'segment 數不符：校正版 {len(existing["segments"])}，ASR {len(document["segments"])}'
+    for index, (old, new) in enumerate(zip(existing["segments"], document["segments"]), 1):
+        if old["text_asr"] != new["text"] or old["start"] != new["start"] or old["end"] != new["end"]:
+            return f"第 {index} 個 segment 的 ASR 文字或時間不符"
+    return None
+
+
+def collect_redo(args, log, digest):
+    """重做模式選檔：只選 --out-dir 已有、能通過驗證、且至少有一段是 --redo-engine 做的校正版。
+    回傳 documents、existing_docs、targets（每檔要重做的段號）與安全檢查不符而略過的檔數。"""
+    documents, existing_docs, targets = {}, {}, {}
+    errors = 0
+    remaining = args.redo_limit
+    for relative in selected_paths(args, log):
+        if remaining is not None and remaining <= 0:
+            break
+        source = relative.as_posix().removesuffix(".json")
+        if args.include and not any(source.startswith(prefix) for prefix in args.include):
+            continue
+        if not relative.name.endswith(".json"):
+            log.error("略過非 JSON 檔：%s", relative)
+            continue
+        output = args.out_dir / relative
+        if not output.exists():
+            continue
+        try:
+            existing = validate_corrected(json.loads(output.read_text(encoding="utf-8")))
+            if existing["source"] != source:
+                raise ValueError("校正版 source 與相對檔名不一致")
+        except (OSError, ValueError) as error:
+            log.warning("既有校正版無法驗證，重做模式略過：%s：%s", relative, error)
+            continue
+        numbers = [number for number, item in enumerate(existing["correction"]["chunks"], 1)
+                   if chunk_engine(item) == args.redo_engine]
+        if not numbers:
+            continue
+        try:
+            document = validate(json.loads((args.in_dir / relative).read_text(encoding="utf-8")))
+            if document["source"] != source:
+                raise ValueError("source 與相對檔名不一致")
+        except (OSError, ValueError) as error:
+            log.error("重做略過（校正版不動）：ASR 原檔讀不到或壞檔：%s：%s", relative, error)
+            errors += 1
+            continue
+        chunks = split_chunks(document["segments"])
+        reason = redo_mismatch(document, chunks, existing, digest, args.max_search)
+        if reason:
+            log.error("重做安全檢查不符，整檔略過（校正版不動）：%s：%s", relative, reason)
+            errors += 1
+            continue
+        if remaining is not None:
+            numbers = numbers[:remaining]
+            remaining -= len(numbers)
+        documents[source] = (relative, document, chunks)
+        existing_docs[source] = existing
+        targets[source] = numbers
+    return documents, existing_docs, targets, errors
+
+
+def prior_result(source, number, chunk, existing):
+    """既有校正版第 number 段的文字與 metadata，形式和 correct_chunk 的結果相同。"""
+    prior = existing["correction"]["chunks"][number - 1]
+    segments = existing["segments"][chunk["start_index"]:chunk["end_index"]]
+    return {"source": source, "chunk_number": number, **prior, "engine": chunk_engine(prior),
+            "model": prior.get("model", existing["correction"]["model"]), "effort": prior.get("effort"),
+            "lines": [(item["text"], item["corrected"]) for item in segments]}
+
+
+def redo_merge(result, prior):
+    """重做結果是 ok 才取代，並在 replaced 記下被取代那一版；否則原版原封不動。回傳（要寫入的結果, 是否取代）。"""
+    if result["status"] != "ok":
+        return prior, False
+    replaced = {key: prior[key] for key in ("engine", "model", "effort", "searches", "elapsed_sec")}
+    return dict(result, replaced=replaced), True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="用 Antigravity / Codex / Claude Code CLI 批次校正逐字稿")
     for name in ("in-dir", "out-dir", "work-dir"):
@@ -1391,6 +1502,10 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--redo-engine", choices=sorted(TOOL_ENGINES), metavar="TOOL",
+                        help="重做模式：只把既有校正版裡這個引擎做的段（antigravity-cli、codex-cli、claude-cli）"
+                             "交給 --engines 重做，ok 才取代，其他段不動")
+    parser.add_argument("--redo-limit", type=int, metavar="N", help="重做模式這次最多重做幾段（試跑用）")
     parser.add_argument("--quota-poll-min", type=float,
                         help="Antigravity 額度暫停最多幾分鐘就由一個 worker 試探；不給則等到重設時間")
     parser.add_argument("--expected-agy-account", metavar="EMAIL",
@@ -1407,6 +1522,16 @@ def main(argv=None):
             not 0 <= args.claude_weekly_max <= 100 or not 0 <= args.claude_session_max <= 100 or
             (args.quota_poll_min is not None and not args.quota_poll_min > 0)):
         parser.error("jobs、print-timeout、limit-hours、quota-poll-min 必須為正數；max-search、retries 不可為負數")
+    if args.redo_engine:
+        if TOOL_ENGINES[args.redo_engine] in engines:
+            parser.error(f"--engines 不能包含要重做的引擎 {TOOL_ENGINES[args.redo_engine]}"
+                         f"（--redo-engine {args.redo_engine}）")
+        if args.force or args.retry_failed:
+            parser.error("--redo-engine 不能跟 --force、--retry-failed 一起用")
+        if args.limit_hours is not None:
+            parser.error("重做模式不支援 --limit-hours，請用 --redo-limit 限制段數")
+    if args.redo_limit is not None and (not args.redo_engine or args.redo_limit < 1):
+        parser.error("--redo-limit 只能跟 --redo-engine 一起用，而且必須是正整數")
     args.in_dir, args.out_dir, args.work_dir = (item.resolve() for item in (args.in_dir, args.out_dir, args.work_dir))
     (args.work_dir / "logs").mkdir(parents=True, exist_ok=True)
     log = log_setup(args.work_dir)
@@ -1419,12 +1544,25 @@ def main(argv=None):
         if any(codex_ws.iterdir()):
             raise ValueError("codex-ws 工作目錄必須是空的")
     claude_ws, claude_hook = setup_claude(args.work_dir) if "claude" in engines else (None, None)
-    documents, hours, existing_docs, failed_files = collect(args, log)
     digest = prompt_sha256()
-    jobs = [(source, document, number, chunk,
-             reuse_existing(source, document, number, chunk, len(chunks), existing_docs.get(source), args, digest))
-            for source, (_, document, chunks) in documents.items()
-            for number, chunk in enumerate(chunks, 1)]
+    redo_counts = {"replaced": 0, "kept": 0}
+    redo_errors = 0
+    if args.redo_engine:
+        # 重做模式只排目標段；既有的結果不當成快取或 existing（job 的 existing 一律是 None）。
+        documents, existing_docs, targets, redo_errors = collect_redo(args, log, digest)
+        failed_files = set()
+        jobs = [(source, documents[source][1], number, documents[source][2][number - 1], None)
+                for source, numbers in targets.items() for number in numbers]
+        hours = sum(chunk_audio_hours(documents[source][1], documents[source][2], number)
+                    for source, numbers in targets.items() for number in numbers)
+        log.info("重做模式：把 %s 做的段改用 %s 重做，ok 才取代；%d 檔安全檢查不符已略過",
+                 args.redo_engine, args.engines, redo_errors)
+    else:
+        documents, hours, existing_docs, failed_files = collect(args, log)
+        jobs = [(source, document, number, chunk,
+                 reuse_existing(source, document, number, chunk, len(chunks), existing_docs.get(source), args, digest))
+                for source, (_, document, chunks) in documents.items()
+                for number, chunk in enumerate(chunks, 1)]
     log.info("開始：%d 檔，%.2f 音訊小時，%d 段，engines=%s，codex-mode=%s",
              len(documents), hours, len(jobs), args.engines, args.codex_mode)
     if "claude" in engines:
@@ -1439,6 +1577,8 @@ def main(argv=None):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(prompt + "\n", encoding="utf-8")
             log.info("提示詞：%s 第 %d 段 → %s", source, number, path)
+        if args.redo_engine:
+            log.info("重做：%d 檔、%d 段、%.2f 音訊小時", len(documents), len(jobs), hours)
         return 0
     empty_sources = [source for source, (_, _, chunks) in documents.items() if not chunks]
     if not jobs:
@@ -1455,6 +1595,9 @@ def main(argv=None):
             shared.audio_hours_done += original["duration_sec"] / 3600
         shared.status("finished")
         log.info("摘要：0 段，輸出 %d 個空白逐字稿", len(empty_sources))
+        if args.redo_engine:
+            log.info("重做：取代 0 段、保留原版 0 段、未完成 0 段")
+            return 1 if redo_errors else 0
         if failed_files:
             log.error("仍有失敗段落的檔案：%s", "、".join(sorted(failed_files)))
         return 1 if failed_files else 0
@@ -1504,6 +1647,12 @@ def main(argv=None):
     if empty_sources:
         shared.status()
     by_file = {source: {} for source in documents}
+    if args.redo_engine:
+        # 非目標段直接沿用既有校正版，不呼叫引擎、不排進佇列。
+        for source, numbers in targets.items():
+            chunks = documents[source][2]
+            by_file[source] = {number: prior_result(source, number, chunks[number - 1], existing_docs[source])
+                               for number in range(1, len(chunks) + 1) if number not in numbers}
     interrupted = False
     waiting = deque(jobs)
     condition = threading.Condition(shared.lock)
@@ -1525,16 +1674,22 @@ def main(argv=None):
         if result is None:
             return
         by_file[source][number] = result
-        file_chunks = documents[source][2]
-        audio_start = (document["clip"]["start"] if document["clip"] else 0.0) if number == 1 else chunk["start"]
-        audio_end = (file_chunks[number]["start"] if number < len(file_chunks) else
-                     (document["clip"]["start"] if document["clip"] else 0.0) + document["duration_sec"])
-        shared.completed(result, chunk, max(0, audio_end - audio_start) / 3600, log)
+        if args.redo_engine:
+            prior = prior_result(source, number, chunk, existing_docs[source])
+            by_file[source][number], replaced = redo_merge(result, prior)
+            redo_counts["replaced" if replaced else "kept"] += 1
+            if not replaced:
+                log.warning("重做 %s 第 %d 段的結果是 %s，保留原本 %s 的版本", source, number,
+                            result["status"], prior["engine"])
+        shared.completed(result, chunk, chunk_audio_hours(document, documents[source][2], number), log)
         if len(by_file[source]) == len(documents[source][2]):
             relative, original, chunks = documents[source]
+            # 重做模式沿用既有校正版的 model，免得之後一般模式的 reuse_existing 認不得。
+            model = (existing_docs[source]["correction"]["model"] if args.redo_engine else
+                     primary_model(args, engines))
             corrected = corrected_document(original, chunks,
                                            [by_file[source][i] for i in range(1, len(chunks) + 1)],
-                                           primary_model(args, engines), args.max_search, digest)
+                                           model, args.max_search, digest)
             save_corrected(corrected, args.out_dir / relative)
             if any(item["status"] == "failed" for item in by_file[source].values()):
                 failed_files.add(source)
@@ -1628,8 +1783,13 @@ def main(argv=None):
              shared.counts["chunks_done"], shared.counts["chunks_total"],
              shared.counts["chunks_ok"], shared.counts["chunks_partial"],
              shared.counts["chunks_failed"], shared.counts["files_done"])
+    if args.redo_engine:
+        log.info("重做：取代 %d 段、保留原版 %d 段、未完成 %d 段", redo_counts["replaced"], redo_counts["kept"],
+                 len(jobs) - redo_counts["replaced"] - redo_counts["kept"])
     if failed_files:
         log.error("仍有失敗段落的檔案：%s", "、".join(sorted(failed_files)))
+    if args.redo_engine and (redo_counts["kept"] or redo_errors):
+        return 2 if interrupted else 1
     return 2 if interrupted else 1 if failed_files or shared.counts["chunks_done"] < len(jobs) else 0
 
 

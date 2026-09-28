@@ -178,6 +178,8 @@ def corrected_document(original, chunks, results, model, max_search, digest):
         detail["engine"] = result.get("engine", "antigravity-cli")
         detail["model"] = result.get("model", model)
         detail["effort"] = result.get("effort")
+        if result.get("replaced") is not None:
+            detail["replaced"] = dict(result["replaced"])
         metadata.append(detail)
     engines = {item["engine"] for item in metadata}
     tool = next(iter(engines)) if len(engines) == 1 else "mixed" if engines else "antigravity-cli"

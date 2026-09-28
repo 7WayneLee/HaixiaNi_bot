@@ -132,6 +132,31 @@ claude -p --model claude-opus-5-5 --effort medium --no-session-persistence \
 
 每段中繼資料記 `engine`=`claude-cli`、`model`、`effort`；`correction.tool` 在整份都由 Claude 完成時是 `claude-cli`，混用時是 `mixed`。`status.json` 的 `engines.claude` 有狀態、暫停時間、原因、完成段數、平均耗時，以及最後讀到的 `session_used_percent`、`weekly_used_percent`、`session_resets_at`、`weekly_resets_at`。舊格式（沒有 `engine` 等欄位）的校正版仍然有效。
 
+## 重做某個引擎的段（`--redo-engine`）
+
+全量跑完後，如果某個引擎做的段品質較差（例如 Claude 幾乎不上網查證），可以只把那些段交給別的引擎重做，其他段一律不動：
+
+```bash
+# 先看要重做多少：只替目標段寫提示詞，印出「重做：N 檔、M 段、H 音訊小時」，不呼叫任何引擎。
+.venv/bin/python scripts/correct_transcripts.py \
+  --in-dir "$HOME/haixia-asr" --out-dir "$HOME/haixia-corrected" \
+  --work-dir "$HOME/haixia-correct-work" --engines agy --redo-engine claude-cli --dry-run
+
+# 試跑 20 段，確認沒問題再拿掉 --redo-limit 跑全部。
+.venv/bin/python scripts/correct_transcripts.py \
+  --in-dir "$HOME/haixia-asr" --out-dir "$HOME/haixia-corrected" \
+  --work-dir "$HOME/haixia-correct-work" --engines agy --agy-jobs 4 --quota-poll-min 10 \
+  --redo-engine claude-cli --redo-limit 20
+```
+
+- **選檔**：只看 `--out-dir` 已有、能通過驗證、而且至少有一段 `engine` 是指定引擎的校正版（舊格式沒有 `engine` 的段算 `antigravity-cli`）。沒有校正版的檔不會新做；`--include`、`--files` 照常可以縮小範圍。
+- **安全檢查**：用 ASR 原檔重新切段，段數、每段起訖、每個 segment 的 ASR 文字與起訖，以及 `prompt_sha256`、`max_search` 都要跟既有校正版一致。任何一項不符就記一行錯誤、整檔略過，檔案不動。
+- **只重做目標段**：其他段直接沿用既有校正版的文字與中繼資料，不呼叫引擎。目標段照一般流程交給 `--engines` 重做（快取、重試、驗收、額度暫停、帳號檢查、`resume-now`、Ctrl-C 都照舊）。快取裡指定引擎的結果不算數；快取裡 `partial`、`failed` 的結果會重跑。
+- **取代規則**：重做結果是 `ok` 才取代，該段中繼資料多一個 `replaced`，記下被取代那一版的 `engine`、`model`、`effort`、`searches`、`elapsed_sec`；`partial`、`failed` 或發生例外時保留原版（文字與中繼資料原封不動），log 記一行「保留原本 … 的版本」。其他段原有的 `replaced` 會保留。
+- **寫檔**：一個檔的目標段全部有結果（取代或保留）才重建整份寫回原位；`correction.tool` 依各段引擎重算，`created_at` 更新，`model` 沿用既有校正版。被中斷而沒做完的檔不寫，下次再跑仍會被選到。
+- **進度**：`status.json` 只算目標段（段數、音訊小時、檔數），`watch_correction.py` 不用改；結束摘要多一行「重做：取代 X 段、保留原版 Y 段、未完成 Z 段」。有段保留原版、有檔因安全檢查略過，或沒做完時，結束碼是 1。
+- **限制**：`--engines` 不能包含要重做的那個引擎；不能跟 `--force`、`--retry-failed`、`--limit-hours` 一起用（限制數量用 `--redo-limit`）。
+
 ## 暫停、續跑與監看
 
 每段、每次嘗試會存到 `工作目錄/chunks/`，完成檔則寫到 `--out-dir`。按 Ctrl-C 後，程式立即停止派新段，向進行中的 CLI 程序群組送出 SIGTERM；5 秒後仍未結束就送 SIGKILL。被中止的段不寫入快取，用同一組目錄重跑即可續跑。退出碼 0 表示無 failed 段，1 表示有 failed 段沿用 ASR 或段落未完成，2 表示手動中止。

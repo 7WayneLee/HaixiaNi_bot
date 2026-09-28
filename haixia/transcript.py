@@ -300,11 +300,18 @@ def validate_corrected(document):
     for index, chunk in enumerate(correction["chunks"], 1):
         legacy = {"start", "end", "status", "attempts", "searches", "elapsed_sec", "fallback_lines"}
         modern = legacy | {"engine", "model", "effort"}
-        if not isinstance(chunk, dict) or set(chunk) not in (legacy, modern):
+        # replaced：重做模式取代某段時，記下被取代那一版的引擎資訊。
+        if not isinstance(chunk, dict) or set(chunk) not in (legacy, modern, modern | {"replaced"}):
             raise ValueError(f"correction.chunks 第 {index} 段欄位錯誤")
-        if set(chunk) == modern and (chunk["engine"] not in {"antigravity-cli", "codex-cli", "claude-cli"}
-                                     or not isinstance(chunk["model"], str) or not chunk["model"]
-                                     or chunk["effort"] is not None and not isinstance(chunk["effort"], str)):
+        engine_fields = [chunk] if set(chunk) == modern else [chunk, chunk["replaced"]] if "replaced" in chunk else []
+        if "replaced" in chunk and (not isinstance(chunk["replaced"], dict) or
+                                    set(chunk["replaced"]) != {"engine", "model", "effort", "searches", "elapsed_sec"} or
+                                    type(chunk["replaced"]["searches"]) is not int or chunk["replaced"]["searches"] < 0 or
+                                    not _number(chunk["replaced"]["elapsed_sec"]) or chunk["replaced"]["elapsed_sec"] < 0):
+            raise ValueError(f"correction.chunks 第 {index} 段 replaced 欄位錯誤")
+        if any(item["engine"] not in {"antigravity-cli", "codex-cli", "claude-cli"}
+               or not isinstance(item["model"], str) or not item["model"]
+               or item["effort"] is not None and not isinstance(item["effort"], str) for item in engine_fields):
             raise ValueError(f"correction.chunks 第 {index} 段引擎欄位錯誤")
         if (not _number(chunk["start"]) or not _number(chunk["end"]) or
                 chunk["start"] < 0 or chunk["end"] < chunk["start"]):
