@@ -193,6 +193,19 @@
     - 2026-09-28 23:26 程式完成（commit 51abc92，Claude Code worker 撰寫，經同意也改了 `validate_corrected` 讓它接受 `replaced`；340 個測試通過，`prompt_sha256` 不變）。實際資料 dry-run：56 檔、400 段、25.08 小時，安全檢查全過。
     - 23:28 用 A 試跑 2 段（内2（1）第 5、7 段）：都 ok 並取代，其他段完全不變；例如 Claude 的「死症」「發音是月」被改成「噦證」「發音是噦」。
     - 23:32 用 A 開始重做其餘 398 段（`--engines agy --agy-jobs 4 --quota-poll-min 10 --redo-engine claude-cli`），監視程式照舊。
+    - 23:40 A 的 5 小時額度用完，02:47 重設後自動接著跑。
+    - 2026-09-29 04:00 家裡網路短暫斷線（DNS 查不到 googleapis），恢復後 **agy 的登入失效**：
+      - 每次 `agy -p` 都改成要求互動式 Google 登入（Waiting for authentication … timeout 60s），逾時失敗。
+      - 因為要使用者重新登入，而且繼續重試只會一直跳登入，04:12 由指揮**停止**重做。
+    - 停止時的進度：重做完成 140/398 段，全部 ok 並取代，另加試跑 2 段。
+      - 寫回的檔案裡已取代 139 段；另 3 段在沒做完的檔裡，已存在快取，下次會直接沿用。
+      - 還有 261 段是 Claude 版。
+      - 440 個檔都通過驗證。
+      - GCS 仍是重做前的版本，等重做完成再 push。
+    - 恢復方式：
+      1. 使用者在 agy 互動模式重新登入（同時只留一個 agy 登入）。
+      2. expected-account 設成那個帳號。
+      3. 用同樣參數重跑 `--redo-engine claude-cli`，已完成的段會直接沿用。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
