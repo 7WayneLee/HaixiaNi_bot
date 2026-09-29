@@ -1,2 +1,4 @@
 opencc>=1.4.2
 pytest>=9.1.1
+numpy>=2.0
+pymupdf>=1.24

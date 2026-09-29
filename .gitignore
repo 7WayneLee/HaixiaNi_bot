@@ -14,3 +14,14 @@ __pycache__/
 # Claude Code 本機設定（權限規則等）
 .claude/settings.local.json
 .venv*/
+
+# 索引產物（含原始文字，一律不進 repo）
+chunks*.jsonl
+build_report*.json
+index.sqlite*
+embeddings*.npy
+embeddings*.meta.json
+embed_cache.sqlite*
+*.pages.json
+private_*
+haixia-index-build/
