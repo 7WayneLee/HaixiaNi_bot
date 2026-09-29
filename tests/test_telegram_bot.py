@@ -318,6 +318,25 @@ def test_model_switch_starts_new_conversation(make_core):
     assert "Sonnet 5.5" in bot.texts()[-1]
 
 
+def test_gemini_models_are_listed_and_switch_resets_conversation(make_core):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    old = state.conversation
+    old.messages.append({"role": "user", "content": "舊問題"})
+    run(bot_core.handle_message(bot, CHAT, USER, "/model"))
+    listing = bot.texts()[-1]
+    for alias in ("opus", "sonnet", "gemini-flash", "gemini-pro"):
+        assert f"/model {alias}" in listing
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-flash"))
+    assert state.model == "gemini-3.8-flash" and state.conversation is not old
+    previous = state.conversation
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-pro"))
+    assert state.model == "gemini-3.1-pro-preview" and state.conversation is not previous
+    run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
+    assert state.model == "claude-opus-5-5" and not state.conversation.messages
+
+
 def test_new_command_and_help(make_core):
     bot_core, _ = make_core(daily_budget=2.5)
     bot = FakeBot()
@@ -569,6 +588,16 @@ def test_timeout_and_connection_errors():
     assert "逾時" in tg.error_message(anthropic.APITimeoutError(request=request))
     assert "連不上" in tg.error_message(anthropic.APIConnectionError(request=request))
     assert "ANTHROPIC_API_KEY" in tg.error_message(core.MissingApiKey("x"))
+
+
+def test_gemini_api_error_uses_vertex_wording_without_raw_text():
+    problem = RuntimeError("raw token-secret")
+    problem.code = 403
+    message = tg.error_message(problem, "gemini-3.8-flash")
+    assert "Gemini" in message and "服務帳號" in message
+    assert "token-secret" not in message and "ANTHROPIC_API_KEY" not in message
+    import httpx
+    assert "逾時" in tg.error_message(httpx.ReadTimeout("private"), "gemini-3.8-flash")
 
 
 def test_non_text_message_gets_hint(make_core):

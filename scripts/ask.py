@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用 Claude 問倪師資料（第四步命令列版；第五步的 Telegram bot 用同一個問答核心）。
+"""用 Claude 或 Vertex AI Gemini 問倪師資料（Telegram bot 用同一個問答核心）。
 
     scripts/ask.py "桂枝湯和麻黃湯怎麼分？"
     scripts/ask.py -i                     # 多輪互動：/new 開新對話，/quit 或 Ctrl-D 結束
@@ -93,13 +93,15 @@ def interactive(ask):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="用 Claude 問倪師資料")
+    parser = argparse.ArgumentParser(description="用 Claude 或 Gemini 問倪師資料")
     parser.add_argument("question", nargs="?", help="問題（用 -i 時可省略）")
     parser.add_argument("-i", "--interactive", action="store_true", help="多輪互動")
     parser.add_argument("--model", default=core.DEFAULT_MODEL,
-                        help=f"模型（預設 {core.DEFAULT_MODEL}；比較用 {core.COMPARE_MODEL}）")
+                        help=f"模型（預設 {core.DEFAULT_MODEL}；可用 {core.COMPARE_MODEL}、gemini-3.8-flash、gemini-3.1-pro-preview）")
     parser.add_argument("--effort", choices=core.EFFORTS, default=core.DEFAULT_EFFORT,
-                        help=f"思考深度（預設 {core.DEFAULT_EFFORT}）")
+                        help=f"Claude 思考深度（預設 {core.DEFAULT_EFFORT}）")
+    parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
+                        default="default", help="Gemini 思考程度；default 用模型預設")
     parser.add_argument("--show-tools", action="store_true", help="印出每次搜尋的查詢與命中出處")
     parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--bm25-only", action="store_true", help="不呼叫 Vertex，只用關鍵字搜尋")
@@ -113,21 +115,29 @@ def main(argv=None):
     if not args.interactive and not args.question:
         parser.error("請給問題，或用 -i 進入互動模式")
 
-    import anthropic
-
-    try:
-        api_key = core.resolve_api_key()
-    except core.MissingApiKey as problem:
-        print(problem, file=sys.stderr)
-        return 2
-    workspace_id = core.resolve_workspace_id()
+    gemini = args.model.startswith("gemini-")
+    api_key = workspace_id = None
+    if not gemini:
+        try:
+            api_key = core.resolve_api_key()
+        except core.MissingApiKey as problem:
+            print(problem, file=sys.stderr)
+            return 2
+        workspace_id = core.resolve_workspace_id()
     try:
         prices = core.load_prices(args.prices) if args.prices else None
-        answerer = core.Answerer(
-            args.index_dir, args.model, args.effort, api_key=api_key, workspace_id=workspace_id,
-            embedder=None if args.bm25_only else "vertex", max_tool_rounds=args.max_tool_rounds,
-            fallback={"auto": None, "on": True, "off": False}[args.fallback],
-            log_dir=None if args.no_log else args.log_dir, prices=prices)
+        if gemini:
+            from haixia import answer_gemini
+            answerer = answer_gemini.Answerer(
+                args.index_dir, args.model, thinking_level=args.gemini_thinking,
+                embedder=None if args.bm25_only else "vertex", max_tool_rounds=args.max_tool_rounds,
+                log_dir=None if args.no_log else args.log_dir, prices=prices)
+        else:
+            answerer = core.Answerer(
+                args.index_dir, args.model, args.effort, api_key=api_key, workspace_id=workspace_id,
+                embedder=None if args.bm25_only else "vertex", max_tool_rounds=args.max_tool_rounds,
+                fallback={"auto": None, "on": True, "off": False}[args.fallback],
+                log_dir=None if args.no_log else args.log_dir, prices=prices)
     except (ValueError, OSError) as problem:
         print(core.redact(problem, api_key, workspace_id), file=sys.stderr)
         return 2
@@ -135,10 +145,9 @@ def main(argv=None):
     def ask(conversation, question):
         try:
             return answerer.ask(conversation, question, on_tool=print_tool if args.show_tools else None)
-        except anthropic.APIStatusError as problem:
-            message = f"Claude API 錯誤（HTTP {problem.status_code}，{type(problem).__name__}）：{problem.message}"
-        except anthropic.APIConnectionError as problem:
-            message = f"連不上 Claude API（{type(problem).__name__}），請稍後再試"
+        except Exception as problem:  # noqa: BLE001 — 避免 SDK 錯誤內容洩漏憑證
+            status = getattr(problem, "status_code", None) or getattr(problem, "code", None)
+            message = f"回答服務暫時失敗（{type(problem).__name__}，HTTP {status or '未知'}），請稍後再試"
         print(core.redact(message, api_key, workspace_id), file=sys.stderr)
         return None
 

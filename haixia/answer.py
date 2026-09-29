@@ -51,6 +51,8 @@ PRICES = {
     # fallback 可能改由下面的模型回答
     "claude-opus-5": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+    "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075, "cache_write": 0.75},
+    "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00, "cache_read": 0.20, "cache_write": 2.00},
 }
 PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
 USAGE_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
@@ -369,6 +371,31 @@ def run_classic_commentary(store, args, max_chars=9000):
     return "\n\n".join(blocks), hits
 
 
+def execute_tool(searcher, name, data, round_number, calls, on_tool=None):
+    """兩種模型共用的工具驗證、執行與進度紀錄；回傳 (文字, 是否錯誤)。"""
+    record = {"round": round_number, "name": name, "input": data, "hits": [],
+              "mode": None, "error": None}
+    try:
+        args = validate_input(name, data)
+        record["input"] = args
+        if name == "search":
+            result, record["hits"], record["mode"] = run_search(searcher, args)
+        elif name == "classic_commentary":
+            result, record["hits"] = run_classic_commentary(searcher.store, args)
+        else:
+            result, record["hits"] = run_read_context(searcher.store, args)
+    except Exception as problem:  # noqa: BLE001 — 工具失敗要回傳模型
+        result = (str(problem) if isinstance(problem, ToolInputError)
+                  else f"工具執行失敗（{type(problem).__name__}）：{problem}")
+        if not isinstance(data, dict):
+            result += "；收到的輸入：" + json.dumps(data, ensure_ascii=False, default=str)[:300]
+        record["error"] = result
+    calls.append(record)
+    if on_tool:
+        on_tool(record)
+    return result, record["error"] is not None
+
+
 # ---------- 對話與回答 ----------
 
 class Conversation:
@@ -395,6 +422,32 @@ class Answer:
     notes: list = field(default_factory=list)
     # 最後一個請求的輸入總量（input＋快取讀＋快取寫）＝目前對話的長度，下一題至少要重送這麼多
     context_tokens: int = 0
+
+
+def log_answer(log_dir, model, effort, fallback_enabled, question, answer, error):
+    """兩個 provider 共用 JSONL 欄位；只記錯誤類型與狀態碼。"""
+    if log_dir is None:
+        return
+    entry = {
+        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": model, "served_model": answer.model, "effort": effort,
+        "fallback_enabled": fallback_enabled, "fallback_ran": answer.fallback,
+        "question": question, "answer": answer.text, "stop_reason": answer.stop_reason,
+        "refused": answer.refused, "rounds": answer.rounds, "requests": answer.requests,
+        "tool_calls": answer.tool_calls, "usage": answer.usage,
+        "cost_usd": round(answer.cost_usd, 6), "elapsed_sec": answer.elapsed_sec,
+        "notes": answer.notes,
+        "error": None if error is None else {
+            "type": type(error).__name__,
+            "status": getattr(error, "status_code", None) or getattr(error, "code", None)},
+    }
+    try:
+        path = Path(log_dir)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with open(path / LOG_NAME, "a", encoding="utf-8") as log:
+            log.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except OSError as problem:
+        answer.notes.append(f"寫入 log 失敗：{type(problem).__name__}")
 
 
 def history_content(content):
@@ -492,30 +545,10 @@ class Answerer:
     # ----- 工具 -----
 
     def _run_tool(self, block, round_number, calls, on_tool):
-        record = {"round": round_number, "name": block.name, "input": block.input, "hits": [],
-                  "mode": None, "error": None}
-        try:
-            args = validate_input(block.name, block.input)
-            record["input"] = args
-            if block.name == "search":
-                text, record["hits"], record["mode"] = run_search(self.searcher, args)
-            elif block.name == "classic_commentary":
-                text, record["hits"] = run_classic_commentary(self.searcher.store, args)
-            else:
-                text, record["hits"] = run_read_context(self.searcher.store, args)
-            result = {"type": "tool_result", "tool_use_id": block.id, "content": text}
-        except Exception as problem:  # noqa: BLE001 — 工具錯誤一律回給 Claude，不丟掉
-            if isinstance(problem, ToolInputError):
-                message = str(problem)
-            else:
-                message = f"工具執行失敗（{type(problem).__name__}）：{problem}"
-            if not isinstance(block.input, dict):
-                message += "；收到的輸入：" + json.dumps(block.input, ensure_ascii=False, default=str)[:300]
-            record["error"] = message
-            result = {"type": "tool_result", "tool_use_id": block.id, "content": message, "is_error": True}
-        calls.append(record)
-        if on_tool:
-            on_tool(record)
+        message, failed = execute_tool(self.searcher, block.name, block.input, round_number, calls, on_tool)
+        result = {"type": "tool_result", "tool_use_id": block.id, "content": message}
+        if failed:
+            result["is_error"] = True
         return result
 
     # ----- 問答 -----
@@ -598,27 +631,7 @@ class Answerer:
     # ----- 紀錄 -----
 
     def _log(self, question, answer, error):
-        if self.log_dir is None:
-            return
-        entry = {
-            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "model": self.model, "served_model": answer.model, "effort": self.effort,
-            "fallback_enabled": self.fallback, "fallback_ran": answer.fallback,
-            "question": question, "answer": answer.text, "stop_reason": answer.stop_reason,
-            "refused": answer.refused, "rounds": answer.rounds, "requests": answer.requests,
-            "tool_calls": answer.tool_calls, "usage": answer.usage,
-            "cost_usd": round(answer.cost_usd, 6), "elapsed_sec": answer.elapsed_sec,
-            "notes": answer.notes,
-            # 只記錯誤類型與 HTTP 狀態碼，不記訊息內容
-            "error": None if error is None else {
-                "type": type(error).__name__, "status": getattr(error, "status_code", None)},
-        }
-        try:
-            self.log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with open(self.log_dir / LOG_NAME, "a", encoding="utf-8") as log:
-                log.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-        except OSError as problem:
-            answer.notes.append(f"寫入 log 失敗：{type(problem).__name__}")
+        log_answer(self.log_dir, self.model, self.effort, self.fallback, question, answer, error)
 
     def close(self):
         if self.owns_searcher:

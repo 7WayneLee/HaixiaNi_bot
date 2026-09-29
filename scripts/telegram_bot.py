@@ -40,6 +40,8 @@ def main(argv=None):
     parser.add_argument("--log-dir", type=Path, default=core.DEFAULT_LOG_DIR,
                         help="問答紀錄 JSONL 的資料夾（每日花費也從這裡加總）")
     parser.add_argument("--effort", choices=core.EFFORTS, default=core.DEFAULT_EFFORT)
+    parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
+                        default="default", help="Gemini 思考程度；default 用模型預設")
     parser.add_argument("--bm25-only", action="store_true", help="不呼叫 Vertex，只用關鍵字搜尋")
     parser.add_argument("--check", action="store_true", help="只檢查設定與索引，不連 Telegram、不呼叫 API")
     args = parser.parse_args(argv)
@@ -57,6 +59,10 @@ def main(argv=None):
         return Searcher(args.index_dir, embedder)
 
     def make_answerer(model, searcher):
+        if model.startswith("gemini-"):
+            from haixia import answer_gemini
+            return answer_gemini.Answerer(args.index_dir, model, searcher=searcher,
+                                          thinking_level=args.gemini_thinking, log_dir=args.log_dir)
         return core.Answerer(args.index_dir, model, args.effort, api_key=config.api_key,
                              workspace_id=config.workspace_id, searcher=searcher, log_dir=args.log_dir)
 

@@ -49,6 +49,6 @@ sudo systemctl restart haixia-bot.service
 
 ## 使用方式與費用
 
-直接傳正體中文問題；連續問題會排隊。`/help` 或 `/start` 看用法，`/new` 開新對話，`/model opus`、`/model sonnet` 切換模型（切換會開新對話），`/cost` 看台灣時間今天與本月的題數和花費。醫案引用會隱藏姓名並附編號；只有白名單使用者能用 `/source 編號` 或「原文 編號」看原始標題、路徑、該段與前後段。對話閒置超過 6 小時或最後一個請求的輸入約超過 15 萬 token，下一題前會自動開新對話。
+直接傳正體中文問題；連續問題會排隊。`/help` 或 `/start` 看用法，`/new` 開新對話，`/model` 列出四個模型；`/model opus`、`/model sonnet`、`/model gemini-flash`、`/model gemini-pro` 切換模型（切換會開新對話），`/cost` 看台灣時間今天與本月的題數和花費。Gemini 的 Vertex 設定、價格與思考參數見 [08-gemini.md](08-gemini.md)。醫案引用會隱藏姓名並附編號；只有白名單使用者能用 `/source 編號` 或「原文 編號」看原始標題、路徑、該段與前後段。對話閒置超過 6 小時或最後一個請求的輸入約超過 15 萬 token，下一題前會自動開新對話。
 
-每題估計費用會寫到 `~/haixia-bot-logs/answers.jsonl`。常見題目約 Opus 5.5 US$0.20–0.26（約 NT$6–8）、Sonnet 5.5 US$0.10–0.14（約 NT$3–4）；搜尋輪數多時可能超過 US$0.50。台幣以 1 美元＝32 元估算。`DAILY_BUDGET_USD` 預設為 3，按台灣時間午夜重新計算；當天已記錄花費達上限時，不再發出新的 Claude API 請求。`/cost` 會顯示餘額。要調整上限，修改 `.env` 的 `DAILY_BUDGET_USD` 後重啟服務。
+每題估計費用會寫到 `~/haixia-bot-logs/answers.jsonl`。常見題目約 Opus 5.5 US$0.20–0.26（約 NT$6–8）、Sonnet 5.5 US$0.10–0.14（約 NT$3–4）；Gemini 費用依實際用量計算，價格見 [08-gemini.md](08-gemini.md)。台幣以 1 美元＝32 元估算。`DAILY_BUDGET_USD` 預設為 3，按台灣時間午夜重新計算；當天已記錄花費達上限時，不再發出新的回答模型 API 請求。`/cost` 會顯示餘額。要調整上限，修改 `.env` 的 `DAILY_BUDGET_USD` 後重啟服務。

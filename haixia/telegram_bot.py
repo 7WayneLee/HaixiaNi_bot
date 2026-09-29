@@ -38,10 +38,12 @@ TYPING_INTERVAL = 4.5           # Telegram 的「輸入中」約 5 秒後消失
 PROGRESS_QUERIES = 4            # 進度訊息最多列幾個查詢
 SERVICE = "haixia-bot"
 
-MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5"}
-MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5"}
+MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
+          "gemini-flash": "gemini-3.8-flash", "gemini-pro": "gemini-3.1-pro-preview"}
+MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
+               "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.1-pro-preview": "Gemini 3.1 Pro"}
 COMMANDS = {"start", "help", "new", "model", "cost", "source"}
-BOT_COMMANDS = [("help", "用法說明"), ("new", "開新對話"), ("model", "顯示或切換模型（opus／sonnet）"),
+BOT_COMMANDS = [("help", "用法說明"), ("new", "開新對話"), ("model", "顯示或切換四個模型"),
                 ("cost", "今天與本月的花費"), ("source", "看醫案或段落原文：/source 編號")]
 
 BM25_NOTE = "（註：這題的語意搜尋（Vertex）暫時失敗，只用關鍵字搜尋，找到的資料可能不完整。）"
@@ -413,29 +415,39 @@ def progress_text(labels, notices=()):
 
 # ---------- 錯誤與答案 ----------
 
-def error_message(problem):
+def error_message(problem, model=core.DEFAULT_MODEL):
     """例外 → 給使用者看的說明。不放原始錯誤內容（可能含金鑰或請求內容）。"""
-    status = getattr(problem, "status_code", None)
+    status = getattr(problem, "status_code", None) or getattr(problem, "code", None)
+    gemini = model.startswith("gemini-")
+    service = "Gemini" if gemini else "Claude"
     try:
         import anthropic
     except ImportError:  # pragma: no cover — 部署環境一定有
         anthropic = None
     if isinstance(problem, core.MissingApiKey):
         return "找不到 Anthropic API 金鑰：請在 movie-nas 的 ~/HaixiaNi_bot/.env 設定 ANTHROPIC_API_KEY，再重啟服務。"
-    if anthropic is not None and isinstance(problem, anthropic.APITimeoutError):
+    if gemini:
+        import httpx
+        if isinstance(problem, httpx.TimeoutException):
+            return "Gemini API 逾時，這題沒有完成。請再問一次。"
+        if isinstance(problem, httpx.ConnectError):
+            return "連不上 Gemini API（網路問題），這題沒有完成。請稍後再問一次。"
+    if not gemini and anthropic is not None and isinstance(problem, anthropic.APITimeoutError):
         return "Claude API 逾時，這題沒有完成。請再問一次。"
-    if anthropic is not None and isinstance(problem, anthropic.APIConnectionError):
+    if not gemini and anthropic is not None and isinstance(problem, anthropic.APIConnectionError):
         return "連不上 Claude API（網路問題），這題沒有完成。請稍後再問一次。"
     if status == 429:
-        return "Claude API 目前達到流量限制（HTTP 429），請過一兩分鐘再問。"
+        return f"{service} API 目前達到流量限制（HTTP 429），請過一兩分鐘再問。"
     if status in (401, 403):
+        if gemini:
+            return f"Gemini API 拒絕了服務帳號認證或權限（HTTP {status}），請檢查 Vertex AI 權限。"
         return f"Claude API 拒絕了金鑰（HTTP {status}）：請檢查 .env 的 ANTHROPIC_API_KEY（和 ANTHROPIC_WORKSPACE_ID）。"
     if status == 400:
-        return "Claude API 不接受這次請求（HTTP 400）。可能是對話太長或格式問題，請輸入 /new 開新對話再問。"
+        return f"{service} API 不接受這次請求（HTTP 400）。可能是對話太長或格式問題，請輸入 /new 開新對話再問。"
     if isinstance(status, int) and status >= 500:
-        return f"Claude 伺服器暫時忙碌或出錯（HTTP {status}），請稍後再問。"
+        return f"{service} 伺服器暫時忙碌或出錯（HTTP {status}），請稍後再問。"
     if status:
-        return f"Claude API 錯誤（HTTP {status}），這題沒有完成。請稍後再問。"
+        return f"{service} API 錯誤（HTTP {status}），這題沒有完成。請稍後再問。"
     return (f"處理這題時發生錯誤（{type(problem).__name__}），這題沒有完成。請再問一次；"
             f"一直失敗的話請看 log：journalctl -u {SERVICE}")
 
@@ -485,7 +497,7 @@ def help_text(model, budget):
 
 <b>指令</b>
 /new 開新對話（換題目時用，比較省錢）
-/model 顯示目前模型；/model opus 或 /model sonnet 切換（會開新對話）
+/model 顯示四個模型；/model opus、sonnet、gemini-flash 或 gemini-pro 切換（會開新對話）
 /cost 今天與本月的題數、花費
 /source 編號 看原文（也可以打「原文 編號」）
 /help 這個說明
@@ -728,13 +740,13 @@ class BotCore:
             return f"目前模型：{model_name(state.model)}（{state.model}）。\n切換：{choices}"
         model = resolve_model(arg)
         if model is None:
-            return f"不認得「{html.escape(arg)}」。可以用：/model opus 或 /model sonnet"
+            return f"不認得「{html.escape(arg)}」。可以用：" + "、".join(f"/model {alias}" for alias in MODELS)
         if model == state.model:
             return f"已經是 {model_name(model)}，不用切換。"
         state.model = model
         state.reset()
         return (f"已切換到 {model_name(model)}（{model}），下一題生效。\n"
-                "已開新對話：思考區塊綁定在模型上，換模型要重新開始。")
+                "已開新對話：換模型要重新開始。")
 
     async def handle_source(self, bot, chat_id, arg):
         code = normalize_code(arg)
@@ -827,9 +839,10 @@ class BotCore:
             answerer = self.pool.get(state.model)
             result = answerer.ask(conversation, question, on_tool=progress.on_tool)
         except Exception as problem:  # noqa: BLE001 — 一律回友善說明，log 只記類型與狀態碼
-            log.error("回答失敗：%s（HTTP %s）", type(problem).__name__, getattr(problem, "status_code", None))
+            log.error("回答失敗：%s（HTTP %s）", type(problem).__name__,
+                      getattr(problem, "status_code", None) or getattr(problem, "code", None))
             state.last_active = self.clock()
-            return JobResult("error", error_message(problem), notices)
+            return JobResult("error", error_message(problem, state.model), notices)
         if state.conversation is conversation:     # 回答期間使用者沒有 /new 或換模型
             state.last_active = self.clock()
             state.context_tokens = result.context_tokens
