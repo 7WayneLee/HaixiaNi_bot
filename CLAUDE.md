@@ -272,7 +272,28 @@
     - 抽查 20 個問題（桂枝湯組成、少陽病提綱、太衝穴、產後鬱冒、流年卦、肝癌等）：
       - 18 題前 4 名就有最相關的段落，其餘 2 題也相關。
       - 在 movie-nas 上最大 RSS 127 MB，每題約 0.6 秒（含 Vertex 查詢向量）。
-- [ ] 第四步：Claude 問答（2026-09-29 使用者同意開 worker）
+- [x] 第四步：Claude 問答（2026-09-29 完成）
+  - 程式：commit f7ecb98，Claude Code worker 撰寫，471 個測試通過。
+    - `haixia/answer.py`：兩個工具（`search`、`read_context`）、工具迴圈（最多 8 輪）、只附加的多輪對話、拒答處理、JSONL 費用紀錄（`~/haixia-bot-logs/`）。
+    - `data/system_prompt.md`：落實 6 條回答規則。
+    - `scripts/ask.py`：命令列問答；`docs/05-answer.md`：說明文件。
+  - 設定：
+    - 思考 adaptive；effort 預設 medium。
+    - 思考區塊綁定 beta 用 `drop_block`。
+    - 伺服器端 fallback（`fallbacks: "default"`）在 Opus 5.5 預設開啟。
+    - system 和工具定義用 prompt caching。
+    - movie-nas 的 `.venv-index` 裝了 anthropic 1.9.0。
+  - 實測 5 題（Opus 5.5）：總共 US$0.58，平均每題 US$0.117（約 3.7 台幣）、33 秒；沒有拒答，也沒觸發 fallback。
+    - 少陽病提綱：出處正確，原文依據和推論分得清楚。
+    - 口苦頭暈的病例：先列出問診項目，不直接開方，依倪師框架分出幾種可能。
+    - 疑似中風：第一句就叫 119，並標明一般知識；也引用倪師「醒著就不要十宣放血」。
+    - 新冠疫苗：明說查不到，推論標「把握程度：低」。
+    - 桂枝湯劑量：倪師把一兩當一錢（約 3.3 克）；還發現講義「生薑二兩」可能是打錯。
+  - 留給第五步處理：
+    - 答案裡的 Markdown 粗體（**）要轉成 Telegram 格式。
+    - 出處字串偏長：講義的條文、針灸教程的時間碼都被當成章節。
+    - 醫案出處會出現病人姓名。
+    - 每題約 30 秒，要有「查詢中」的提示。
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
 
