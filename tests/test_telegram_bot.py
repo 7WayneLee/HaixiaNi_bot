@@ -61,6 +61,16 @@ class FakeBot:
         return [(name, kwargs) for name, kwargs in self.calls if name != "action"]
 
 
+class FakeCallback:
+    def __init__(self, data, message_id=101, chat_id=CHAT):
+        self.data = data
+        self.message = SimpleNamespace(message_id=message_id, chat_id=chat_id)
+        self.answers = []
+
+    async def answer(self, **kwargs):
+        self.answers.append(kwargs)
+
+
 # ---------- 假的問答 ----------
 
 def make_answer(text="答案", model=core.DEFAULT_MODEL, cost=0.1, context=20_000, tool_calls=None, **extra):
@@ -325,9 +335,9 @@ def test_gemini_models_are_listed_and_switch_resets_conversation(make_core):
     old = state.conversation
     old.messages.append({"role": "user", "content": "舊問題"})
     run(bot_core.handle_message(bot, CHAT, USER, "/model"))
-    listing = bot.texts()[-1]
-    for alias in ("opus", "sonnet", "gemini-flash", "gemini-pro"):
-        assert f"/model {alias}" in listing
+    listing = bot.messages()[-1][1]
+    assert listing["text"] == "目前模型：Opus 5.5\n請選擇模型服務："
+    assert [button.text for button in listing["reply_markup"].inline_keyboard[0]] == ["Claude", "Gemini"]
     run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-flash"))
     assert state.model == "gemini-3.8-flash" and state.conversation is not old
     previous = state.conversation
@@ -335,6 +345,59 @@ def test_gemini_models_are_listed_and_switch_resets_conversation(make_core):
     assert state.model == "gemini-3.1-pro-preview" and state.conversation is not previous
     run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
     assert state.model == "claude-opus-5-5" and not state.conversation.messages
+
+
+def test_model_callback_menu_navigation_and_switch(make_core):
+    bot_core, pool = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    old = state.conversation
+    old.messages.append({"role": "user", "content": "舊題"})
+    run(bot_core.handle_message(bot, CHAT, USER, "/model"))
+    assert len(bot.messages()) == 1
+    for data, expected in [("m:c", ["Opus 5.5（目前）", "Sonnet 5.5", "‹ 返回"]),
+                           ("m:b", ["Claude", "Gemini"]),
+                           ("m:g", ["Gemini 3.8 Flash", "Gemini 3.1 Pro", "‹ 返回"])]:
+        callback = FakeCallback(data)
+        run(bot_core.handle_model_callback(bot, callback, USER))
+        assert callback.answers == [{}]
+        method, edit = bot.messages()[-1]
+        assert method == "edit" and edit["message_id"] == 101
+        if data == "m:b":
+            assert [button.text for button in edit["reply_markup"].inline_keyboard[0]] == expected
+        else:
+            assert [row[0].text for row in edit["reply_markup"].inline_keyboard] == expected
+        assert "目前模型：Opus 5.5" in edit["text"]
+    callback = FakeCallback("m:p")
+    run(bot_core.handle_model_callback(bot, callback, USER))
+    assert callback.answers == [{}]
+    assert state.model == "gemini-3.1-pro-preview" and state.conversation is not old
+    assert not state.conversation.messages
+    assert bot.messages()[-1][1]["reply_markup"] is None
+    assert "已切換到 Gemini 3.1 Pro" in bot.messages()[-1][1]["text"]
+    run(bot_core.handle_message(bot, CHAT, USER, "下一題"))
+    assert pool.answerers["gemini-3.1-pro-preview"].calls[0]["messages"] == 0
+    current = state.conversation
+    callback = FakeCallback("m:p")
+    run(bot_core.handle_model_callback(bot, callback, USER))
+    assert "已經是 Gemini 3.1 Pro" in bot.messages()[-1][1]["text"]
+    assert state.conversation is current
+
+
+def test_model_callback_rejects_strangers_and_expired_data(make_core, caplog):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    with caplog.at_level(logging.WARNING):
+        stranger = FakeCallback("m:s")
+        run(bot_core.handle_model_callback(bot, stranger, STRANGER))
+    assert stranger.answers == [{}] and not bot.messages()
+    assert state.model == core.DEFAULT_MODEL and "拒絕 model callback user_id=999" in caplog.text
+    for data in ("unknown", None, ["m:s"]):
+        callback = FakeCallback(data)
+        run(bot_core.handle_model_callback(bot, callback, USER))
+        assert callback.answers == [{"text": "選單已過期，請重新輸入 /model"}]
+    assert not bot.messages() and state.model == core.DEFAULT_MODEL
 
 
 def test_new_command_and_help(make_core):
@@ -670,10 +733,11 @@ def test_source_command_ambiguous_and_missing(make_core, case_store):
 
 def test_build_application_registers_message_handler(make_core):
     pytest.importorskip("telegram")
-    from telegram.ext import MessageHandler
+    from telegram.ext import CallbackQueryHandler, MessageHandler
 
     bot_core, _ = make_core()
     application = tg.build_application(bot_core, "123456:TEST-TOKEN-NOT-REAL")
     handlers = [handler for group in application.handlers.values() for handler in group]
-    assert len(handlers) == 1 and isinstance(handlers[0], MessageHandler)
+    assert len(handlers) == 2 and isinstance(handlers[0], MessageHandler)
+    assert isinstance(handlers[1], CallbackQueryHandler)
     assert application.update_processor.max_concurrent_updates > 1

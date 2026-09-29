@@ -45,12 +45,32 @@ MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
 COMMANDS = {"start", "help", "new", "model", "cost", "source"}
 BOT_COMMANDS = [("help", "用法說明"), ("new", "開新對話"), ("model", "顯示或切換四個模型"),
                 ("cost", "今天與本月的花費"), ("source", "看醫案或段落原文：/source 編號")]
+MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:f": "gemini-flash", "m:p": "gemini-pro"}
 
 BM25_NOTE = "（註：這題的語意搜尋（Vertex）暫時失敗，只用關鍵字搜尋，找到的資料可能不完整。）"
 
 
 def model_name(model):
     return MODEL_NAMES.get(model, model)
+
+
+def model_menu(model, provider=None):
+    """傳回選單文字與按鈕規格；callback data 固定且短。"""
+    current = f"目前模型：{model_name(model)}"
+    if provider is None:
+        return current + "\n請選擇模型服務：", [[("Claude", "m:c"), ("Gemini", "m:g")]]
+    aliases = ("opus", "sonnet") if provider == "claude" else ("gemini-flash", "gemini-pro")
+    rows = [[(model_name(MODELS[alias]) + ("（目前）" if MODELS[alias] == model else ""), data)]
+            for alias, data in zip(aliases, ("m:o", "m:s") if provider == "claude" else ("m:f", "m:p"))]
+    rows.append([("‹ 返回", "m:b")])
+    return current + f"\n選擇{(' Claude' if provider == 'claude' else ' Gemini')} 模型：", rows
+
+
+def model_keyboard(rows):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=data) for label, data in row]
+                                 for row in rows])
 
 
 # ---------- 設定 ----------
@@ -497,7 +517,7 @@ def help_text(model, budget):
 
 <b>指令</b>
 /new 開新對話（換題目時用，比較省錢）
-/model 顯示四個模型；/model opus、sonnet、gemini-flash 或 gemini-pro 切換（會開新對話）
+/model 開啟二級選單：先選 Claude 或 Gemini，再選模型；也可用 /model opus、sonnet、gemini-flash 或 gemini-pro 切換（會開新對話）
 /cost 今天與本月的題數、花費
 /source 編號 看原文（也可以打「原文 編號」）
 /help 這個說明
@@ -725,7 +745,12 @@ class BotCore:
             state.reset()
             await self.send_html(bot, chat_id, "已開新對話。")
         elif command.name == "model":
-            await self.send_html(bot, chat_id, self.switch_model(state, command.arg))
+            if command.arg:
+                await self.send_html(bot, chat_id, self.switch_model(state, command.arg))
+            else:
+                menu_text, rows = model_menu(state.model)
+                await self._call(bot.send_message, chat_id=chat_id, text=menu_text,
+                                 reply_markup=model_keyboard(rows))
         elif command.name == "cost":
             summary = read_costs(self.log_path, self.now())
             await self.send_html(bot, chat_id, html.escape(cost_message(summary, self.daily_budget), quote=False))
@@ -735,9 +760,6 @@ class BotCore:
             await self.send_html(bot, chat_id, f"不認得 /{html.escape(command.raw)} 這個指令。輸入 /help 看用法。")
 
     def switch_model(self, state, arg):
-        if not arg:
-            choices = "、".join(f"/model {alias}（{model_name(model)}）" for alias, model in MODELS.items())
-            return f"目前模型：{model_name(state.model)}（{state.model}）。\n切換：{choices}"
         model = resolve_model(arg)
         if model is None:
             return f"不認得「{html.escape(arg)}」。可以用：" + "、".join(f"/model {alias}" for alias in MODELS)
@@ -747,6 +769,34 @@ class BotCore:
         state.reset()
         return (f"已切換到 {model_name(model)}（{model}），下一題生效。\n"
                 "已開新對話：換模型要重新開始。")
+
+    async def handle_model_callback(self, bot, query, user_id):
+        """依按鈕使用者 ID 授權；每個 callback 都先 answer 以停止轉圈。"""
+        if not self.is_allowed(user_id):
+            log.warning("拒絕 model callback user_id=%s", user_id)
+            await query.answer()
+            return
+        data = query.data
+        if not isinstance(data, str) or (data not in ("m:c", "m:g", "m:b") and data not in MODEL_CALLBACKS):
+            await query.answer(text="選單已過期，請重新輸入 /model")
+            return
+        await query.answer()
+        message = query.message
+        if message is None:
+            return
+        chat_id, message_id = message.chat_id, message.message_id
+        state = self.state(chat_id)
+        if data in MODEL_CALLBACKS:
+            model = MODELS[MODEL_CALLBACKS[data]]
+            text = (f"已經是 {model_name(model)}。" if model == state.model
+                    else self.switch_model(state, MODEL_CALLBACKS[data]))
+            markup = None
+        else:
+            provider = {"m:c": "claude", "m:g": "gemini", "m:b": None}[data]
+            text, rows = model_menu(state.model, provider)
+            markup = model_keyboard(rows)
+        await self._call(bot.edit_message_text, chat_id=chat_id, message_id=message_id,
+                         text=text, reply_markup=markup)
 
     async def handle_source(self, bot, chat_id, arg):
         code = normalize_code(arg)
@@ -855,13 +905,19 @@ class BotCore:
 
 def build_application(bot_core, token):
     """建立 python-telegram-bot 的 Application（long polling）。只有這裡 import telegram。"""
-    from telegram.ext import ApplicationBuilder, MessageHandler, filters
+    from telegram.ext import ApplicationBuilder, CallbackQueryHandler, MessageHandler, filters
 
     async def on_message(update, context):
         message, chat, user = update.effective_message, update.effective_chat, update.effective_user
         if message is None or chat is None:
             return
         await bot_core.handle_message(context.bot, chat.id, user.id if user else None, message.text)
+
+    async def on_callback(update, context):
+        query = update.callback_query
+        if query is not None:
+            user = update.effective_user
+            await bot_core.handle_model_callback(context.bot, query, user.id if user else None)
 
     async def on_error(update, context):
         log.error("處理 Telegram 更新時出錯：%s", type(context.error).__name__)
@@ -879,5 +935,6 @@ def build_application(bot_core, token):
                    .post_init(post_init).post_shutdown(post_shutdown).build())
     # 只處理新訊息（不處理編輯過的訊息、頻道貼文），讓排隊由 BotCore 的 worker 負責
     application.add_handler(MessageHandler(filters.UpdateType.MESSAGE, on_message))
+    application.add_handler(CallbackQueryHandler(on_callback))
     application.add_error_handler(on_error)
     return application

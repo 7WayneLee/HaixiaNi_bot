@@ -204,6 +204,15 @@ def test_system_prompt_file_covers_the_six_rules():
         assert phrase in prompt, phrase
 
 
+def test_system_prompt_keeps_emergency_retrieval_and_needle_details():
+    prompt = core.SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    emergency = prompt.split("# 急重症\n", 1)[1].split("\n# ", 1)[0]
+    for phrase in ("答案第一句先提醒立即就醫或打急救電話", "仍要照常用工具查經典原文與倪師講義、逐字稿",
+                   "穴位、取穴、手法與先後順序", "病人醒著就不要十宣放血", "本人懂針灸、會自己下針",
+                   "針灸或放血的內容照資料完整提供"):
+        assert phrase in emergency, phrase
+
+
 # ---------- 工具迴圈 ----------
 
 def test_tool_loop_runs_several_rounds(index_dir):

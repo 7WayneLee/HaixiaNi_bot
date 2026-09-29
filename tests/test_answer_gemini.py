@@ -110,6 +110,50 @@ def test_tool_error_is_returned_to_model():
     assert "error" in client.models.calls[1]["contents"][2].parts[0].function_response.response
 
 
+def test_blank_after_tool_retries_once_without_tools_and_keeps_history():
+    call_part = types.Part(function_call=types.FunctionCall(name="search", args={"query": "中風"}),
+                           thought_signature=b"signature")
+    first = reply([call_part])
+    blank = reply([types.Part(text=" ")])
+    final = reply([types.Part.from_text(text="【倪師原文依據】答案")])
+    answerer, client = make([first, blank, final], model="gemini-3.1-pro-preview")
+    conversation = core.Conversation()
+    result = answerer.ask(conversation, "問題")
+    assert result.text == "【倪師原文依據】答案" and result.requests == 3
+    assert len(result.notes) == 1 and "補答一次" in result.notes[0]
+    assert result.cost_usd == pytest.approx(3 * (100 * 2 + 25 * 12) / 1_000_000)
+    assert conversation.messages[1] is first.candidates[0].content
+    assert conversation.messages[1].parts[0].thought_signature == b"signature"
+    assert conversation.messages[3] is blank.candidates[0].content
+    assert conversation.messages[4].role == "user" and "工具結果" in conversation.messages[4].parts[0].text
+    assert conversation.messages[5] is final.candidates[0].content
+    assert client.models.calls[2]["config"].tool_config.function_calling_config.mode == "NONE"
+
+
+def test_blank_after_tool_only_retries_once():
+    call = types.Part(function_call=types.FunctionCall(name="search", args={"query": "中風"}))
+    answerer, client = make([reply([call]), reply([]), reply([])])
+    result = answerer.ask(core.Conversation(), "問題")
+    assert result.requests == 3 and len(client.models.calls) == 3
+    assert "這次沒有產生文字回答" in result.text
+    assert len(result.notes) == 1 and "補答一次" in result.notes[0]
+
+
+def test_missing_content_after_tool_is_retried():
+    call = types.Part(function_call=types.FunctionCall(name="search", args={"query": "中風"}))
+    missing = types.GenerateContentResponse(candidates=[types.Candidate(finish_reason="STOP")])
+    answerer, client = make([reply([call]), missing, reply([types.Part.from_text(text="補答")])])
+    result = answerer.ask(core.Conversation(), "問題")
+    assert result.text == "補答" and result.requests == 3
+    assert client.models.calls[2]["config"].tool_config.function_calling_config.mode == "NONE"
+
+
+def test_blank_without_tool_result_does_not_retry():
+    answerer, client = make([reply([])])
+    result = answerer.ask(core.Conversation(), "問題")
+    assert result.requests == 1 and not result.notes and len(client.models.calls) == 1
+
+
 def test_round_limit_disables_tools():
     call = types.Part(function_call=types.FunctionCall(name="search", args={"query": "桂枝湯"}))
     answerer, client = make([reply([call]), reply([types.Part.from_text(text="結論")])], max_tool_rounds=1)

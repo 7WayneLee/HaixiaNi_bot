@@ -117,6 +117,8 @@ class Answerer:
 
     def _loop(self, messages, answer, on_tool):
         allow_tools = True
+        has_tool_results = False
+        retried_blank = False
         while True:
             response = self.client.models.generate_content(
                 model=self.model, contents=messages, config=self.request_config(allow_tools))
@@ -142,6 +144,13 @@ class Answerer:
                 return
             content = getattr(candidate, "content", None)
             if content is None:
+                if has_tool_results and not retried_blank:
+                    retried_blank = True
+                    allow_tools = False
+                    answer.notes.append("工具結果後沒有文字，已要求 Gemini 補答一次")
+                    messages.append(types.Content(role="user", parts=[types.Part.from_text(
+                        text="請根據上面已有的工具結果，依系統指示的答案格式直接作答。")]))
+                    continue
                 answer.text = "（這次沒有產生文字回答，請再問一次或換個說法。）"
                 return
             # 完整物件原樣追加；Part 裡的 thought_signature 不拆、不重建。
@@ -162,6 +171,7 @@ class Answerer:
                     allow_tools = False
                     answer.notes.append(f"工具呼叫達到上限 {self.max_tool_rounds} 輪，要求直接作答")
                 messages.append(types.Content(role="tool", parts=results))
+                has_tool_results = True
                 continue
             if calls:
                 messages.append(types.Content(role="tool", parts=[types.Part(
@@ -172,6 +182,13 @@ class Answerer:
             if reason == "MAX_TOKENS":
                 answer.notes.append("回答超過 max_output_tokens 被截斷")
             if not answer.text:
+                if has_tool_results and not retried_blank:
+                    retried_blank = True
+                    allow_tools = False
+                    answer.notes.append("工具結果後沒有文字，已要求 Gemini 補答一次")
+                    messages.append(types.Content(role="user", parts=[types.Part.from_text(
+                        text="請根據上面已有的工具結果，依系統指示的答案格式直接作答。")]))
+                    continue
                 answer.text = "（這次沒有產生文字回答，請再問一次或換個說法。）"
             return
 
