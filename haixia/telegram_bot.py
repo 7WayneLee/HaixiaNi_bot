@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from haixia import answer as core
-from haixia.search import citation, original_title
+from haixia.search import citation, display_source_path, original_title
 
 log = logging.getLogger("haixia.bot")
 
@@ -45,7 +45,7 @@ MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
                "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.1-pro-preview": "Gemini 3.1 Pro"}
 COMMANDS = {"start", "help", "new", "model", "cost", "source"}
 BOT_COMMANDS = [("help", "用法說明"), ("new", "開新對話"), ("model", "顯示或切換四個模型"),
-                ("cost", "今天與本月的花費"), ("source", "看醫案或段落原文：/source 編號")]
+                ("cost", "今天與本月的花費"), ("source", "看段落原文：/source 編號")]
 MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:f": "gemini-flash", "m:p": "gemini-pro"}
 
 BM25_NOTE = "（註：這題的語意搜尋（Vertex）暫時失敗，只用關鍵字搜尋，找到的資料可能不完整。）"
@@ -176,6 +176,8 @@ def parse_command(text):
     found = _COMMAND.match(text)
     if found:
         name = found.group(1).lower()
+        if re.fullmatch(r"s_[0-9a-f]{4,16}", name) and not found.group(2):
+            return Command("source", name[2:], found.group(1))
         return Command(name if name in COMMANDS else "unknown", (found.group(2) or "").strip(), found.group(1))
     found = _ORIGINAL.match(text)
     if found:
@@ -473,9 +475,9 @@ def error_message(problem, model=core.DEFAULT_MODEL):
             f"一直失敗的話請看 log：journalctl -u {SERVICE}")
 
 
-def answer_text(result):
+def answer_text(result, displayed=None):
     """Answer → 要送出的文字：答案、搜尋退回關鍵字的註明、fallback、用量。"""
-    text = result.text
+    text = result.text if displayed is None else displayed
     if result.refused:
         text = text.replace("互動模式輸入 /new", "輸入 /new")
     notes = []
@@ -488,13 +490,42 @@ def answer_text(result):
     return "\n\n".join([text, *notes, footer])
 
 
+_SOURCE_CODE = re.compile(r"（編號 ([0-9a-f]{4,16})）")
+
+
+def clickable_citations(text, store):
+    """只把索引中確實唯一的編號變成 Telegram 可點的 /s_ 指令。須在 worker 執行緒呼叫。"""
+    valid = {}
+
+    def replace(match):
+        code = match.group(1)
+        if code not in valid:
+            matches = store.find_prefix(code, limit=2)
+            valid[code] = len(matches) == 1
+        return f" /s_{code}" if valid[code] else match.group()
+
+    return _SOURCE_CODE.sub(replace, text)
+
+
+_CLASSIC_SOURCE = re.compile(r"^jicheng:(.+)#\d+(?:-.*)?$")
+
+
+def display_source(source):
+    found = _CLASSIC_SOURCE.fullmatch(source)
+    return f"中醫笈成《{found.group(1)}》" if found else display_source_path(source)
+
+
 def format_source(target, previous, following):
     """/source 的回覆（HTML）：原始標題（可能含姓名）、檔案路徑、出處與前後各一段全文。只回給使用者本人。"""
     escape = lambda value: html.escape(str(value), quote=False)  # noqa: E731
+    source = target["source"]
+    shown_source = display_source(source)
     lines = [f"<b>原文（段落 {escape(target['id'])}）</b>",
              f"原始標題：{escape(original_title(target) or '（無）')}",
-             f"檔案：{escape(target['source'])}",
-             f"出處：{escape(citation(target))}"]
+             f"檔案：{escape(shown_source)}"]
+    if shown_source != source and "倪海厦08年医案959篇" in source:
+        lines.append(f"Drive 上的原檔名：{escape(source)}")
+    lines.append(f"出處：{escape(citation(target))}")
     if target.get("section"):
         lines.append(f"章節：{escape(target['section'])}")
     blocks = ["\n".join(lines)]
@@ -523,8 +554,8 @@ def help_text(model, budget):
 /source 編號 看原文（也可以打「原文 編號」）
 /help 這個說明
 
-<b>醫案編號</b>
-醫案的出處不顯示病人姓名，寫成「醫案 2008-08-07 皮癢（編號 3e13af）」。要看原醫案（原始標題、檔案路徑、全文與前後段）就傳 /source 3e13af。
+<b>出處與原文</b>
+經典、逐字稿、講義、醫案的出處後面都有 /s_…，點它就能看原文與前後段。也可以傳 /source 編號或「原文 編號」。醫案出處不顯示病人姓名，例如「醫案 2008-08-07 皮癢 /s_3e13af」。
 
 <b>其他</b>
 目前模型：{model_name(model)}。追問會接著同一段對話；超過 6 小時沒互動、或對話太長（約 15 萬 token）時會自動開新對話並告訴你。bot 重新啟動後對話會清空。
@@ -899,7 +930,9 @@ class BotCore:
             state.context_tokens = result.context_tokens
         log.info("回答完成：%s，%d 輪工具，US$%.4f，%.1f 秒%s", result.model, result.rounds, result.cost_usd,
                  result.elapsed_sec, "（拒答）" if result.refused else "")
-        return JobResult("answer", answer_text(result), notices, result)
+        displayed = core.display_answer(result.text, conversation)
+        displayed = clickable_citations(displayed, self.pool.store)
+        return JobResult("answer", answer_text(result, displayed), notices, result)
 
 
 # ---------- python-telegram-bot ----------

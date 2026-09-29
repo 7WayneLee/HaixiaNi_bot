@@ -52,8 +52,8 @@ def usage_line(usage, cost, rounds=None, requests=None, elapsed=None):
     return "；".join(parts)
 
 
-def show(result):
-    print(result.text)
+def show(result, conversation=None):
+    print(core.display_answer(result.text, conversation) if conversation is not None else result.text)
     print(file=sys.stderr)
     for note in result.notes:
         print(f"［注意］{note}", file=sys.stderr)
@@ -85,7 +85,7 @@ def interactive(ask):
         result = ask(conversation, question)
         if result is None:
             continue
-        show(result)
+        show(result, conversation)
         for name in core.USAGE_FIELDS:
             total[name] += result.usage[name]
         cost += result.cost_usd
@@ -155,10 +155,11 @@ def main(argv=None):
         if args.interactive:
             interactive(ask)
             return 0
-        result = ask(core.Conversation(), args.question)
+        conversation = core.Conversation()
+        result = ask(conversation, args.question)
         if result is None:
             return 1
-        show(result)
+        show(result, conversation)
         return 0
     finally:
         answerer.close()

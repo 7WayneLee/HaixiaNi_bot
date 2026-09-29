@@ -102,6 +102,29 @@ def test_multiple_calls_one_response_and_signature_preserved():
     assert all(part.function_response for part in tool_content.parts)
 
 
+def test_gemini_display_citation_does_not_change_history_or_log(tmp_path):
+    record = {"id": "a1b2c30000000001", "short_id": "a1b2c3", "kind": "transcript",
+              "title": "測試課", "episode": "第1集", "start": 10, "end": 20, "text": "測試原文。"}
+
+    class OneResult(FakeSearcher):
+        def search(self, query, k, kind):
+            return {"results": [record], "mode": "bm25"}
+
+    original = "測試答案（出處：測試課 第1集 00:10–00:20）"
+    answerer, _ = make([
+        reply([types.Part(function_call=types.FunctionCall(name="search", args={"query": "測試"}))]),
+        reply([types.Part.from_text(text=original)]),
+    ])
+    answerer.searcher = OneResult()
+    answerer.log_dir = tmp_path
+    conversation = core.Conversation()
+    result = answerer.ask(conversation, "問題")
+    assert result.text == original
+    assert core.display_answer(result.text, conversation) == original[:-1] + "（編號 a1b2c3））"
+    assert conversation.messages[-1].parts[0].text == original
+    assert json.loads((tmp_path / core.LOG_NAME).read_text().strip())["answer"] == original
+
+
 def test_tool_error_is_returned_to_model():
     answerer, client = make([reply([types.Part(function_call=types.FunctionCall(
         name="search", args={"query": ""}))]), reply([types.Part.from_text(text="已修正")])])

@@ -4,9 +4,9 @@ Vertex 失敗（逾時、網路、認證）時退回只用 BM25，並在結果�
 常駐記憶體：SQLite 連線、每段一個布林（段落種類）、向量用 memmap，不整份讀進來。
 
 出處（citation）同時給 Claude 看（工具結果）和給人看（ask.py、Telegram），所以要短：
-去掉講義章節裡的時間碼、條文只留條號與開頭幾個字；以病人姓名命名的醫案隱藏姓名，
-改成「醫案 日期 主訴（編號 xxxxxx）」，編號是段落 id 的前 6 碼（不唯一時加長），
-用 /source 編號 可以找回原始標題、路徑與全文。
+去掉講義章節裡的時間碼、條文只留條號與開頭幾個字；以病人姓名命名的醫案隱藏姓名。
+每種段落都附編號，編號是段落 id 的前 6 碼（不唯一時加長），
+用 /source 編號可以找回原始標題、路徑與全文。
 """
 
 import re
@@ -31,7 +31,7 @@ def rrf_merge(rankings, k=RRF_K):
 
 
 class CitationStore(IndexStore):
-    """IndexStore 加上醫案編號：rows() 取出的醫案段落多一個 short_id，給 citation() 用。"""
+    """查詢時替每種段落補上索引內唯一的短編號，不改動索引。"""
 
     def count_prefix(self, prefix):
         return self.connection.execute(
@@ -49,8 +49,7 @@ class CitationStore(IndexStore):
         return [self._annotate(dict(row)) for row in rows]
 
     def _annotate(self, record):
-        if case_info(record) is not None:
-            record["short_id"] = self.short_id(record["id"])
+        record["short_id"] = self.short_id(record["id"])
         return record
 
     def rows(self, row_ids):
@@ -58,6 +57,9 @@ class CitationStore(IndexStore):
         for record in records.values():
             self._annotate(record)
         return records
+
+    def classic_commentary(self, classic_id, limit=6):
+        return [self._annotate(record) for record in super().classic_commentary(classic_id, limit)]
 
 
 class Searcher:
@@ -158,6 +160,22 @@ def short_section(section):
     if not section:
         return ""
     text = re.sub(r"\s+", " ", _TIMECODE.sub("", section)).strip()
+    brackets = {"【": "】", "[": "]", "（": "）", "(": ")"}
+    closers = {right: left for left, right in brackets.items()}
+    pending = {left: [] for left in brackets}
+    drop = set()
+    for index, char in enumerate(text):
+        if char in brackets:
+            pending[char].append(index)
+        elif char in closers:
+            openings = pending[closers[char]]
+            if openings:
+                openings.pop()
+            else:
+                drop.add(index)
+    drop.update(index for openings in pending.values() for index in openings)
+    if drop:
+        text = "".join(char for index, char in enumerate(text) if index not in drop)
     article = _ARTICLE.search(text)
     if article:
         number, body = article.groups()
@@ -178,6 +196,49 @@ def repair_filename(name):
         return name
     except UnicodeDecodeError:
         return name.encode("gb18030").decode("big5", errors="replace").replace("\ufffd", "")
+
+
+_GARBLED_CASE_DIR = re.compile(r"^((?:畍羬洛|畍羬洛)(?:6|7|8|9|10|11)_2008)(.*)$")
+
+
+def _repair_path_part(name):
+    """修復能解碼的片段；無法轉回 Big5 的原字元保留，不刪除。"""
+    if not name:
+        return name
+    encoded = [char.encode("gb18030") for char in name]
+    combined = b"".join(encoded)
+    try:
+        return combined.decode("big5")
+    except UnicodeDecodeError as problem:
+        offsets = []
+        position = 0
+        for unit in encoded:
+            offsets.append((position, position + len(unit)))
+            position += len(unit)
+        first = next(i for i, (_start, end) in enumerate(offsets) if end > problem.start)
+        last = next(i for i, (_start, end) in enumerate(offsets) if end >= problem.end)
+        return (_repair_path_part(name[:first]) + name[first:last + 1]
+                + _repair_path_part(name[last + 1:]))
+
+
+def display_source_path(source):
+    """959 篇的路徑只修復已知亂碼目錄與檔名；正常的路徑片段照原樣顯示。"""
+    if MOJIBAKE_FOLDER not in source:
+        return source
+    parts = source.split("/")
+    folder = next((i for i, part in enumerate(parts) if MOJIBAKE_FOLDER in part), None)
+    if folder is None:
+        return source
+    for i in range(folder + 1, len(parts)):
+        part = parts[i]
+        found = _GARBLED_CASE_DIR.match(part)
+        if found:
+            parts[i] = _repair_path_part(found.group(1)) + found.group(2)
+        elif i == len(parts) - 1 and PurePosixPath(part).suffix.lower() in _DOC_SUFFIXES:
+            # 959 篇的文件檔名是整段 Big5 位元組誤解碼；副檔名是 ASCII。
+            stem, suffix = part[:-len(PurePosixPath(part).suffix)], PurePosixPath(part).suffix
+            parts[i] = _repair_path_part(stem) + suffix
+    return "/".join(parts)
 
 
 def original_title(record):
@@ -244,18 +305,20 @@ def case_code(record):
 
 
 def citation(record):
-    """出處：課名、集數與時間 mm:ss–mm:ss；書名、章節與頁碼；醫案則是日期、主訴與編號。"""
+    """各種出處都附可查原文的唯一編號。"""
+    code = f"（編號 {case_code(record)}）"
     if record["kind"] == "classic":
         location = f"《{record['title']}》{short_section(record.get('section'))}"
-        return f"{location} {record['episode']}" if record.get("episode") else location
+        location = f"{location} {record['episode']}" if record.get("episode") else location
+        return location + code
     if record["kind"] == "transcript":
         parts = [record["title"], record.get("episode")]
         where = f"{_clock(record['start'])}–{_clock(record['end'])}"
-        return " ".join(p for p in parts if p) + f" {where}"
+        return " ".join(p for p in parts if p) + f" {where}" + code
     case = case_info(record)
     if case is not None:
         parts = ["醫案", case["date"], case["complaint"]]
-        return " ".join(p for p in parts if p) + f"（編號 {case_code(record)}）"
+        return " ".join(p for p in parts if p) + code
     parts = [record["title"]]
     section = short_section(record.get("section"))
     if section:
@@ -266,4 +329,4 @@ def citation(record):
         pages = (f"第 {record['page_start']} 頁" if record["page_start"] == record["page_end"]
                  else f"第 {record['page_start']}–{record['page_end']} 頁")
         parts.append(pages)
-    return " ".join(parts)
+    return " ".join(parts) + code

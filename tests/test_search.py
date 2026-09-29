@@ -136,10 +136,10 @@ def test_vector_meta_must_match_chunks(tmp_path):
 
 
 def test_citation_formats():
-    assert citation({**CHUNKS[0]}) == "人紀・傷寒論 傷寒論1（1） 01:05–03:10"
-    assert citation({**CHUNKS[3]}) == "人紀・針灸 針灸1（1） 1:00:00–1:02:05"
-    assert citation({**CHUNKS[1]}) == "人紀《傷寒論》 辨太陽病 第 12–13 頁"
-    assert citation({**CHUNKS[2]}) == "事實評論一 2008-08-01"
+    assert citation({**CHUNKS[0]}) == "人紀・傷寒論 傷寒論1（1） 01:05–03:10（編號 a）"
+    assert citation({**CHUNKS[3]}) == "人紀・針灸 針灸1（1） 1:00:00–1:02:05（編號 d）"
+    assert citation({**CHUNKS[1]}) == "人紀《傷寒論》 辨太陽病 第 12–13 頁（編號 b）"
+    assert citation({**CHUNKS[2]}) == "事實評論一 2008-08-01（編號 c）"
 
 
 def test_search_cli_bm25_only(tmp_path, capsys):
@@ -149,14 +149,14 @@ def test_search_cli_bm25_only(tmp_path, capsys):
     assert search_index.main(["桂枝湯", "-k", "2", "--index-dir", str(tmp_path), "--bm25-only"]) == 0
     output = capsys.readouterr().out
     assert "只用關鍵字搜尋" in output
-    assert "1. 人紀・傷寒論 傷寒論1（1） 01:05–03:10" in output
+    assert "1. 人紀・傷寒論 傷寒論1（1） 01:05–03:10（編號 a）" in output
     assert "桂枝湯是五味藥" in output
     assert search_index.main(["不存在的詞彙", "--index-dir", str(tmp_path), "--bm25-only"]) == 1
 
 
 # ---------- 出處縮短與醫案隱藏姓名（姓名都是虛構的測試資料） ----------
 
-from haixia.search import (CitationStore, case_info, original_title, repair_filename, short_section,  # noqa: E402
+from haixia.search import (CitationStore, case_info, display_source_path, original_title, repair_filename, short_section,  # noqa: E402
                            split_case_title, unique_prefix)
 
 CASE_DIR = "文字資料/03.倪海厦诊疗日志 医案/"
@@ -183,6 +183,9 @@ def test_short_section_rules():
     # 第一層短就保留，截斷第二層；總長 20 字加「…」
     assert short_section("平人氣象論篇第十八 （八）寸脈若沈而急緩不定，是往來寒熱之表現") == "平人氣象論篇第十八 （八）寸脈若沈而急緩…"
     assert short_section("辨太陽病") == "辨太陽病"
+    assert short_section("【胸痺心痛短氣病脈證治第九") == "胸痺心痛短氣病脈證治第九"
+    assert short_section("（辨太陽病）") == "（辨太陽病）"
+    assert short_section("【正常】 【未閉") == "【正常】 未閉"
     assert short_section("一二三四五六七八九十一二三四五六七八九十一二") == "一二三四五六七八九十一二三四五六七八九十…"
     assert short_section(None) == "" and short_section("") == ""
 
@@ -250,10 +253,10 @@ def test_case_citation_hides_name():
 def test_document_citation_shortened():
     record = doc("z1", "文字資料/人紀.pdf", "人紀《傷寒論》", page=164,
                  section="辨少陽病脈證並治法 二七七：「少陽」之為病,口苦,咽乾,目眩也。")
-    assert citation(record) == "人紀《傷寒論》 二七七：「少陽」之為病,口苦… 第 164 頁"
+    assert citation(record) == "人紀《傷寒論》 二七七：「少陽」之為病,口苦… 第 164 頁（編號 z1）"
     record = doc("z2", "文字資料/針灸.pdf", "人紀《針灸教程》", page=35,
                  section="第三章十二經納天干地支與十二正經井榮俞原經合（1-01:14:05） 5、脊中與筋縮穴（2-01:07:00）")
-    assert citation(record) == "人紀《針灸教程》 5、脊中與筋縮穴 第 35 頁"
+    assert citation(record) == "人紀《針灸教程》 5、脊中與筋縮穴 第 35 頁（編號 z2）"
 
 
 def test_unique_prefix_grows_until_unique():
@@ -277,10 +280,10 @@ def test_citation_store_short_ids_and_prefix_lookup(tmp_path):
     ]
     store = CitationStore(build(tmp_path, chunks=chunks, vectors=None))
     records = store.rows([0, 1, 2, 3])
-    # 前 6 碼相同的兩段自動加長成 7 碼；只有一段的維持 6 碼；不是醫案的不加 short_id
+    # 前 6 碼相同的兩段自動加長成 7 碼；各種段落都帶編號。
     assert records[0]["short_id"] == "3e13af0" and records[1]["short_id"] == "3e13af1"
     assert records[2]["short_id"] == "777777"
-    assert "short_id" not in records[3]
+    assert records[3]["short_id"] == "3e13b0"
     assert citation(records[0]) == "醫案 2008-08-07 皮癢（編號 3e13af0）"
     assert [r["id"] for r in store.find_prefix("3e13af")] == ["3e13af0000000001", "3e13af1000000002"]
     assert [r["id"] for r in store.find_prefix("777777")] == ["777777a000000003"]
@@ -289,3 +292,16 @@ def test_citation_store_short_ids_and_prefix_lookup(tmp_path):
     target, previous, following = store.neighbors("3e13af1000000002", 1, 1)
     assert previous[0]["short_id"] == "3e13af0" and target["short_id"] == "3e13af1"
     store.close()
+
+
+@pytest.mark.parametrize("number", range(6, 12))
+def test_display_source_path_repairs_only_garbled_parts(number):
+    basename = "Doe,Jane20080807-皮癢".encode("big5").decode("gb18030") + ".doc"
+    root = CASE_DIR + "倪海厦08年医案959篇-按人名分类(神州医料库）/"
+    original = root + f"畍羬洛{number}_2008(神州医料库）/" + basename
+    displayed = display_source_path(original)
+    assert displayed == root + f"師臨醫{number}_2008(神州医料库）/Doe,Jane20080807-皮癢.doc"
+    assert display_source_path(original[:-4] + "😀.doc").endswith("Doe,Jane20080807-皮癢😀.doc")
+    assert display_source_path("文字資料/正常資料夾/正常檔名.doc") == "文字資料/正常資料夾/正常檔名.doc"
+    complete = root + f"畍羬洛{number}_2008(神州医料库）/" + basename
+    assert display_source_path(complete) == root + f"倪師臨床醫案{number}_2008(神州医料库）/Doe,Jane20080807-皮癢.doc"

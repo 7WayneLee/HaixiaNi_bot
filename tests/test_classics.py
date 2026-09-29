@@ -119,7 +119,7 @@ def test_chunk_does_not_cross_section_and_citation():
     chunks = classics.classic_chunks(units)
     assert len(chunks) == 2 and chunks[0]["kind"] == "classic"
     assert chunks[0]["episode"] == "第263條" and chunks[0]["source"].endswith("第263條")
-    assert citation(chunks[0]) == "《傷寒論（宋本）》辨少陽病脈證並治第九 第263條"
+    assert citation(chunks[0]) == "《傷寒論（宋本）》辨少陽病脈證並治第九 第263條（編號 ecb40d）"
     assert chunks[0]["quality"] == 90 and chunks[0]["raw_text"] == units[0]["原文"]
 
 

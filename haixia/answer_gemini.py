@@ -106,7 +106,7 @@ class Answerer:
         conversation.questions += 1
         error = None
         try:
-            self._loop(messages, answer, on_tool)
+            self._loop(messages, answer, on_tool, conversation)
         except Exception as problem:
             error = problem
             raise
@@ -115,7 +115,7 @@ class Answerer:
             core.log_answer(self.log_dir, self.model, self.thinking_level, False, question, answer, error)
         return answer
 
-    def _loop(self, messages, answer, on_tool):
+    def _loop(self, messages, answer, on_tool, conversation):
         allow_tools = True
         has_tool_results = False
         retried_blank = False
@@ -163,7 +163,8 @@ class Answerer:
                 for call in calls:
                     name = call.name or ""
                     message, failed = core.execute_tool(
-                        self.searcher, name, call.args or {}, answer.rounds, answer.tool_calls, on_tool)
+                        self.searcher, name, call.args or {}, answer.rounds, answer.tool_calls, on_tool,
+                        conversation)
                     payload = {"error" if failed else "result": message}
                     results.append(types.Part(function_response=types.FunctionResponse(
                         name=name, id=call.id, response=payload)))

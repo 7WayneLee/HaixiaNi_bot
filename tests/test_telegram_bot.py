@@ -294,6 +294,9 @@ def test_parse_command_variants():
     assert tg.parse_command("/model@HaixiaBot opus") == tg.Command("model", "opus", "model")
     assert tg.parse_command("/COST").name == "cost"
     assert tg.parse_command("/source 3e13af") == tg.Command("source", "3e13af", "source")
+    assert tg.parse_command("/s_3e13af") == tg.Command("source", "3e13af", "s_3e13af")
+    assert tg.parse_command("/s_3e13af@HaixiaBot") == tg.Command("source", "3e13af", "s_3e13af")
+    assert tg.parse_command("/s_badname").name == "unknown"
     assert tg.parse_command("原文 3e13af") == tg.Command("source", "3e13af", "原文")
     assert tg.parse_command("原文：3E13AF9").arg == "3E13AF9"
     assert tg.parse_command("原文3e13af").name == "source"
@@ -711,6 +714,8 @@ def test_source_command_found(make_core, case_store):
     run(bot_core.handle_message(bot, CHAT, USER, "原文 3E13AF1000000002"))
     text = bot.texts()[-1]
     assert "【前一段】" in text and "【後一段】" in text and "複診：好轉。" in text
+    run(bot_core.handle_message(bot, CHAT, USER, "/s_3e13af0@HaixiaBot"))
+    assert "【這一段】" in bot.texts()[-1]
 
 
 def test_source_command_ambiguous_and_missing(make_core, case_store):
@@ -719,6 +724,7 @@ def test_source_command_ambiguous_and_missing(make_core, case_store):
     run(bot_core.handle_message(bot, CHAT, USER, "/source 3e13af"))
     text = bot.texts()[-1]
     assert "對應到不只一段" in text and "3e13af0" in text and "3e13af1" in text
+    assert "（編號 3e13af0）" in text and "（編號 3e13af1" in text
     run(bot_core.handle_message(bot, CHAT, USER, "/source 3e13af1"))
     assert "對應到不只一段" in bot.texts()[-1]
     run(bot_core.handle_message(bot, CHAT, USER, "/source ffffff"))
@@ -727,6 +733,36 @@ def test_source_command_ambiguous_and_missing(make_core, case_store):
     assert "用法：/source 編號" in bot.texts()[-1]
     run(bot_core.handle_message(bot, CHAT, USER, "/source 5a5a5a"))
     assert "原始標題：人紀《傷寒論》" in bot.texts()[-1]
+
+
+def test_clickable_citations_verify_unique_index_code(case_store):
+    text = "甲（編號 3e13af0）；乙（編號 3e13af）；丙（編號 ffffff）；丁（編號 5a5a5a）；戊（編號 3e13af0000000001）"
+    shown = tg.clickable_citations(text, case_store)
+    assert shown == "甲 /s_3e13af0；乙（編號 3e13af）；丙（編號 ffffff）；丁 /s_5a5a5a；戊 /s_3e13af0000000001"
+    assert tg.to_html(shown) == shown
+
+
+def test_answer_shows_clickable_source_in_worker(make_core, case_store):
+    bot_core, _ = make_core(store=case_store, script=lambda model, question, on_tool:
+                            make_answer("答案（出處：醫案 2008-08-07 皮癢（編號 3e13af0））", model))
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "測試問題"))
+    assert "醫案 2008-08-07 皮癢 /s_3e13af0" in bot.texts()[-1]
+
+
+def test_source_formats_repaired_case_path_and_classic_source():
+    garbled = "Doe,Jane20080807-皮癢".encode("big5").decode("gb18030") + ".doc"
+    source = ("文字資料/倪海厦08年医案959篇-按人名分类(神州医料库）/"
+              "畍羬洛11_2008(神州医料库）/" + garbled)
+    case = _doc("a1b2c30000000001", source, "亂碼標題", "虛構原文。")
+    shown = tg.format_source(case, [], [])
+    assert "檔案：文字資料/倪海厦08年医案959篇-按人名分类(神州医料库）/師臨醫11_2008(神州医料库）/Doe,Jane20080807-皮癢.doc" in shown
+    assert "Drive 上的原檔名：" + source in shown
+    classic = {**case, "kind": "classic", "source": "jicheng:傷寒論（宋本）#1",
+               "title": "傷寒論（宋本）", "episode": "第1條"}
+    shown = tg.format_source(classic, [], [])
+    assert "檔案：中醫笈成《傷寒論（宋本）》" in shown
+    assert "Drive 上的原檔名" not in shown
 
 
 # ---------- python-telegram-bot 介面 ----------

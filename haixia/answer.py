@@ -15,6 +15,7 @@
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -316,7 +317,7 @@ def format_record(record, label):
     return f"{label} id={record['id']}｜{kind}\n出處：{citation(record)}\n{record['text'].strip()}"
 
 
-def run_search(searcher, args):
+def run_search(searcher, args, remember=None):
     """→ (給 Claude 的文字, 命中清單, 搜尋模式)。"""
     result = searcher.search(args["query"], k=args["k"], kind=KINDS[args["kind"]])
     records = result["results"]
@@ -325,17 +326,21 @@ def run_search(searcher, args):
         header += "［向量搜尋失敗，這次只用關鍵字搜尋］"
     if not records:
         return header + "：找不到相關段落。可以換關鍵字、同義詞或條文原句再查。", [], result["mode"]
+    if remember:
+        remember(records)
     blocks = [f"{header}，共 {len(records)} 段："]
     blocks += [format_record(record, f"[{number}]") for number, record in enumerate(records, 1)]
     hits = [{"id": record["id"], "citation": citation(record)} for record in records]
     return "\n\n".join(blocks), hits, result["mode"]
 
 
-def run_read_context(store, args):
+def run_read_context(store, args, remember=None):
     try:
         target, previous, following = store.neighbors(args["id"], args["before"], args["after"])
     except KeyError:
         raise ToolInputError(f"找不到段落 id：{args['id']}") from None
+    if remember:
+        remember([*previous, target, *following])
     lines = [f"段落 {target['id']}（{citation(target)}）的前後文，依原本順序排列："]
     if not previous and not following:
         lines.append("同一來源裡沒有相鄰的段落（這一段就是開頭或結尾）。")
@@ -348,7 +353,7 @@ def run_read_context(store, args):
     return "\n\n".join(lines), hits
 
 
-def run_classic_commentary(store, args, max_chars=9000):
+def run_classic_commentary(store, args, max_chars=9000, remember=None):
     try:
         records = store.classic_commentary(args["id"])
     except KeyError:
@@ -358,7 +363,8 @@ def run_classic_commentary(store, args, max_chars=9000):
     blocks, hits, used = [], [], 0
     for record in records:
         number = f"（講義第{record['lecture_number']}條）" if record.get("lecture_number") else ""
-        block = f"id={record['id']}｜{KIND_NAMES.get(record['kind'], record['kind'])}{number}\n出處：{citation(record)}\n{record['text'].strip()}"
+        marker = f"\n出處：{citation(record)}\n"
+        block = f"id={record['id']}｜{KIND_NAMES.get(record['kind'], record['kind'])}{number}{marker}{record['text'].strip()}"
         separator = 2 if blocks else 0
         available = max_chars - used - separator
         if available <= 0:
@@ -366,24 +372,27 @@ def run_classic_commentary(store, args, max_chars=9000):
         if len(block) > available:
             block = block[:max(0, available - 1)] + "…"
         blocks.append(block)
+        if remember and marker in block:
+            remember([{**record, "text": block.split(marker, 1)[1].removesuffix("…")}])
         hits.append({"id": record["id"], "citation": citation(record)})
         used += len(block) + separator
     return "\n\n".join(blocks), hits
 
 
-def execute_tool(searcher, name, data, round_number, calls, on_tool=None):
+def execute_tool(searcher, name, data, round_number, calls, on_tool=None, conversation=None):
     """兩種模型共用的工具驗證、執行與進度紀錄；回傳 (文字, 是否錯誤)。"""
     record = {"round": round_number, "name": name, "input": data, "hits": [],
               "mode": None, "error": None}
     try:
         args = validate_input(name, data)
         record["input"] = args
+        remember = conversation.remember if conversation is not None else None
         if name == "search":
-            result, record["hits"], record["mode"] = run_search(searcher, args)
+            result, record["hits"], record["mode"] = run_search(searcher, args, remember)
         elif name == "classic_commentary":
-            result, record["hits"] = run_classic_commentary(searcher.store, args)
+            result, record["hits"] = run_classic_commentary(searcher.store, args, remember=remember)
         else:
-            result, record["hits"] = run_read_context(searcher.store, args)
+            result, record["hits"] = run_read_context(searcher.store, args, remember)
     except Exception as problem:  # noqa: BLE001 — 工具失敗要回傳模型
         result = (str(problem) if isinstance(problem, ToolInputError)
                   else f"工具執行失敗（{type(problem).__name__}）：{problem}")
@@ -404,6 +413,51 @@ class Conversation:
     def __init__(self):
         self.messages = []
         self.questions = 0
+        # 出處不含編號 → {段落 id: 原文}；只存工具已回傳的段落。
+        self.citations = {}
+        self.codes = {}
+
+    def remember(self, records):
+        for record in records:
+            full = citation(record)
+            base, marker, _code = full.rpartition("（編號 ")
+            if marker:
+                self.citations.setdefault(base, {})[record["id"]] = record["text"]
+                self.codes[record["id"]] = _code.removesuffix("）")
+
+
+_CITATION_END = frozenset("；）) \t\r\n")
+_QUOTED_BEFORE = re.compile(r"「([^「」]+)」\s*(?:（出處：|出處：)?$")
+
+
+def display_answer(text, conversation):
+    """只補顯示文字中可確認的編號；不修改模型答案或對話歷史。"""
+    if not conversation.citations:
+        return text
+    bases = sorted(conversation.citations, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(base) for base in bases))
+
+    def replace(match):
+        end = match.end()
+        if end < len(text) and text[end] not in _CITATION_END:
+            return match.group()
+        if text.startswith("（編號 ", end):
+            return match.group()
+        candidates = conversation.citations[match.group()]
+        if len(candidates) == 1:
+            chunk_id = next(iter(candidates))
+        else:
+            quoted = _QUOTED_BEFORE.search(text[:match.start()])
+            if quoted is None:
+                return match.group()
+            matched = [chunk_id for chunk_id, body in candidates.items() if quoted.group(1) in body]
+            if len(matched) != 1:
+                return match.group()
+            chunk_id = matched[0]
+        # 編號已在工具回傳時算好，不以固定六碼猜測。
+        return match.group() + f"（編號 {conversation.codes[chunk_id]}）"
+
+    return pattern.sub(replace, text)
 
 
 @dataclass
@@ -544,8 +598,9 @@ class Answerer:
 
     # ----- 工具 -----
 
-    def _run_tool(self, block, round_number, calls, on_tool):
-        message, failed = execute_tool(self.searcher, block.name, block.input, round_number, calls, on_tool)
+    def _run_tool(self, block, round_number, calls, on_tool, conversation):
+        message, failed = execute_tool(self.searcher, block.name, block.input, round_number, calls,
+                                       on_tool, conversation)
         result = {"type": "tool_result", "tool_use_id": block.id, "content": message}
         if failed:
             result["is_error"] = True
@@ -562,7 +617,7 @@ class Answerer:
         conversation.questions += 1
         error = None
         try:
-            self._loop(messages, answer, on_tool)
+            self._loop(messages, answer, on_tool, conversation)
         except Exception as problem:
             error = problem
             raise
@@ -571,7 +626,7 @@ class Answerer:
             self._log(question, answer, error)
         return answer
 
-    def _loop(self, messages, answer, on_tool):
+    def _loop(self, messages, answer, on_tool, conversation):
         allow_tools = True
         while True:
             response = self._send(messages, allow_tools)
@@ -607,7 +662,7 @@ class Answerer:
 
             if tool_uses and response.stop_reason == "tool_use" and allow_tools:
                 answer.rounds += 1
-                results = [self._run_tool(block, answer.rounds, answer.tool_calls, on_tool)
+                results = [self._run_tool(block, answer.rounds, answer.tool_calls, on_tool, conversation)
                            for block in tool_uses]
                 if answer.rounds >= self.max_tool_rounds:
                     allow_tools = False

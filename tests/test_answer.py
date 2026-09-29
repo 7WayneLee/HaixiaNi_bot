@@ -199,7 +199,7 @@ def test_system_prompt_file_covers_the_six_rules():
         "找不到", "不要編造",                                             # 規則 6
         "同音錯字", "劑量", "人紀講義",                                   # 資料特性
         "濕", "黃耆", "痺", "溪", "Markdown 表格",                        # 用字與格式
-        "（出處：人紀・傷寒論 傷寒論3（7） 16:35–18:26）",
+        "（出處：人紀・傷寒論 傷寒論3（7） 16:35–18:26（編號 a1b2c3））",
     ]:
         assert phrase in prompt, phrase
 
@@ -231,7 +231,7 @@ def test_tool_loop_runs_several_rounds(index_dir):
     search_call = result.tool_calls[0]
     assert search_call["input"] == {"query": "桂枝湯", "kind": "any", "k": 8}
     assert search_call["mode"] == "hybrid" and search_call["hits"][0]["id"] == "a0"
-    assert search_call["hits"][0]["citation"] == "人紀・傷寒論 傷寒論1（1） 00:00–02:00"
+    assert search_call["hits"][0]["citation"] == "人紀・傷寒論 傷寒論1（1） 00:00–02:00（編號 a0）"
     # 第二次請求：最後是 search 的結果，內容含 id、出處與全文
     second = client.calls[1]["messages"]
     result_block = second[-1]["content"][0]
@@ -242,6 +242,72 @@ def test_tool_loop_runs_several_rounds(index_dir):
     context = client.calls[2]["messages"][-1]["content"][0]["content"]
     assert "[前 1 段]" in context and "id=a0" in context and "[後 1 段]" in context and "id=a2" in context
     assert all(call["tool_choice"] == {"type": "auto"} for call in client.calls)
+
+
+def test_display_answer_fills_only_confirmed_citations():
+    conversation = core.Conversation()
+    common = {"kind": "classic", "title": "測試經典", "section": "測試章", "episode": "第1條"}
+    conversation.remember([
+        {**common, "id": "a1b2c30000000001", "short_id": "a1b2c3", "text": "第一段的獨有引文。"},
+        {**common, "id": "a1b2c40000000002", "short_id": "a1b2c4", "text": "第二段的獨有引文。"},
+        {"kind": "document", "id": "b1c2d30000000003", "short_id": "b1c2d3", "title": "測試講義",
+         "section": None, "date": None, "page_start": 1, "page_end": 1, "text": "唯一一段。"},
+    ])
+    base = "《測試經典》測試章 第1條"
+    lecture = "測試講義 第 1 頁"
+    assert core.display_answer(f"（出處：{base}）", conversation) == f"（出處：{base}）"
+    assert core.display_answer(f"「第一段的獨有引文」（出處：{base}）", conversation) \
+        == f"「第一段的獨有引文」（出處：{base}（編號 a1b2c3））"
+    assert core.display_answer(f"「沒有的引文」（出處：{base}）", conversation) \
+        == f"「沒有的引文」（出處：{base}）"
+    assert core.display_answer(f"（出處：{lecture}；同頁）", conversation) \
+        == f"（出處：{lecture}（編號 b1c2d3）；同頁）"
+    assert core.display_answer(f"（出處：{lecture}）", conversation) \
+        == f"（出處：{lecture}（編號 b1c2d3））"
+    assert core.display_answer(f"（出處：{lecture})", conversation) \
+        == f"（出處：{lecture}（編號 b1c2d3）)"
+    assert core.display_answer(f"（出處：{lecture} 後文）", conversation) \
+        == f"（出處：{lecture}（編號 b1c2d3） 後文）"
+    assert core.display_answer(f"（出處：{lecture}", conversation) \
+        == f"（出處：{lecture}（編號 b1c2d3）"
+    assert core.display_answer(f"（出處：{lecture}附錄）", conversation) \
+        == f"（出處：{lecture}附錄）"
+    assert core.display_answer(f"（出處：{lecture}（編號 b1c2d3））", conversation) \
+        == f"（出處：{lecture}（編號 b1c2d3））"
+    assert not core.Conversation().citations
+
+
+def test_display_answer_prefers_longest_citation_and_cli_uses_it(capsys):
+    from scripts import ask
+
+    conversation = core.Conversation()
+    conversation.remember([
+        {"id": "1111110000000001", "kind": "document", "title": "測試講義", "section": None,
+         "date": None, "page_start": None, "page_end": None, "text": "短出處。"},
+        {"id": "2222220000000002", "kind": "document", "title": "測試講義", "section": None,
+         "date": None, "page_start": 2, "page_end": 2, "text": "長出處。"},
+    ])
+    original = "答案（出處：測試講義 第 2 頁）"
+    result = core.Answer(text=original, stop_reason="end_turn", model=MODEL)
+    ask.show(result, conversation)
+    assert capsys.readouterr().out == "答案（出處：測試講義 第 2 頁（編號 222222））\n"
+    assert result.text == original
+
+
+def test_display_answer_keeps_claude_history_and_log_original(index_dir, tmp_path):
+    original = "桂枝湯。（出處：人紀・傷寒論 傷寒論1（1） 00:00–02:00）"
+    answerer, _ = make(index_dir, [
+        reply([tool("t1", "search", {"query": "桂枝湯"})], "tool_use"),
+        reply([text(original)]),
+    ], log_dir=tmp_path)
+    conversation = core.Conversation()
+    result = answerer.ask(conversation, "桂枝湯？")
+    assert result.text == original
+    assert core.display_answer(result.text, conversation).endswith("00:00–02:00（編號 a0））")
+    assert conversation.messages[-1]["content"][0].text == original
+    entry = json.loads((tmp_path / core.LOG_NAME).read_text().strip())
+    assert entry["answer"] == original
+    assert "人紀・傷寒論 傷寒論1（1） 00:00–02:00" in conversation.citations
 
 
 def test_parallel_tool_calls_answered_in_one_user_message(index_dir):
