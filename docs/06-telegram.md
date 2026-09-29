@@ -1,6 +1,6 @@
 # 第五步：Telegram bot
 
-這是部署說明；本次只交付程式與範本，尚未在 movie-nas 安裝或啟動。
+這是部署說明。2026-09-29 已部署到 movie-nas，以 systemd 服務 `haixia-bot` 執行。
 bot 用 long polling，不需要網域或 HTTPS。輪詢接收一般訊息（`message`）與按鈕回呼（`callback_query`）。只有 `.env` 白名單中的 Telegram 使用者 ID 能得到回覆。
 
 ## 建立 bot 與設定

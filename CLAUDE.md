@@ -342,6 +342,8 @@
     2. Gemini 在工具結果後回空白答案時，不給工具再要求作答一次，最多補一次，照常累計費用。
     3. Telegram `/model` 改為 Claude／Gemini 二級 inline 選單，文字捷徑保留。
     4. 預設模型等第六步的準確率再決定。
+  - 1–3 已完成（commit 3fc530d，Codex 用 `codex exec` 撰寫，546 個測試通過）並部署。急重症那題重測（Opus）：第一句叫就醫，之後完整列出倪師的急救針法和他自己的限制，US$0.14。
+  - 2026-09-30 07:01 修正 `/model` 按鈕按了沒反應：bot 輪詢時只收 `message`，Telegram 不會送按鈕回呼；改成也收 `callback_query`，測試檢查 handler 和這份清單一致（commit f7d51a5），已部署。
 - [ ] 第五步：Telegram bot（2026-09-29 部署完成，待使用者實測）
   - 程式：commit 4b89cc1，515 個測試通過。
     - 前半由 Claude Code worker 撰寫；Claude 5 小時額度到 84% 時，依使用者指示「Work 你可以用 codex」停掉，改由 Codex 接手。
