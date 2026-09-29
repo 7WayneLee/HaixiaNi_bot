@@ -731,13 +731,23 @@ def test_source_command_ambiguous_and_missing(make_core, case_store):
 
 # ---------- python-telegram-bot 介面 ----------
 
-def test_build_application_registers_message_handler(make_core):
+def test_build_application_handlers_match_allowed_updates(make_core):
     pytest.importorskip("telegram")
-    from telegram.ext import CallbackQueryHandler, MessageHandler
+    from telegram.ext import CallbackQueryHandler, MessageHandler, filters
 
     bot_core, _ = make_core()
     application = tg.build_application(bot_core, "123456:TEST-TOKEN-NOT-REAL")
     handlers = [handler for group in application.handlers.values() for handler in group]
     assert len(handlers) == 2 and isinstance(handlers[0], MessageHandler)
     assert isinstance(handlers[1], CallbackQueryHandler)
+    update_types = []
+    for handler in handlers:
+        if type(handler) is MessageHandler and handler.filters is filters.UpdateType.MESSAGE:
+            update_types.append("message")
+        elif type(handler) is CallbackQueryHandler:
+            update_types.append("callback_query")
+        else:
+            pytest.fail(f"未確認更新種類的 handler：{handler!r}")
+    assert set(update_types) == set(tg.ALLOWED_UPDATES)
+    assert len(tg.ALLOWED_UPDATES) == len(set(tg.ALLOWED_UPDATES))
     assert application.update_processor.max_concurrent_updates > 1

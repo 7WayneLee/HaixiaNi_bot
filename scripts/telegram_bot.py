@@ -84,7 +84,7 @@ def main(argv=None):
     log.info("bot 啟動：允許 %d 個使用者，每日上限 US$%.2f，預設模型 %s，effort %s%s",
              len(config.allowed), config.daily_budget, core.DEFAULT_MODEL, args.effort,
              "，只用關鍵字搜尋" if args.bm25_only else "")
-    application.run_polling(allowed_updates=["message"])
+    application.run_polling(allowed_updates=bot.ALLOWED_UPDATES)
     log.info("bot 已停止")
     return 0
 

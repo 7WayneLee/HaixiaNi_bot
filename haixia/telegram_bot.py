@@ -37,6 +37,7 @@ PROGRESS_INTERVAL = 2.0         # 進度訊息最多每 2 秒改一次
 TYPING_INTERVAL = 4.5           # Telegram 的「輸入中」約 5 秒後消失
 PROGRESS_QUERIES = 4            # 進度訊息最多列幾個查詢
 SERVICE = "haixia-bot"
+ALLOWED_UPDATES = ("message", "callback_query")
 
 MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
           "gemini-flash": "gemini-3.8-flash", "gemini-pro": "gemini-3.1-pro-preview"}
