@@ -22,6 +22,7 @@ GROUPS = {
     "compilations": (6, "彙編"),
     "asr": (0, "影片逐字稿"),
     "lrc": (0, "梁冬對話倪海廈（LRC）"),
+    "classic": (0, "經典"),
 }
 
 DOC_EXTS = {".doc", ".docx", ".htm", ".html", ".txt"}
@@ -206,6 +207,8 @@ def title_for(rel_path):
     parts = PurePosixPath(rel_path).parts
     mojibake = MOJIBAKE_FOLDER in rel_path and len(parts) > 3
     title = clean_title(parts[-1], mojibake=mojibake)
+    if "天纪  《天纪》" in rel_path and rel_path.lower().endswith(".pdf"):
+        return "天紀《地脈道》"
     if not re.search(r"\w", title) and len(parts) > 1:
         # 檔名沒有內容（例如「,」）時改用資料夾名稱。
         title = clean_title(parts[-2], mojibake=mojibake)

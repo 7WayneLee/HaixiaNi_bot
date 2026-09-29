@@ -55,8 +55,8 @@ PRICES = {
 PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
 USAGE_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
 
-KINDS = {"any": None, "transcript": "transcript", "document": "document"}
-KIND_NAMES = {"transcript": "逐字稿", "document": "文件"}
+KINDS = {"any": None, "transcript": "transcript", "document": "document", "classic": "classic"}
+KIND_NAMES = {"transcript": "逐字稿", "document": "文件", "classic": "經典"}
 SCOPE_NAMES = {"any": "全部", **KIND_NAMES}
 DEFAULT_K = 8
 MAX_K = 10
@@ -72,7 +72,7 @@ TOOLS = [
     {
         "name": "search",
         "description": (
-            "搜尋倪海廈（倪師）的課程逐字稿與文件（人紀講義、天紀、醫案、診療日誌、文章等），"
+            "搜尋倪海廈（倪師）的課程逐字稿、文件與經典原文，"
             "混合語意與關鍵字搜尋，回傳最相關段落的 id、出處與全文。"
             "回答任何跟倪師教學或中醫內容有關的問題前都要先用它查；一個問題通常要換不同關鍵字"
             "（方名、藥名、穴位、條文原句、病名、症狀、課名）查好幾次。"
@@ -85,12 +85,22 @@ TOOLS = [
                 "query": {"type": "string",
                           "description": "查詢內容，用正體中文；短而具體的關鍵詞或一句話，例如「桂枝湯 組成」「少陽病提綱」。"},
                 "kind": {"type": "string", "enum": list(KINDS),
-                         "description": "any＝全部（預設）；transcript＝只查課程逐字稿；document＝只查講義、醫案等文件。"},
+                         "description": "any＝全部；transcript＝逐字稿；document＝講義等文件；classic＝經典原文。"},
                 "k": {"type": "integer", "enum": list(range(1, MAX_K + 1)),
                       "description": f"回傳幾段，1–{MAX_K}，預設 {DEFAULT_K}。"},
             },
             "required": ["query"],
             "additionalProperties": False,
+        },
+    },
+    {
+        "name": "classic_commentary",
+        "description": "給經典段落 id，讀取已連結的倪師講義及上課逐字稿段落，附講義條號、出處與內文。",
+        "strict": True,
+        "eager_input_streaming": True,
+        "input_schema": {
+            "type": "object", "properties": {"id": {"type": "string", "description": "經典搜尋回傳的段落 id。"}},
+            "required": ["id"], "additionalProperties": False,
         },
     },
     {
@@ -272,7 +282,8 @@ def validate_input(name, data):
     """驗證並補上預設值（eager 串流時伺服器不驗證工具輸入）。"""
     if not isinstance(data, dict):
         raise ToolInputError("輸入要是物件")
-    allowed = {"search": {"query", "kind", "k"}, "read_context": {"id", "before", "after"}}.get(name)
+    allowed = {"search": {"query", "kind", "k"}, "read_context": {"id", "before", "after"},
+               "classic_commentary": {"id"}}.get(name)
     if allowed is None:
         raise ToolInputError(f"沒有這個工具：{name}")
     extra = set(data) - allowed
@@ -286,11 +297,13 @@ def validate_input(name, data):
             raise ToolInputError(f"query 最多 {MAX_QUERY_CHARS} 字")
         kind = data.get("kind", "any")
         if kind not in KINDS:
-            raise ToolInputError("kind 只能是 any、transcript 或 document")
+            raise ToolInputError("kind 只能是 any、transcript、document 或 classic")
         return {"query": query.strip(), "kind": kind, "k": _integer(data.get("k"), "k", 1, MAX_K, DEFAULT_K)}
     chunk_id = data.get("id")
     if not isinstance(chunk_id, str) or not chunk_id.strip():
         raise ToolInputError("id 不能是空的")
+    if name == "classic_commentary":
+        return {"id": chunk_id.strip()}
     return {"id": chunk_id.strip(),
             "before": _integer(data.get("before"), "before", 0, MAX_CONTEXT, 1),
             "after": _integer(data.get("after"), "after", 0, MAX_CONTEXT, 1)}
@@ -331,6 +344,29 @@ def run_read_context(store, args):
         lines.append(format_record(record, f"[後 {offset} 段]"))
     hits = [{"id": record["id"], "citation": citation(record)} for record in previous + following]
     return "\n\n".join(lines), hits
+
+
+def run_classic_commentary(store, args, max_chars=9000):
+    try:
+        records = store.classic_commentary(args["id"])
+    except KeyError:
+        raise ToolInputError(f"找不到經典段落 id：{args['id']}") from None
+    if not records:
+        return "這段經典沒有可確認的倪師講義或逐字稿連結。", []
+    blocks, hits, used = [], [], 0
+    for record in records:
+        number = f"（講義第{record['lecture_number']}條）" if record.get("lecture_number") else ""
+        block = f"id={record['id']}｜{KIND_NAMES.get(record['kind'], record['kind'])}{number}\n出處：{citation(record)}\n{record['text'].strip()}"
+        separator = 2 if blocks else 0
+        available = max_chars - used - separator
+        if available <= 0:
+            break
+        if len(block) > available:
+            block = block[:max(0, available - 1)] + "…"
+        blocks.append(block)
+        hits.append({"id": record["id"], "citation": citation(record)})
+        used += len(block) + separator
+    return "\n\n".join(blocks), hits
 
 
 # ---------- 對話與回答 ----------
@@ -463,6 +499,8 @@ class Answerer:
             record["input"] = args
             if block.name == "search":
                 text, record["hits"], record["mode"] = run_search(self.searcher, args)
+            elif block.name == "classic_commentary":
+                text, record["hits"] = run_classic_commentary(self.searcher.store, args)
             else:
                 text, record["hits"] = run_read_context(self.searcher.store, args)
             result = {"type": "tool_result", "tool_use_id": block.id, "content": text}

@@ -17,7 +17,7 @@ DB_NAME = "index.sqlite"
 VECTORS_NAME = "embeddings.f16.npy"
 VECTORS_META = "embeddings.meta.json"
 COLUMNS = ("id", "kind", "source", "title", "episode", "section", "page_start", "page_end",
-           "start", "end", "date", "text", "chars")
+           "start", "end", "date", "text", "chars", "quality", "raw_text", "unit_ids")
 _RUN = re.compile("[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f]+|[0-9a-z]+")
 
 
@@ -74,8 +74,14 @@ CREATE TABLE chunks (
   row INTEGER PRIMARY KEY,           -- 與 chunks.jsonl、向量的列順序相同（從 0 起）
   id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, source TEXT NOT NULL, title TEXT,
   episode TEXT, section TEXT, page_start INTEGER, page_end INTEGER,
-  start REAL, "end" REAL, date TEXT, text TEXT NOT NULL, chars INTEGER NOT NULL);
+  start REAL, "end" REAL, date TEXT, text TEXT NOT NULL, chars INTEGER NOT NULL,
+  quality INTEGER, raw_text TEXT, unit_ids TEXT);
 CREATE INDEX chunks_kind ON chunks(kind);
+CREATE TABLE classic_links (
+  classic_id TEXT NOT NULL, target_id TEXT NOT NULL, target_kind TEXT NOT NULL,
+  score REAL NOT NULL, method TEXT NOT NULL, lecture_number TEXT,
+  PRIMARY KEY (classic_id, target_id));
+CREATE INDEX classic_links_classic ON classic_links(classic_id);
 CREATE VIRTUAL TABLE chunks_fts USING fts5(tokens, content='', tokenize='unicode61 remove_diacritics 0');
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
@@ -140,8 +146,7 @@ class IndexStore:
             self.vectors = vectors
             self.vector_meta = vector_meta
             kinds = self.connection.execute("SELECT kind FROM chunks ORDER BY row").fetchall()
-            self.is_transcript = np.fromiter((k[0] == "transcript" for k in kinds), dtype=bool,
-                                             count=self.count)
+            self.kinds = np.array([k[0] for k in kinds], dtype="U10")
 
     def bm25(self, query, limit=50, kind=None):
         """回傳 [(row, 分數)]，分數越大越相關（FTS5 bm25 取負號）。"""
@@ -166,10 +171,8 @@ class IndexStore:
         scores = np.empty(self.count, dtype=np.float32)
         for start in range(0, self.count, block):
             scores[start:start + block] = self.vectors[start:start + block].astype(np.float32) @ query
-        if kind == "transcript":
-            scores[~self.is_transcript] = -np.inf
-        elif kind == "document":
-            scores[self.is_transcript] = -np.inf
+        if kind is not None:
+            scores[self.kinds != kind] = -np.inf
         limit = min(limit, self.count)
         top = np.argpartition(-scores, limit - 1)[:limit] if limit else np.array([], dtype=int)
         top = top[np.argsort(-scores[top])]
@@ -212,3 +215,13 @@ class IndexStore:
 
     def close(self):
         self.connection.close()
+
+    def classic_commentary(self, classic_id, limit=6):
+        target = self.connection.execute("SELECT kind FROM chunks WHERE id = ?", (classic_id,)).fetchone()
+        if target is None or target[0] != "classic":
+            raise KeyError(classic_id)
+        rows = self.connection.execute(
+            "SELECT c.*, l.score, l.method, l.lecture_number FROM classic_links l "
+            "JOIN chunks c ON c.id = l.target_id WHERE l.classic_id = ? "
+            "ORDER BY l.score DESC LIMIT ?", (classic_id, limit)).fetchall()
+        return [dict(row) for row in rows]

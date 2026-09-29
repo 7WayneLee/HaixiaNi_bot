@@ -379,7 +379,11 @@ class ProgressThrottle:
 
 def tool_label(record):
     args = record.get("input")
+    if record.get("name") == "classic_commentary":
+        return "查倪師對經文的講解"
     if record.get("name") == "search" and isinstance(args, dict) and args.get("query"):
+        if args.get("kind") == "classic":
+            return f"搜尋經典：{args['query']}"
         return f"搜尋：{args['query']}"
     if record.get("name") == "read_context":
         return "讀前後文"
@@ -393,6 +397,14 @@ def progress_text(labels, notices=()):
         shown = queries[-PROGRESS_QUERIES:]
         more = f"（共 {len(queries)} 次）" if len(queries) > len(shown) else ""
         lines.append("已搜尋：" + "、".join(shown) + more)
+    classics = [label[len("搜尋經典："):] for label in labels if label.startswith("搜尋經典：")]
+    if classics:
+        shown = classics[-PROGRESS_QUERIES:]
+        more = f"（共 {len(classics)} 次）" if len(classics) > len(shown) else ""
+        lines.append("已搜尋經典：" + "、".join(shown) + more)
+    commentaries = labels.count("查倪師對經文的講解")
+    if commentaries:
+        lines.append(f"已查倪師對經文的講解 {commentaries} 次")
     reads = sum(1 for label in labels if label == "讀前後文")
     if reads:
         lines.append(f"已讀前後文 {reads} 次")

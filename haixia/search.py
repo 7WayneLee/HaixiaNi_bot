@@ -74,8 +74,8 @@ class Searcher:
 
     def search(self, query, k=10, kind=None):
         """回傳 {"mode", "vector_error", "results": [段落 dict，含 bm25、vector、rrf 與名次]}。"""
-        if kind not in (None, "transcript", "document"):
-            raise ValueError("kind 只能是 transcript、document 或 None")
+        if kind not in (None, "transcript", "document", "classic"):
+            raise ValueError("kind 只能是 transcript、document、classic 或 None")
         bm25 = self.store.bm25(query, self.candidates, kind)
         vector, error = [], None
         if self.embedder is None:
@@ -245,6 +245,9 @@ def case_code(record):
 
 def citation(record):
     """出處：課名、集數與時間 mm:ss–mm:ss；書名、章節與頁碼；醫案則是日期、主訴與編號。"""
+    if record["kind"] == "classic":
+        location = f"《{record['title']}》{short_section(record.get('section'))}"
+        return f"{location} {record['episode']}" if record.get("episode") else location
     if record["kind"] == "transcript":
         parts = [record["title"], record.get("episode")]
         where = f"{_clock(record['start'])}–{_clock(record['end'])}"

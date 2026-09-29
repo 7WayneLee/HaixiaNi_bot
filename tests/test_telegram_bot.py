@@ -499,6 +499,18 @@ def test_progress_edits_are_rate_limited(make_core):
     assert tg.progress_text(["搜尋：甲", "讀前後文", "讀前後文"]) == "查詢中…\n已搜尋：甲\n已讀前後文 2 次"
 
 
+def test_classic_tool_progress_labels():
+    records = [
+        {"name": "search", "input": {"query": "少陽", "kind": "classic"}},
+        {"name": "classic_commentary", "input": {"id": "c1"}},
+        {"name": "search", "input": {"query": "桂枝", "kind": "document"}},
+        {"name": "read_context", "input": {"id": "d1"}},
+    ]
+    labels = [tg.tool_label(record) for record in records]
+    assert labels == ["搜尋經典：少陽", "查倪師對經文的講解", "搜尋：桂枝", "讀前後文"]
+    assert tg.progress_text(labels) == "查詢中…\n已搜尋：桂枝\n已搜尋經典：少陽\n已查倪師對經文的講解 1 次\n已讀前後文 1 次"
+
+
 # ---------- 答案、錯誤 ----------
 
 def test_long_answer_edits_status_then_sends_rest(make_core):

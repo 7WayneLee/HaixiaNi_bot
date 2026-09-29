@@ -131,7 +131,7 @@ def make(index_dir, outcomes, tmp_path=None, **options):
 
 def test_tool_definitions_are_strict_and_well_formed():
     names = [t["name"] for t in core.TOOLS]
-    assert names == ["search", "read_context"]
+    assert names == ["search", "classic_commentary", "read_context"]
     for definition in core.TOOLS:
         schema = definition["input_schema"]
         assert definition["strict"] is True
@@ -145,9 +145,9 @@ def test_tool_definitions_are_strict_and_well_formed():
             assert not {"minimum", "maximum", "minLength", "maxLength"} & set(prop)
     search = core.TOOLS[0]["input_schema"]
     assert search["required"] == ["query"]
-    assert search["properties"]["kind"]["enum"] == ["any", "transcript", "document"]
+    assert search["properties"]["kind"]["enum"] == ["any", "transcript", "document", "classic"]
     assert search["properties"]["k"]["enum"] == list(range(1, 11))
-    context = core.TOOLS[1]["input_schema"]
+    context = core.TOOLS[2]["input_schema"]
     assert context["required"] == ["id"]
     assert context["properties"]["before"]["enum"] == [0, 1, 2, 3]
     assert context["properties"]["after"]["enum"] == [0, 1, 2, 3]
@@ -652,7 +652,7 @@ def test_real_sdk_request_shape_and_round_trip(index_dir):
     assert body["output_config"] == {"effort": "medium"} and body["fallbacks"] == "default"
     assert body["tool_choice"] == {"type": "auto"} and body["cache_control"] == {"type": "ephemeral"}
     assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
-    assert [t["name"] for t in body["tools"]] == ["search", "read_context"] and body["tools"][0]["strict"] is True
+    assert [t["name"] for t in body["tools"]] == ["search", "classic_commentary", "read_context"] and body["tools"][0]["strict"] is True
     # 第二個請求：完整放回 thinking（含 signature）與 tool_use，工具結果在同一則 user 訊息
     later = json.loads(second.content)
     assert later["system"] == body["system"] and later["tools"] == body["tools"]

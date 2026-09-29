@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from haixia import corpus, vertex
+from haixia.classics import BOOKS, classic_chunks
 from haixia.chunking import ParagraphDeduper, chunk_document, chunk_transcript, find_date
 from haixia.index_store import DB_NAME, build_db
 from haixia.textnorm import to_traditional
@@ -36,6 +37,7 @@ COURSES = ROOT / "data/course_prompts.json"
 DEFAULT_OUT = Path.home() / "haixia-index-build"
 DEFAULT_RAW = Path.home() / "haixia-text-raw"
 DEFAULT_CORRECTED = Path.home() / "haixia-corrected"
+DEFAULT_CLASSICS = Path.home() / "haixia-classics/parsed"
 TIANJIDAO = "文字資料/01.倪海厦电子书全集/天纪  天机道-(（守候诚实）淘宝店）.pdf"
 LRC_TITLE = "梁冬對話倪海廈"
 BIG_RAR = "倪海厦诊疗日志医案-全"
@@ -352,6 +354,23 @@ def cmd_chunks(args):
             stats["asr"]["chars_before"] += chars
             emit("asr", chunks)
 
+        # 經典獨立處理，不進倪師文件的段落去重器。
+        classics_arg = getattr(args, "classics_dir", None)
+        classics_dir = Path(classics_arg) if classics_arg else (DEFAULT_CLASSICS if out_dir == DEFAULT_OUT else None)
+        if classics_dir and classics_dir.exists():
+            for name in BOOKS:
+                path = classics_dir / f"{name}.json"
+                if not path.exists():
+                    raise FileNotFoundError(f"找不到經典解析結果：{path}（先跑 scripts/parse_classics.py）")
+                units = json.loads(path.read_text(encoding="utf-8"))
+                chunks = classic_chunks(units)
+                stats["classic"]["files"] += 1
+                stats["classic"]["paragraphs_before"] += len(units)
+                stats["classic"]["paragraphs_after"] += len(units)
+                stats["classic"]["chars_before"] += sum(len(u["顯示文字"]) for u in units)
+                stats["classic"]["chars_after"] += sum(len(u["顯示文字"]) for u in units)
+                emit("classic", chunks)
+
         # 2. 梁冬對話 LRC
         for item in (i for i in kept if i["group"] == "lrc"):
             try:
@@ -468,6 +487,7 @@ def cmd_embed(args):
     try:
         if args.dry_run:
             total = cached = estimate = 0
+            by_kind = defaultdict(int)
             for line in chunks_path.open(encoding="utf-8"):
                 chunk = json.loads(line)
                 total += 1
@@ -475,9 +495,13 @@ def cmd_embed(args):
                 if cache.get(vertex.cache_key(args.model, args.dims, "RETRIEVAL_DOCUMENT", title, chunk["text"])):
                     cached += 1
                 else:
-                    estimate += vertex.estimate_tokens(title + chunk["text"])
+                    tokens = vertex.estimate_tokens(title + chunk["text"])
+                    estimate += tokens
+                    by_kind[chunk["kind"]] += tokens
             log(f"共 {total} 段，已快取 {cached} 段；待送估計 {estimate:,} token，"
                 f"約 {estimate / 1e6 * args.price_per_mtok:.2f} 美元（沒有呼叫 API）")
+            if by_kind.get("classic"):
+                log(f"其中新增經典估計 {by_kind['classic']:,} token（沒有呼叫 API）")
             return 0
         api = vertex.GoogleApi(timeout=args.timeout, log=log)
         client = vertex.EmbeddingClient(api, args.project, args.location, args.model, args.dims)
@@ -525,6 +549,7 @@ def main(argv=None):
     p = common(sub.add_parser("chunks", help="轉文字、去重、切段（Mac，不連網）"))
     p.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW)
     p.add_argument("--corrected-dir", type=Path, default=DEFAULT_CORRECTED)
+    p.add_argument("--classics-dir", type=Path, help=f"經典解析目錄（預設正式輸出用 {DEFAULT_CLASSICS}）")
     p.add_argument("--ocr-dir", type=Path, help="逐頁文字辨識結果（預設 <out-dir>/ocr）")
     p.add_argument("--jobs", type=int, default=6, help="同時執行的 textutil 數")
     p.add_argument("--skip-rar-check", action="store_true")
