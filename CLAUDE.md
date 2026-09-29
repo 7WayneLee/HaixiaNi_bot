@@ -32,7 +32,10 @@
   - 向量用 Vertex AI 的 `gemini-embedding-001`（768 維；文件用 RETRIEVAL_DOCUMENT，問題用 RETRIEVAL_QUERY）。這是 2026-09-29 使用者的決定，取代原本的 bge-m3：bge-m3 查詢時要約 2 GB 記憶體，movie-nas 跑不動。
   - 從 movie-nas 用預設 Compute Engine 服務帳號呼叫，不需要金鑰。已實測 768 維，一次可送多筆。
   - 已啟用 `aiplatform.googleapis.com` 和 `vision.googleapis.com`（天機道掃描檔用 Cloud Vision 做文字辨識）。
-- **回答**：Claude API（官方 `anthropic` Python SDK）。把「搜尋資料庫」做成 tool，讓 Claude 可以查多次。模型預設 `claude-opus-5`，若要省錢可改 `claude-sonnet-5`，由使用者決定
+- **回答**：Claude API（官方 `anthropic` Python SDK）。把「搜尋資料庫」做成 tool，讓 Claude 可以查多次。
+  - 模型：2026-09-29 使用者決定用 `claude-opus-5-5`（Opus 5.5）。
+  - 第六步用醫案測試時，同一批題目也要用 `claude-sonnet-5` 跑一次，比較準確率和費用。使用者說的「Sonnet 5.5」目前不存在，最新的 Sonnet 是 Sonnet 5。
+  - Anthropic API 金鑰由使用者自己寫進 movie-nas 的 `~/HaixiaNi_bot/.env`（`ANTHROPIC_API_KEY=`），不貼在對話裡。
 - **介面**：Telegram bot，用 long polling（不需要網域或 HTTPS），預計跑在 movie-nas（可用記憶體約 400 MB，所以搜尋模組要省記憶體）
 - **語言**：Python
 
@@ -262,7 +265,7 @@
     - 抽查 20 個問題（桂枝湯組成、少陽病提綱、太衝穴、產後鬱冒、流年卦、肝癌等）：
       - 18 題前 4 名就有最相關的段落，其餘 2 題也相關。
       - 在 movie-nas 上最大 RSS 127 MB，每題約 0.6 秒（含 Vertex 查詢向量）。
-- [ ] 第四步：Claude 問答
+- [ ] 第四步：Claude 問答（2026-09-29 使用者同意開 worker）
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
 
