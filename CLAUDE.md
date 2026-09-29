@@ -221,7 +221,7 @@
       - 重做的 400 段共 43,246 行，文字和 Claude 版不同的有 5,208 行（12.0%）。
       - 440 個檔都通過驗證，現在只剩 Antigravity（3,012 段）和 Codex（491 段）。
       - 已備份到 GCS（440 個，rclone check 相符）；重做前的版本在本機 `~/haixia-corrected-pre-redo/`。
-  - [ ] 切段、向量、建索引（2026-09-29 使用者同意計畫）：
+  - [x] 切段、向量、建索引（2026-09-29 使用者同意計畫，同日 15:31 完成）：
     - 資料範圍（合計約 810 萬字，預估 1.6–2 萬段）：
       - 逐字稿 440 檔，286 萬字。
       - 梁冬對話倪海廈 7 集，用 LRC 字幕。
@@ -242,6 +242,26 @@
       - Mac：轉文字、切段、建 FTS。
       - movie-nas：文字辨識、算向量、搜尋與 bot。
     - 預估費用：向量約 800 萬 token，約 1.2 美元；文字辨識在免費額度內。
+    - 程式：commit 33883f4，Claude Code worker 撰寫，441 個測試通過。
+      - `scripts/build_index.py`：`ocr`、`chunks`、`embed`、`db` 四個子命令。
+      - `haixia/search.py`：混合搜尋。`scripts/search_index.py`：命令列查詢。
+      - `scripts/sync_index.sh`：經 movie-nas 同步，傳送前先列清單和大小。
+      - 說明文件：`docs/04-index.md`。
+    - 天機道文字辨識：Cloud Vision，82 頁、約 5.6 萬字，品質良好。
+    - 切段結果：共 20,052 段（逐字稿 7,578 段、文件 12,474 段），沒有錯誤。文件去重前 976 萬字，去重後 588 萬字。
+    - 向量：
+      - 7,890,882 token，約 1.18 美元，0 段被截斷。
+      - movie-nas 一次只送一段時，CPU 都花在每次重新建立加密連線，每秒只能算約 2 段。
+      - 實測一次送 20 段，向量和一段一段算的完全相同（cos 1.0000），token 也相同，所以改用 `--batch-size 20`，速度變成每秒約 27 段。
+    - 產物：
+      - GCS `gs://haixiani-bot-data-507014/index/`：chunks.jsonl、index.sqlite、embeddings.f16.npy、meta。
+      - movie-nas 的 `~/haixia-index-build/`：同上，另有向量快取 `embed_cache.sqlite`。
+      - Mac 的 `~/haixia-index-build/`。
+    - movie-nas 的 Python 環境：
+      - 沒有 python3-venv，所以用 `python3 -m venv --without-pip` 建 `~/HaixiaNi_bot/.venv-index`，再用官方 get-pip 裝 pip、numpy、opencc。
+    - 抽查 20 個問題（桂枝湯組成、少陽病提綱、太衝穴、產後鬱冒、流年卦、肝癌等）：
+      - 18 題前 4 名就有最相關的段落，其餘 2 題也相關。
+      - 在 movie-nas 上最大 RSS 127 MB，每題約 0.6 秒（含 Vertex 查詢向量）。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
