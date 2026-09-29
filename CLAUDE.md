@@ -34,8 +34,15 @@
   - 已啟用 `aiplatform.googleapis.com` 和 `vision.googleapis.com`（天機道掃描檔用 Cloud Vision 做文字辨識）。
 - **回答**：Claude API（官方 `anthropic` Python SDK）。把「搜尋資料庫」做成 tool，讓 Claude 可以查多次。
   - 模型：2026-09-29 使用者決定用 `claude-opus-5-5`（Opus 5.5）。
-  - 第六步用醫案測試時，同一批題目也要用 `claude-sonnet-5` 跑一次，比較準確率和費用。使用者說的「Sonnet 5.5」目前不存在，最新的 Sonnet 是 Sonnet 5。
+  - 第六步用醫案測試時，同一批題目也要用 `claude-sonnet-5-5`（Sonnet 5.5，2026-09-28 推出）跑一次，比較準確率和費用。
+    - 指揮原本以為 Sonnet 5.5 不存在，是資料過期；使用者指正後，用 Models API 確認有這個模型。
+  - 官方價格（每百萬 token）：
+    - Opus 5.5：輸入 $4、輸出 $20、5 分鐘快取寫入 $5、快取讀取 $0.20。
+    - Sonnet 5.5：輸入 $2、輸出 $10、快取寫入 $2.50、快取讀取 $0.20。
+    - Sonnet 5 和 Sonnet 5.5 同價。
   - Anthropic API 金鑰由使用者自己寫進 movie-nas 的 `~/HaixiaNi_bot/.env`（`ANTHROPIC_API_KEY=`），不貼在對話裡。
+    - 第一把是組織層級的金鑰，每次請求都要帶 `anthropic-workspace-id`。
+    - 2026-09-29 使用者換成綁定 workspace 的金鑰，已實測可用。
 - **介面**：Telegram bot，用 long polling（不需要網域或 HTTPS），預計跑在 movie-nas（可用記憶體約 400 MB，所以搜尋模組要省記憶體）
 - **語言**：Python
 
