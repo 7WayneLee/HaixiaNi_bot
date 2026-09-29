@@ -306,7 +306,22 @@
     - 出處字串偏長：講義的條文、針灸教程的時間碼都被當成章節。
     - 醫案出處會出現病人姓名。
     - 每題約 30 秒，要有「查詢中」的提示。
-- [ ] 第五步：Telegram bot（2026-09-29 開 worker）
+- [ ] 第五步：Telegram bot（2026-09-29 部署完成，待使用者實測）
+  - 程式：commit 4b89cc1，515 個測試通過。
+    - 前半由 Claude Code worker 撰寫；Claude 5 小時額度到 84% 時，依使用者指示「Work 你可以用 codex」停掉，改由 Codex 接手。
+    - Orca 用 Codex 0.158.0 派工三次都卡在 agent_readiness（逾時，任務沒送進去），所以改用 `codex exec -m gpt-6-sol -c model_reasoning_effort=high -s workspace-write -o <檔> - < spec` 直接執行，9 分鐘完成。
+  - 功能：
+    - 只回應 `.env` 裡 `TELEGRAM_ALLOWED_USER_IDS` 的使用者。
+    - 先回「查詢中…」並即時顯示搜尋進度，答案轉成 Telegram HTML，超長時分則送出。
+    - 醫案出處只顯示日期、主訴、編號，用 `/source 編號` 看原文。
+    - 其他指令：`/model opus|sonnet`、`/cost`、`/new`、`/help`。
+    - 每日上限 `DAILY_BUDGET_USD` 預設 3 美元。
+    - 對話閒置 6 小時或長度超過 15 萬 token 時自動開新對話。
+  - 部署：
+    - bot 帳號 @MyClinicDEMO_bot；token 由使用者傳來，指揮寫進 movie-nas 的 `.env`，已用 getMe 驗證。token 留在對話紀錄裡，使用者之後可以用 BotFather `/revoke` 換新的。
+    - movie-nas 的 `.venv-index` 裝了 python-telegram-bot 22.8。
+    - systemd 服務 `haixia-bot`（`deploy/haixia-bot.service`，`MemoryMax=350M`）已 enable 並啟動；剛啟動時記憶體約 32 MB。
+    - 看 log：`sudo journalctl -u haixia-bot -f`。
 - [ ] 第六步：醫案測試
 
 ## 預算
