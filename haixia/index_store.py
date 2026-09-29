@@ -184,5 +184,31 @@ class IndexStore:
             result[record["row"]] = dict(record)
         return result
 
+    def neighbors(self, chunk_id, before=1, after=1):
+        """段落 id → (該段, [前面的段…], [後面的段…])，都依 row 排序。
+
+        只取同一來源、row 連續相鄰的段落：往前（往後）遇到別的來源就停。
+        找不到這個 id 時丟 KeyError。
+        """
+        found = self.connection.execute("SELECT row, source FROM chunks WHERE id = ?",
+                                        (chunk_id,)).fetchone()
+        if found is None:
+            raise KeyError(chunk_id)
+        row, source = found["row"], found["source"]
+        records = self.rows(list(range(max(row - before, 0), row + after + 1)))
+
+        def walk(rows):
+            taken = []
+            for other in rows:
+                record = records.get(other)
+                if record is None or record["source"] != source:
+                    break
+                taken.append(record)
+            return taken
+
+        previous = walk(range(row - 1, row - before - 1, -1))[::-1]
+        following = walk(range(row + 1, row + after + 1))
+        return records[row], previous, following
+
     def close(self):
         self.connection.close()
