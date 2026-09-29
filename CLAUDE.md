@@ -186,7 +186,7 @@
       - 363,912 行裡改了 141,748 行（39.0%）。
       - 已備份到 GCS `transcripts/corrected/`（440 個，rclone check 相符）；本機另留一份重做前的版本 `~/haixia-corrected-pre-redo/`。
       - 快取是依引擎分開的：不帶 Claude 重啟時，沒做完的檔裡 Claude 做過的段會由 Antigravity 重做。
-  - [ ] Claude 段改用 Antigravity 重做（使用者 2026-09-28 決定）：
+  - [x] Claude 段改用 Antigravity 重做（使用者 2026-09-28 決定，2026-09-29 12:02 完成）：
     - 依據：兩個引擎都做過的 13 段（1,574 行）裡，94% 的行結果相同；不同的 99 行中，Antigravity 對約 20 行（多半是照聲音改對，例如督脈、有洞就鑽、怢慄），Claude 對約 5–8 行（多半是背出經文原句），另有約 15 行是 Claude 把語助詞刪掉。
     - 程式：`correct_transcripts.py` 加 `--redo-engine claude-cli`，只重做目標段；新結果 ok 才取代，否則保留原版；被取代的段記在 `replaced`（Claude Code worker 撰寫中）。
     - 使用者同意：寫好、審查、試跑後，有額度就開始跑，只用 Antigravity（不用 Claude、Codex）。
@@ -212,6 +212,12 @@
       - 440 個檔都通過驗證，已備份到 GCS（440 個，rclone check 相符）。GCS 上的重做前版本因此被覆蓋，重做前的完整版本只剩本機的 `~/haixia-corrected-pre-redo/`。
       - 額度：E 11:51 重設、A 12:47 重設。
       - 恢復方式：expected-account 設成登入的帳號，照原參數重跑 `--redo-engine claude-cli`。
+    - 2026-09-29 11:24 用 E 恢復，11:51 E 重設後接上，12:02 **重做完成**：
+      - 400 段全部 ok 並取代，沒有保留原版的段。
+      - 其中 272 段有上網搜尋，共 1,207 次；Claude 原本只有 4 段搜尋過。
+      - 重做的 400 段共 43,246 行，文字和 Claude 版不同的有 5,208 行（12.0%）。
+      - 440 個檔都通過驗證，現在只剩 Antigravity（3,012 段）和 Codex（491 段）。
+      - 已備份到 GCS（440 個，rclone check 相符）；重做前的版本在本機 `~/haixia-corrected-pre-redo/`。
 - [ ] 第四步：Claude 問答
 - [ ] 第五步：Telegram bot
 - [ ] 第六步：醫案測試
