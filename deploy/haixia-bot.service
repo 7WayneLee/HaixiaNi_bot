@@ -1,0 +1,16 @@
+[Unit]
+Description=倪海廈教學研讀 Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=Daniel
+WorkingDirectory=/home/Daniel/HaixiaNi_bot
+ExecStart=/home/Daniel/HaixiaNi_bot/.venv-index/bin/python scripts/telegram_bot.py
+Restart=on-failure
+RestartSec=10
+MemoryMax=350M
+
+[Install]
+WantedBy=multi-user.target

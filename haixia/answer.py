@@ -357,6 +357,8 @@ class Answer:
     elapsed_sec: float = 0.0
     fallback: bool = False
     notes: list = field(default_factory=list)
+    # 最後一個請求的輸入總量（input＋快取讀＋快取寫）＝目前對話的長度，下一題至少要重送這麼多
+    context_tokens: int = 0
 
 
 def history_content(content):
@@ -378,13 +380,15 @@ class Answerer:
                  api_key=None, workspace_id=None, embedder="vertex", system_prompt=None,
                  max_tool_rounds=MAX_TOOL_ROUNDS, max_tokens=MAX_TOKENS, fallback=None,
                  prefix_mismatch="drop_block",
-                 log_dir=DEFAULT_LOG_DIR, prices=None, clock=time.monotonic):
+                 log_dir=DEFAULT_LOG_DIR, prices=None, clock=time.monotonic, searcher=None):
         """client：anthropic.Anthropic（或同介面物件）；None 時用 api_key（與 workspace_id）建立。
 
         embedder："vertex"＝用 Vertex 算查詢向量；None＝只用 BM25；或傳入同介面物件（測試用）。
         fallback：None＝依模型決定（Opus 5.5 等預設開）；True／False 強制。
         prefix_mismatch：思考區塊綁定檢查不符時的處理（"drop_block"／"error"／None＝不送）。
         log_dir：None＝不寫 JSONL。
+        searcher：共用現成的 Searcher（Telegram bot 切換模型時用），這時不看 index_dir 與 embedder；
+        close() 也不會關掉它，由建立的人負責。
         """
         if effort not in EFFORTS:
             raise ValueError(f"effort 只能是 {'、'.join(EFFORTS)}")
@@ -403,9 +407,12 @@ class Answerer:
         # system 與工具在整個 Answerer 的生命週期內固定不變（快取前綴、思考綁定都靠它）
         self.system = [{"type": "text", "text": text.strip(), "cache_control": {"type": "ephemeral"}}]
         self.tools = TOOLS
-        if embedder == "vertex":
-            embedder = default_embedder()
-        self.searcher = Searcher(index_dir, embedder)
+        self.owns_searcher = searcher is None
+        if searcher is None:
+            if embedder == "vertex":
+                embedder = default_embedder()
+            searcher = Searcher(index_dir, embedder)
+        self.searcher = searcher
         self.client = client if client is not None else make_client(api_key, workspace_id)
 
     # ----- 請求 -----
@@ -499,6 +506,9 @@ class Answerer:
             response = self._send(messages, allow_tools)
             answer.requests += 1
             usage, cost, notes = response_cost(response, self.model, self.prices)
+            last = usage_dict(response.usage)
+            answer.context_tokens = (last["input_tokens"] + last["cache_read_input_tokens"]
+                                     + last["cache_creation_input_tokens"])
             for name in USAGE_FIELDS:
                 answer.usage[name] += usage[name]
             answer.cost_usd += cost
@@ -573,4 +583,5 @@ class Answerer:
             answer.notes.append(f"寫入 log 失敗：{type(problem).__name__}")
 
     def close(self):
-        self.searcher.close()
+        if self.owns_searcher:
+            self.searcher.close()

@@ -664,3 +664,33 @@ def test_real_sdk_request_shape_and_round_trip(index_dir):
     results = later["messages"][2]["content"]
     assert results[0]["type"] == "tool_result" and results[0]["tool_use_id"] == "toolu_1"
     assert SECRET not in second.content.decode("utf-8")
+
+
+# ---------- 第五步：對話長度與共用 Searcher ----------
+
+def test_context_tokens_is_last_request_input_total(index_dir):
+    answerer, _ = make(index_dir, [
+        reply([tool("t1", "search", {"query": "桂枝湯"})], "tool_use", use=usage(3000, 0, 2500, 100)),
+        reply([text("答案")], use=usage(500, 2500, 6000, 800)),
+    ])
+    result = answerer.ask(core.Conversation(), "桂枝湯？")
+    # 只看最後一個請求：500＋2500＋6000（不是兩個請求加總）
+    assert result.context_tokens == 9000
+    assert result.usage["input_tokens"] == 3500
+
+
+def test_shared_searcher_is_used_and_not_closed(index_dir):
+    from haixia.search import Searcher
+
+    searcher = Searcher(index_dir, FakeEmbedder())
+    client = FakeClient([reply([text("一")]), reply([text("二")])])
+    opus = core.Answerer(index_dir, MODEL, client=client, searcher=searcher, log_dir=None, system_prompt="s")
+    sonnet = core.Answerer(index_dir, "claude-sonnet-5-5", client=client, searcher=searcher, log_dir=None,
+                           system_prompt="s")
+    assert opus.searcher is searcher and sonnet.searcher is searcher
+    assert opus.ask(core.Conversation(), "問").text == "一"
+    opus.close()
+    sonnet.close()
+    # 共用的 Searcher 由建立的人關；Answerer.close() 不會關掉它
+    assert searcher.search("桂枝湯", k=1)["results"]
+    searcher.close()
