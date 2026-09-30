@@ -143,10 +143,12 @@ def run(coroutine):
 
 
 def write_log(log_dir, entries):
+    """entries：(時間, 花費) 或 (時間, 花費, 模型)；沒寫模型時當作 Opus 5.5。"""
     log_dir.mkdir(parents=True, exist_ok=True)
     with open(log_dir / core.LOG_NAME, "w", encoding="utf-8") as out:
-        for when, cost in entries:
-            out.write(json.dumps({"time": when, "cost_usd": cost}) + "\n")
+        for when, cost, *model in entries:
+            out.write(json.dumps({"time": when, "cost_usd": cost, "model": (model or [core.DEFAULT_MODEL])[0]})
+                      + "\n")
 
 
 # ---------- 設定與白名單 ----------
@@ -496,9 +498,10 @@ def test_model_switch_starts_new_conversation(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
     assert "已經是 Opus 5.5" in bot.texts()[-1] and state.conversation is old
     run(bot_core.handle_message(bot, CHAT, USER, "/model gpt"))
-    assert "不認得" in bot.texts()[-1] and state.model == core.DEFAULT_MODEL
+    assert "不認得「gpt」" in bot.texts()[-1] and "gemini-flash" in bot.texts()[-1]
+    assert state.model == core.DEFAULT_MODEL
     run(bot_core.handle_message(bot, CHAT, USER, "/model sonnet"))
-    assert "已切換到 Sonnet 5.5" in bot.texts()[-1] and "開新對話" in bot.texts()[-1]
+    assert bot.texts()[-1] == "已切換到 Sonnet 5.5，開新對話。"
     assert state.model == "claude-sonnet-5-5" and state.conversation is not old and not state.conversation.messages
     run(bot_core.handle_message(bot, CHAT, USER, "第二題"))
     assert pool.answerers["claude-sonnet-5-5"].calls[0]["messages"] == 0
@@ -513,7 +516,7 @@ def test_gemini_models_are_listed_and_switch_resets_conversation(make_core):
     old.messages.append({"role": "user", "content": "舊問題"})
     run(bot_core.handle_message(bot, CHAT, USER, "/model"))
     listing = bot.messages()[-1][1]
-    assert listing["text"] == "目前模型：Opus 5.5\n請選擇模型服務："
+    assert listing["text"] == "目前模型：Opus 5.5\n選服務："
     assert [button.text for button in listing["reply_markup"].inline_keyboard[0]] == ["Claude", "Gemini"]
     run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-flash"))
     assert state.model == "gemini-3.8-flash" and state.conversation is not old
@@ -573,7 +576,7 @@ def test_model_callback_rejects_strangers_and_expired_data(make_core, caplog):
     for data in ("unknown", None, ["m:s"]):
         callback = FakeCallback(data)
         run(bot_core.handle_model_callback(bot, callback, USER))
-        assert callback.answers == [{"text": "選單已過期，請重新輸入 /model"}]
+        assert callback.answers == [{"text": "選單過期了，重打 /model"}]
     assert not bot.messages() and state.model == core.DEFAULT_MODEL
 
 
@@ -585,10 +588,14 @@ def test_new_command_and_help(make_core):
     assert bot.texts()[-1] == "已開新對話。" and not bot_core.state(CHAT).conversation.messages
     run(bot_core.handle_message(bot, CHAT, USER, "/start"))
     help_text = bot.texts()[-1]
-    for words in ("/new", "/model", "/cost", "/source", "【倪師原文依據】", "重新啟動後對話會清空", "US$2.50"):
+    for words in ("/model 換模型", "/new 開新對話", "/cost 看花費", "/source 編號 看原文", "/s_…",
+                  "目前模型：Opus 5.5", "每日上限：2.500 USD ≈ 80.0 TWD"):
         assert words in help_text
+    # 只寫給自己看：不重複免責聲明、不解釋答案格式
+    assert "醫師" not in help_text and "【倪師原文依據】" not in help_text
+    assert all(len(line) <= 25 for line in help_text.splitlines())
     run(bot_core.handle_message(bot, CHAT, USER, "/foo"))
-    assert "不認得 /foo" in bot.texts()[-1]
+    assert bot.texts()[-1] == "不認得 /foo，/help 看指令。"
 
 
 # ---------- 花費 ----------
@@ -609,15 +616,131 @@ def test_summarize_costs_uses_taipei_day():
     assert (summary.month_count, summary.month_usd) == (4, pytest.approx(10.75))
 
 
+def _entry(when, cost, model):
+    return json.dumps({"time": when, "cost_usd": cost, "model": model})
+
+
+def test_provider_of_model_field():
+    assert tg.provider_of("claude-opus-5-5") == tg.provider_of("claude-sonnet-5-5") == "Claude"
+    assert tg.provider_of("gemini-3.8-flash") == tg.provider_of("gemini-3.1-pro-preview") == "Gemini"
+    for other in ("gpt-6-sol", "", None, 42, "Claude-opus"):
+        assert tg.provider_of(other) == "其他"
+
+
+def test_money_format_is_shared():
+    assert tg.money(0.117) == "0.117 USD ≈ 3.7 TWD"
+    assert tg.money(0.1171875) == "0.117 USD ≈ 3.8 TWD"
+    assert tg.money(3) == "3.000 USD ≈ 96.0 TWD"
+    assert tg.money(2.5034, twd=False) == "2.503 USD"
+    answer = make_answer("答案", cost=0.1171875)
+    assert tg.money(0.1171875) in tg.answer_messages("問題", answer, "答案")[0]
+
+
+def test_costs_split_claude_and_gemini():
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc)          # 台灣 9/30 12:00
+    lines = [
+        _entry("2026-09-30T01:00:00+00:00", 0.2, "claude-opus-5-5"),
+        _entry("2026-09-30T02:00:00+00:00", 0.05, "claude-sonnet-5-5"),
+        _entry("2026-09-30T03:00:00+00:00", 0.03, "gemini-3.8-flash"),
+        _entry("2026-09-10T03:00:00+00:00", 0.08, "gemini-3.1-pro-preview"),
+        _entry("2026-09-10T04:00:00+00:00", 1.0, "claude-opus-5-5"),
+    ]
+    summary = tg.summarize_costs(lines, now)
+    assert summary.today["Claude"].count == 2 and summary.today["Claude"].usd == pytest.approx(0.25)
+    assert summary.today["Gemini"].count == 1 and summary.today["Gemini"].usd == pytest.approx(0.03)
+    assert summary.month["Claude"].count == 3 and summary.month["Claude"].usd == pytest.approx(1.25)
+    assert summary.month["Gemini"].count == 2 and summary.month["Gemini"].usd == pytest.approx(0.11)
+    assert "其他" not in summary.month
+    assert tg.cost_message(summary, 3.0) == "\n".join([
+        "今天 9/30",
+        "Claude　2 題　0.250 USD ≈ 8.0 TWD",
+        "Gemini　1 題　0.030 USD ≈ 1.0 TWD",
+        "合計　　0.280 USD ≈ 9.0 TWD",
+        "",
+        "本月",
+        "Claude　3 題　1.250 USD ≈ 40.0 TWD",
+        "Gemini　2 題　0.110 USD ≈ 3.5 TWD",
+        "合計　　1.360 USD ≈ 43.5 TWD",
+        "",
+        "每日上限 3.000 USD，今天還剩 2.720 USD",
+    ])
+
+
+def test_costs_with_only_one_provider_still_list_both():
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc)
+    summary = tg.summarize_costs([_entry("2026-09-30T01:00:00+00:00", 0.4, "gemini-3.8-flash")], now)
+    assert set(summary.today) == {"Gemini"}
+    text = tg.cost_message(summary, 3.0)
+    assert "Claude　0 題　0.000 USD ≈ 0.0 TWD" in text
+    assert "Gemini　1 題　0.400 USD ≈ 12.8 TWD" in text
+    assert text.count("合計　　0.400 USD ≈ 12.8 TWD") == 2 and "其他" not in text
+    # 完全沒有紀錄
+    empty = tg.cost_message(tg.summarize_costs([], now), 3.0)
+    assert empty.count("合計　　0.000 USD ≈ 0.0 TWD") == 2
+    assert empty.endswith("每日上限 3.000 USD，今天還剩 3.000 USD")
+
+
+def test_costs_list_other_only_when_present():
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc)
+    lines = [
+        _entry("2026-09-30T01:00:00+00:00", 0.1, "claude-opus-5-5"),
+        _entry("2026-09-05T01:00:00+00:00", 0.02, "gpt-test"),              # 本月、不是今天
+        json.dumps({"time": "2026-09-06T01:00:00+00:00", "cost_usd": 0.01}),  # 舊紀錄沒有 model
+    ]
+    summary = tg.summarize_costs(lines, now)
+    assert "其他" not in summary.today
+    assert summary.month["其他"].count == 2 and summary.month["其他"].usd == pytest.approx(0.03)
+    text = tg.cost_message(summary, 3.0)
+    today, month = text.split("\n\n本月\n")
+    assert "其他" not in today
+    assert "其他　2 題　0.030 USD ≈ 1.0 TWD" in month
+    assert "合計　　0.130 USD ≈ 4.2 TWD" in month
+
+
+def test_costs_across_month_boundary_in_taipei_time():
+    now = datetime(2026, 9, 30, 16, 30, tzinfo=timezone.utc)        # 台灣 10/1 00:30
+    lines = [
+        _entry("2026-09-30T15:59:00+00:00", 1.0, "claude-opus-5-5"),     # 台灣 9/30 23:59：上個月
+        _entry("2026-09-30T16:10:00+00:00", 0.3, "gemini-3.8-flash"),    # 台灣 10/1 00:10
+        _entry("2025-10-01T02:00:00+00:00", 5.0, "claude-opus-5-5"),     # 去年同月，不算
+    ]
+    summary = tg.summarize_costs(lines, now)
+    assert summary.day == "2026-10-01"
+    assert "Claude" not in summary.month and summary.month["Gemini"].count == 1
+    assert summary.today_usd == pytest.approx(0.3) and summary.month_usd == pytest.approx(0.3)
+    assert tg.cost_message(summary, 3.0).startswith("今天 10/1\n")
+
+
+def test_costs_skip_broken_lines():
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=timezone.utc)
+    lines = [
+        "不是 JSON", "", "[1, 2]", "3", json.dumps({"cost_usd": 3, "model": "claude-opus-5-5"}),
+        json.dumps({"time": "昨天", "cost_usd": 1, "model": "claude-opus-5-5"}),
+        json.dumps({"time": "2026-09-30T01:00:00+00:00", "cost_usd": "很多", "model": "gemini-3.8-flash"}),
+        json.dumps({"time": "2026-09-30T01:00:00+00:00", "cost_usd": "NaN", "model": "gemini-3.8-flash"}),
+        json.dumps({"time": 12345, "cost_usd": 1, "model": "claude-opus-5-5"}),
+        _entry("2026-09-30T01:00:00+00:00", 0.2, "gemini-3.8-flash"),
+        json.dumps({"time": "2026-09-30T02:00:00+00:00", "cost_usd": None, "model": "claude-opus-5-5"}),
+    ]
+    summary = tg.summarize_costs(lines, now)
+    assert summary.today["Gemini"].count == 1 and summary.today["Gemini"].usd == pytest.approx(0.2)
+    assert summary.today["Claude"].count == 1 and summary.today["Claude"].usd == 0.0
+    assert summary.month_count == 2
+
+
 def test_budget_blocks_api_call(make_core, tmp_path):
     now = datetime(2026, 9, 29, 4, 0, tzinfo=timezone.utc)
-    write_log(tmp_path / "logs", [("2026-09-29T01:00:00+00:00", 2.0), ("2026-09-29T02:00:00+00:00", 1.2)])
+    # 上限算 Claude 加 Gemini 的合計
+    write_log(tmp_path / "logs", [("2026-09-29T01:00:00+00:00", 2.0),
+                                  ("2026-09-29T02:00:00+00:00", 1.2, "gemini-3.8-flash")])
     bot_core, pool = make_core(daily_budget=3.0, now=lambda: now)
     bot = FakeBot()
     run(bot_core.handle_message(bot, CHAT, USER, "問題"))
     assert pool.all_calls() == []
     final = bot.texts()[-1]
-    assert "達到每日上限" in final and "DAILY_BUDGET_USD" in final and "US$3.20" in final
+    assert final == ("今天花了 3.200 USD ≈ 102.4 TWD，到上限 3.000 USD 了，明天 0 點重算。\n"
+                     "要調整上限，改 .env 的 DAILY_BUDGET_USD。")
+    assert "Claude" not in final
     # 上限提高後就能問
     bot_core.daily_budget = 5.0
     run(bot_core.handle_message(bot, CHAT, USER, "問題"))
@@ -626,13 +749,16 @@ def test_budget_blocks_api_call(make_core, tmp_path):
 
 def test_cost_command(make_core, tmp_path):
     now = datetime(2026, 9, 29, 4, 0, tzinfo=timezone.utc)
-    write_log(tmp_path / "logs", [("2026-09-29T01:00:00+00:00", 0.5), ("2026-09-02T01:00:00+00:00", 1.0)])
+    write_log(tmp_path / "logs", [("2026-09-29T01:00:00+00:00", 0.5),
+                                  ("2026-09-29T02:00:00+00:00", 0.25, "gemini-3.1-pro-preview"),
+                                  ("2026-09-02T01:00:00+00:00", 1.0)])
     bot_core, _ = make_core(now=lambda: now)
     bot = FakeBot()
     run(bot_core.handle_message(bot, CHAT, USER, "/cost"))
     text = bot.texts()[-1]
-    assert "今天（台灣時間 2026-09-29）：1 題，US$0.50（約 NT$16）" in text
-    assert "本月：2 題，US$1.50（約 NT$48）" in text and "每日上限：US$3.00" in text
+    assert text.startswith("今天 9/29\nClaude　1 題　0.500 USD ≈ 16.0 TWD\nGemini　1 題　0.250 USD ≈ 8.0 TWD\n")
+    assert "本月\nClaude　2 題　1.500 USD ≈ 48.0 TWD\nGemini　1 題　0.250 USD ≈ 8.0 TWD\n合計　　1.750 USD ≈ 56.0 TWD" in text
+    assert text.endswith("每日上限 3.000 USD，今天還剩 2.250 USD")
 
 
 # ---------- 對話自動重置 ----------
@@ -643,11 +769,11 @@ def test_reset_reason_idle_and_context():
     state.conversation.messages.append({"role": "user", "content": "q"})
     state.last_active = 1000.0
     assert tg.reset_reason(state, 1000.0 + 6 * 3600) is None
-    assert "6 小時" in tg.reset_reason(state, 1000.0 + 6 * 3600 + 1)
+    assert tg.reset_reason(state, 1000.0 + 6 * 3600 + 1) == "閒置超過 6 小時"
     state.context_tokens = 150_000
     assert tg.reset_reason(state, 1001.0) is None
     state.context_tokens = 150_001
-    assert "15 萬" in tg.reset_reason(state, 1001.0)
+    assert tg.reset_reason(state, 1001.0) == "對話超過 15 萬 token"
 
 
 def test_question_auto_resets_after_idle_and_long_context(make_core):
@@ -663,11 +789,11 @@ def test_question_auto_resets_after_idle_and_long_context(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "二"))
     calls = pool.all_calls()
     assert calls[1]["messages"] == 0 and calls[1]["conversation"] is not calls[0]["conversation"]
-    assert "已自動開新對話" in bot.texts()[-1] and "15 萬" in bot.texts()[-1]
+    assert "（新對話：對話超過 15 萬 token）" in bot.texts()[-1]
     # 閒置超過 6 小時
     clock[0] += 6 * 3600 + 5
     run(bot_core.handle_message(bot, CHAT, USER, "三"))
-    assert pool.all_calls()[2]["messages"] == 0 and "6 小時" in bot.texts()[-1]
+    assert pool.all_calls()[2]["messages"] == 0 and "（新對話：閒置超過 6 小時）" in bot.texts()[-1]
 
 
 # ---------- 單一 worker 排隊 ----------
@@ -702,7 +828,7 @@ def test_single_worker_thread_queues_questions(make_core):
 
     run(scenario())
     sends = bot.texts("send")
-    assert sends[0] == "查詢中…" and sends[1] == "排隊中：前面還有 1 題，輪到時會開始查詢。"
+    assert sends[0] == "查詢中…" and sends[1] == "排隊中，前面還有 1 題"
     calls = pool.all_calls()
     assert [call["question"] for call in calls] == ["一", "二"]
     assert peak[0] == 1
@@ -795,7 +921,7 @@ def test_bm25_fallback_and_server_fallback_are_noted(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "問題"))
     final = bot.texts()[-1]
     assert "答案</blockquote>" in final
-    assert "只用關鍵字搜尋" in final and "改由 claude-opus-5 回答" in final
+    assert "（語意搜尋失敗，這題只用關鍵字）" in final and "（這題改由 claude-opus-5 回答）" in final
 
 
 def test_refusal_text_mentions_telegram_new():
@@ -845,7 +971,7 @@ def test_non_text_message_gets_hint(make_core):
     bot_core, pool = make_core()
     bot = FakeBot()
     run(bot_core.handle_message(bot, CHAT, USER, None))
-    assert "只接受文字" in bot.texts()[-1] and pool.answerers == {}
+    assert bot.texts()[-1] == "只接受文字訊息。" and pool.answerers == {}
 
 
 # ---------- /source ----------
@@ -899,12 +1025,12 @@ def test_source_command_ambiguous_and_missing(make_core, case_store):
     bot = FakeBot()
     run(bot_core.handle_message(bot, CHAT, USER, "/source 3e13af"))
     text = bot.texts()[-1]
-    assert "對應到不只一段" in text and "3e13af0" in text and "3e13af1" in text
+    assert "3e13af 對應到不只一段，多打幾碼" in text and "3e13af0" in text and "3e13af1" in text
     assert "（編號 3e13af0）" in text and "（編號 3e13af1" in text
     run(bot_core.handle_message(bot, CHAT, USER, "/source 3e13af1"))
     assert "對應到不只一段" in bot.texts()[-1]
     run(bot_core.handle_message(bot, CHAT, USER, "/source ffffff"))
-    assert "找不到編號 ffffff" in bot.texts()[-1]
+    assert bot.texts()[-1] == "找不到 ffffff。索引更新過的話，舊編號會失效。"
     run(bot_core.handle_message(bot, CHAT, USER, "/source"))
     assert "用法：/source 編號" in bot.texts()[-1]
     run(bot_core.handle_message(bot, CHAT, USER, "/source 5a5a5a"))
@@ -962,7 +1088,7 @@ def test_source_without_neighbors_keeps_note():
     target = _doc("a0000002", "虛構資料/範例.txt", "範例標題", "單獨一段。")
     shown = tg.source_messages(target, [], [])
     assert len(shown) == 1
-    assert shown[0].endswith("</blockquote>\n\n（同一來源裡沒有相鄰的段落。）")
+    assert shown[0].endswith("</blockquote>\n\n（沒有前後段）")
 
 
 def test_source_long_blocks_stay_complete_and_continue_at_newlines():

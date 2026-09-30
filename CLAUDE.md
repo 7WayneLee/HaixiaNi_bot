@@ -368,6 +368,10 @@
       - 約 1,060 段的 id 和 `/s_` 編號改變。
       - 舊索引備份在 Mac 的 `~/haixia-index-build/backup-20260930/`。
     - 最後一輪修改做到一半時 Codex 回報「Your workspace is out of credits」（2026-09-30 09:51）；改動已經寫完，由指揮跑測試和實際切段驗收。之後要改程式時，依使用者規則改開 Claude Code worker。
+  - 2026-09-30 文案精簡、`/cost` 分開、README 更新（Orca 派 Claude Code worker 撰寫，Opus 5.5 high，607 個測試通過）：
+    - `/cost` 依 JSONL 的 `model` 分開列 Claude（Anthropic 帳單）和 Gemini（GCP 帳單），今天和本月各有合計；每日上限仍算合計。金額一律「x.xxx USD ≈ y.y TWD」，共用 `money()`。
+    - 使用者說 bot 只有自己用，文案要簡單：`/help`、排隊、開新對話、每日上限、錯誤、`/source` 提示都改成短句，拿掉給別人看的說明。答案內容和格式不變。
+    - README 依現況重寫：功能、架構、資料規模、進度、文件、目錄、費用、隱私；不含電子郵件、Telegram ID、bot 帳號、token、病人資料。
 - [ ] 第五步：Telegram bot（2026-09-29 部署完成，待使用者實測）
   - 程式：commit 4b89cc1，515 個測試通過。
     - 前半由 Claude Code worker 撰寫；Claude 5 小時額度到 84% 時，依使用者指示「Work 你可以用 codex」停掉，改由 Codex 接手。

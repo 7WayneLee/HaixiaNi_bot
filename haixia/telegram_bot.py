@@ -47,11 +47,11 @@ MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
 MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
                "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.1-pro-preview": "Gemini 3.1 Pro"}
 COMMANDS = {"start", "help", "new", "model", "cost", "source"}
-BOT_COMMANDS = [("help", "用法說明"), ("new", "開新對話"), ("model", "顯示或切換四個模型"),
-                ("cost", "今天與本月的花費"), ("source", "看段落原文：/source 編號")]
+BOT_COMMANDS = [("help", "說明"), ("new", "開新對話"), ("model", "換模型"),
+                ("cost", "看花費"), ("source", "看原文：/source 編號")]
 MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:f": "gemini-flash", "m:p": "gemini-pro"}
 
-BM25_NOTE = "（註：這題的語意搜尋（Vertex）暫時失敗，只用關鍵字搜尋，找到的資料可能不完整。）"
+BM25_NOTE = "（語意搜尋失敗，這題只用關鍵字）"
 
 
 def model_name(model):
@@ -62,12 +62,12 @@ def model_menu(model, provider=None):
     """傳回選單文字與按鈕規格；callback data 固定且短。"""
     current = f"目前模型：{model_name(model)}"
     if provider is None:
-        return current + "\n請選擇模型服務：", [[("Claude", "m:c"), ("Gemini", "m:g")]]
+        return current + "\n選服務：", [[("Claude", "m:c"), ("Gemini", "m:g")]]
     aliases = ("opus", "sonnet") if provider == "claude" else ("gemini-flash", "gemini-pro")
     rows = [[(model_name(MODELS[alias]) + ("（目前）" if MODELS[alias] == model else ""), data)]
             for alias, data in zip(aliases, ("m:o", "m:s") if provider == "claude" else ("m:f", "m:p"))]
     rows.append([("‹ 返回", "m:b")])
-    return current + f"\n選擇{(' Claude' if provider == 'claude' else ' Gemini')} 模型：", rows
+    return current + f"\n選 {'Claude' if provider == 'claude' else 'Gemini'} 模型：", rows
 
 
 def model_keyboard(rows):
@@ -303,17 +303,63 @@ def _flatten(text, limit):
 
 # ---------- 花費 ----------
 
+PROVIDERS = ("Claude", "Gemini")        # 分屬 Anthropic 與 GCP 兩份帳單；其他模型只在有紀錄時列出
+OTHER = "其他"
+
+
+def money(amount, twd=True):
+    """金額格式：「0.117 USD ≈ 3.8 TWD」。答案標題、/cost、每日上限共用。"""
+    text = f"{amount:.3f} USD"
+    return text + f" ≈ {amount * TWD_PER_USD:.1f} TWD" if twd else text
+
+
+def provider_of(model):
+    """JSONL 的 model 欄位 → Claude、Gemini 或其他。"""
+    model = model if isinstance(model, str) else ""
+    if model.startswith("claude-"):
+        return "Claude"
+    if model.startswith("gemini-"):
+        return "Gemini"
+    return OTHER
+
+
+@dataclass
+class CostTotal:
+    count: int = 0
+    usd: float = 0.0
+
+
 @dataclass
 class CostSummary:
-    day: str
-    today_count: int = 0
-    today_usd: float = 0.0
-    month_count: int = 0
-    month_usd: float = 0.0
+    day: str                                    # 台灣時間的日期，例如 2026-09-30
+    today: dict = field(default_factory=dict)   # 服務 → CostTotal
+    month: dict = field(default_factory=dict)
+
+    @property
+    def today_count(self):
+        return sum(total.count for total in self.today.values())
+
+    @property
+    def today_usd(self):
+        return sum(total.usd for total in self.today.values())
+
+    @property
+    def month_count(self):
+        return sum(total.count for total in self.month.values())
+
+    @property
+    def month_usd(self):
+        return sum(total.usd for total in self.month.values())
+
+
+def _add(totals, provider, cost):
+    total = totals.setdefault(provider, CostTotal())
+    total.count += 1
+    total.usd += cost
 
 
 def summarize_costs(lines, now):
-    """JSONL 紀錄（answer.py 每題一行）→ 今天、本月（台灣時間）的題數與花費。壞掉的行略過。"""
+    """JSONL 紀錄（answer.py 每題一行）→ 今天、本月（台灣時間）各服務的題數與花費。壞掉的行略過。"""
     local = now.astimezone(TAIPEI)
     summary = CostSummary(day=local.strftime("%Y-%m-%d"))
     for line in lines:
@@ -321,18 +367,19 @@ def summarize_costs(lines, now):
             entry = json.loads(line)
             when = datetime.fromisoformat(entry["time"])
             cost = float(entry.get("cost_usd") or 0.0)
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if not math.isfinite(cost):
             continue
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
         when = when.astimezone(TAIPEI)
         if (when.year, when.month) != (local.year, local.month):
             continue
-        summary.month_count += 1
-        summary.month_usd += cost
+        provider = provider_of(entry.get("model"))
+        _add(summary.month, provider, cost)
         if when.date() == local.date():
-            summary.today_count += 1
-            summary.today_usd += cost
+            _add(summary.today, provider, cost)
     return summary
 
 
@@ -344,23 +391,27 @@ def read_costs(log_path, now):
         return summarize_costs([], now)
 
 
-def usd(amount):
-    return f"US${amount:.2f}（約 NT${amount * TWD_PER_USD:.0f}）"
-
-
 def budget_message(summary, budget):
-    return (f"今天（台灣時間 {summary.day}）已經花了 {usd(summary.today_usd)}，達到每日上限 {usd(budget)}，"
-            "今天不再呼叫 Claude。\n\n"
-            "台灣時間午夜 0 點重新計算。要調整上限：在 movie-nas 的 ~/HaixiaNi_bot/.env 設定 "
-            f"DAILY_BUDGET_USD（例如 DAILY_BUDGET_USD=5），再執行 sudo systemctl restart {SERVICE}。")
+    return (f"今天花了 {money(summary.today_usd)}，到上限 {money(budget, twd=False)} 了，明天 0 點重算。\n"
+            "要調整上限，改 .env 的 DAILY_BUDGET_USD。")
+
+
+def _cost_lines(totals):
+    names = PROVIDERS + ((OTHER,) if OTHER in totals else ())
+    lines = []
+    for name in names:
+        total = totals.get(name, CostTotal())
+        lines.append(f"{name}　{total.count} 題　{money(total.usd)}")
+    lines.append(f"合計　　{money(sum(total.usd for total in totals.values()))}")
+    return lines
 
 
 def cost_message(summary, budget):
+    day = datetime.strptime(summary.day, "%Y-%m-%d")
     left = max(budget - summary.today_usd, 0.0)
-    return (f"今天（台灣時間 {summary.day}）：{summary.today_count} 題，{usd(summary.today_usd)}\n"
-            f"本月：{summary.month_count} 題，{usd(summary.month_usd)}\n"
-            f"每日上限：{usd(budget)}，今天還剩 {usd(left)}\n"
-            f"（台幣以 1 美元＝{TWD_PER_USD} 元估算；命令列 ask.py 的花費也算在內。）")
+    return "\n".join([f"今天 {day.month}/{day.day}", *_cost_lines(summary.today), "",
+                      "本月", *_cost_lines(summary.month), "",
+                      f"每日上限 {money(budget, twd=False)}，今天還剩 {money(left, twd=False)}"])
 
 
 # ---------- 對話 ----------
@@ -383,9 +434,9 @@ def reset_reason(state, now, idle_sec=IDLE_RESET_SEC, max_context=CONTEXT_RESET_
     if not state.conversation.messages:
         return None
     if state.last_active is not None and now - state.last_active > idle_sec:
-        return f"超過 {idle_sec // 3600} 小時沒有互動"
+        return f"閒置超過 {idle_sec // 3600} 小時"
     if state.context_tokens > max_context:
-        return f"對話長度約 {state.context_tokens / 10000:.1f} 萬 token，超過上限 {max_context // 10000} 萬"
+        return f"對話超過 {max_context // 10000} 萬 token"
     return None
 
 
@@ -451,31 +502,30 @@ def error_message(problem, model=core.DEFAULT_MODEL):
     except ImportError:  # pragma: no cover — 部署環境一定有
         anthropic = None
     if isinstance(problem, core.MissingApiKey):
-        return "找不到 Anthropic API 金鑰：請在 movie-nas 的 ~/HaixiaNi_bot/.env 設定 ANTHROPIC_API_KEY，再重啟服務。"
+        return "缺 ANTHROPIC_API_KEY，寫進 .env 後重啟 bot。"
     if gemini:
         import httpx
         if isinstance(problem, httpx.TimeoutException):
-            return "Gemini API 逾時，這題沒有完成。請再問一次。"
+            return "Gemini 逾時，再問一次。"
         if isinstance(problem, httpx.ConnectError):
-            return "連不上 Gemini API（網路問題），這題沒有完成。請稍後再問一次。"
+            return "連不上 Gemini（網路問題），等一下再問。"
     if not gemini and anthropic is not None and isinstance(problem, anthropic.APITimeoutError):
-        return "Claude API 逾時，這題沒有完成。請再問一次。"
+        return "Claude 逾時，再問一次。"
     if not gemini and anthropic is not None and isinstance(problem, anthropic.APIConnectionError):
-        return "連不上 Claude API（網路問題），這題沒有完成。請稍後再問一次。"
+        return "連不上 Claude（網路問題），等一下再問。"
     if status == 429:
-        return f"{service} API 目前達到流量限制（HTTP 429），請過一兩分鐘再問。"
+        return f"{service} 流量限制（HTTP 429），等一兩分鐘再問。"
     if status in (401, 403):
         if gemini:
-            return f"Gemini API 拒絕了服務帳號認證或權限（HTTP {status}），請檢查 Vertex AI 權限。"
-        return f"Claude API 拒絕了金鑰（HTTP {status}）：請檢查 .env 的 ANTHROPIC_API_KEY（和 ANTHROPIC_WORKSPACE_ID）。"
+            return f"Gemini 權限錯誤（HTTP {status}），檢查服務帳號的 Vertex AI 權限。"
+        return f"Claude 金鑰被拒（HTTP {status}），檢查 .env 的 ANTHROPIC_API_KEY。"
     if status == 400:
-        return f"{service} API 不接受這次請求（HTTP 400）。可能是對話太長或格式問題，請輸入 /new 開新對話再問。"
+        return f"{service} 不接受這次請求（HTTP 400），/new 開新對話再問。"
     if isinstance(status, int) and status >= 500:
-        return f"{service} 伺服器暫時忙碌或出錯（HTTP {status}），請稍後再問。"
+        return f"{service} 伺服器忙碌（HTTP {status}），等一下再問。"
     if status:
-        return f"{service} API 錯誤（HTTP {status}），這題沒有完成。請稍後再問。"
-    return (f"處理這題時發生錯誤（{type(problem).__name__}），這題沒有完成。請再問一次；"
-            f"一直失敗的話請看 log：journalctl -u {SERVICE}")
+        return f"{service} 錯誤（HTTP {status}），等一下再問。"
+    return f"出錯了（{type(problem).__name__}），再問一次；一直失敗就看 bot 的 log。"
 
 
 def answer_notes(result):
@@ -484,11 +534,11 @@ def answer_notes(result):
     if any(call.get("mode") == "bm25" for call in result.tool_calls):
         notes.append(BM25_NOTE)
     if result.fallback:
-        notes.append(f"（註：這題改由 {result.model} 回答（伺服器端 fallback）。）")
+        notes.append(f"（這題改由 {model_name(result.model)} 回答）")
     if any("截斷" in note for note in result.notes):
-        notes.append("（註：這題的回答因長度上限而截斷。）")
+        notes.append("（回答太長，被截斷）")
     if any("工具呼叫達到上限" in note for note in result.notes):
-        notes.append("（註：這題已達工具輪數上限。）")
+        notes.append("（查詢輪數到上限，可能沒查完）")
     return notes
 
 
@@ -552,8 +602,7 @@ def _trim_thinking(thinking, limit):
 
 def answer_messages(question, answer, displayed, notices=()):
     """每則都含完整引用標籤；長答案每則重新包一個回答引用區塊。"""
-    title = (f"{model_name(answer.model)}｜思考 {math.floor(answer.elapsed_sec + 0.5)} 秒｜"
-             f"{answer.cost_usd:.3f} USD ≈ {answer.cost_usd * TWD_PER_USD:.1f} TWD")
+    title = f"{model_name(answer.model)}｜思考 {math.floor(answer.elapsed_sec + 0.5)} 秒｜{money(answer.cost_usd)}"
     thinking = answer.thinking or "（這題沒有思考內容）"
     answer_title, answer_body = _answer_title_and_body(question, displayed, answer.model)
     answer_html = to_html(answer_body)
@@ -632,7 +681,7 @@ def _source_blocks(target, previous, following):
                           + [("後一段", item) for item in following]):
         blocks.append(_quote(label, escape(record['text'].strip()), label != "這一段"))
     if not previous and not following:
-        blocks.append("（同一來源裡沒有相鄰的段落。）")
+        blocks.append("（沒有前後段）")
     return blocks
 
 
@@ -685,28 +734,16 @@ def source_messages(target, previous, following):
 
 
 def help_text(model, budget):
-    return f"""<b>倪海廈教學研讀助手</b>
-直接輸入問題就好，例如「少陽病的提綱是什麼？」「桂枝湯和麻黃湯怎麼分？」，或描述病例（寒熱、汗、口渴、二便、睡眠、飲食、舌象越詳細越好）。每題約 30 秒，會先顯示「查詢中…」和搜尋進度。同一時間只處理一題，連續傳的問題會排隊。
+    return f"""直接打問題，病例寫越詳細越好。
 
-<b>答案的段落</b>
-【倪師原文依據】倪師明確講過或寫過的，附出處（課名、集數、時間點，或書名、頁碼）
-【推論（非倪師原話）】依倪師框架推出來的，標把握程度
-【還需要問的】資訊不夠時要補充的問診項目
-這是研讀倪師資料的整理，不能取代醫師診治；有急重症請立即就醫。
+/model 換模型
+/new 開新對話
+/cost 看花費
+/source 編號 看原文
+點出處後面的 /s_… 看原文
 
-<b>指令</b>
-/new 開新對話（換題目時用，比較省錢）
-/model 開啟二級選單：先選 Claude 或 Gemini，再選模型；也可用 /model opus、sonnet、gemini-flash 或 gemini-pro 切換（會開新對話）
-/cost 今天與本月的題數、花費
-/source 編號 看原文（也可以打「原文 編號」）
-/help 這個說明
-
-<b>出處與原文</b>
-經典、逐字稿、講義、醫案的出處後面都有 /s_…，點它就能看原文與前後段。也可以傳 /source 編號或「原文 編號」。醫案出處不顯示病人姓名，例如「醫案 2008-08-07 皮癢 /s_3e13af」。
-
-<b>其他</b>
-目前模型：{model_name(model)}。追問會接著同一段對話；超過 6 小時沒互動、或對話太長（約 15 萬 token）時會自動開新對話並告訴你。bot 重新啟動後對話會清空。
-每日花費上限 {usd(budget)}（台灣時間計算），到了就暫停回答；用 /cost 看目前花費。"""
+目前模型：{model_name(model)}
+每日上限：{money(budget)}"""
 
 
 # ---------- 問答執行緒 ----------
@@ -933,7 +970,7 @@ class BotCore:
             log.warning("拒絕 user_id=%s", user_id)
             return
         if text is None:
-            await self.send_html(bot, chat_id, "目前只接受文字訊息。輸入 /help 看用法。")
+            await self.send_html(bot, chat_id, "只接受文字訊息。")
             return
         text = text.strip()
         if not text:
@@ -964,18 +1001,17 @@ class BotCore:
         elif command.name == "source":
             await self.handle_source(bot, chat_id, command.arg)
         else:
-            await self.send_html(bot, chat_id, f"不認得 /{html.escape(command.raw)} 這個指令。輸入 /help 看用法。")
+            await self.send_html(bot, chat_id, f"不認得 /{html.escape(command.raw)}，/help 看指令。")
 
     def switch_model(self, state, arg):
         model = resolve_model(arg)
         if model is None:
-            return f"不認得「{html.escape(arg)}」。可以用：" + "、".join(f"/model {alias}" for alias in MODELS)
+            return f"不認得「{html.escape(arg)}」，可用：" + "、".join(MODELS)
         if model == state.model:
-            return f"已經是 {model_name(model)}，不用切換。"
+            return f"已經是 {model_name(model)}。"
         state.model = model
         state.reset()
-        return (f"已切換到 {model_name(model)}（{model}），下一題生效。\n"
-                "已開新對話：換模型要重新開始。")
+        return f"已切換到 {model_name(model)}，開新對話。"
 
     async def handle_model_callback(self, bot, query, user_id):
         """依按鈕使用者 ID 授權；每個 callback 都先 answer 以停止轉圈。"""
@@ -985,7 +1021,7 @@ class BotCore:
             return
         data = query.data
         if not isinstance(data, str) or (data not in ("m:c", "m:g", "m:b") and data not in MODEL_CALLBACKS):
-            await query.answer(text="選單已過期，請重新輸入 /model")
+            await query.answer(text="選單過期了，重打 /model")
             return
         await query.answer()
         message = query.message
@@ -1008,12 +1044,11 @@ class BotCore:
     async def handle_source(self, bot, chat_id, arg):
         code = normalize_code(arg)
         if code is None:
-            await self.send_html(bot, chat_id, "用法：/source 編號（或「原文 編號」）。編號是出處括號裡「編號」後面的英數字，"
-                                               "例如 /source 3e13af。")
+            await self.send_html(bot, chat_id, "用法：/source 編號，例如 /source 3e13af")
             return
         ahead = self.pending
         if ahead:
-            await self.send_html(bot, chat_id, f"前面還有 {ahead} 題在處理，查完就回覆原文。")
+            await self.send_html(bot, chat_id, f"前面還有 {ahead} 題，查完就回。")
         self.pending += 1
         try:
             loop = asyncio.get_running_loop()
@@ -1032,18 +1067,17 @@ class BotCore:
             store = self.pool.store
             matches = store.find_prefix(code, limit=6)
             if not matches:
-                return (f"找不到編號 {code} 的段落。請確認是出處括號裡「編號」後面的英數字；"
-                        "bot 更新過索引的話，舊答案裡的編號可能已經失效。")
+                return f"找不到 {code}。索引更新過的話，舊編號會失效。"
             if len(matches) > 1:
                 shown = "\n".join(f"- {html.escape(item.get('short_id') or item['id'][:10])}…："
                                   f"{html.escape(citation(item), quote=False)}" for item in matches[:5])
-                more = "（還有更多）" if len(matches) > 5 else ""
-                return f"編號 {code} 對應到不只一段{more}，請多打幾碼：\n{shown}"
+                more = "（只列前 5 段）" if len(matches) > 5 else ""
+                return f"{code} 對應到不只一段{more}，多打幾碼：\n{shown}"
             target, previous, following = store.neighbors(matches[0]["id"], 1, 1)
             return source_messages(target, previous, following)
         except Exception as problem:  # noqa: BLE001
             log.error("查原文失敗：%s", type(problem).__name__)
-            return f"查原文時發生錯誤（{type(problem).__name__}）。"
+            return f"查原文出錯（{type(problem).__name__}），再試一次。"
 
     async def handle_question(self, bot, chat_id, question):
         ahead = self.pending
@@ -1051,7 +1085,7 @@ class BotCore:
         typing = None
         progress = None
         try:
-            status_text = "查詢中…" if not ahead else f"排隊中：前面還有 {ahead} 題，輪到時會開始查詢。"
+            status_text = "查詢中…" if not ahead else f"排隊中，前面還有 {ahead} 題"
             try:
                 status = await self._call(bot.send_message, chat_id=chat_id, text=status_text)
             except Exception as problem:  # noqa: BLE001
@@ -1092,7 +1126,7 @@ class BotCore:
         reason = reset_reason(state, self.clock())
         if reason:
             state.reset()
-            notices.append(f"（已自動開新對話：{reason}。）")
+            notices.append(f"（新對話：{reason}）")
         progress.notices = notices
         progress.started(queued)
         summary = read_costs(self.log_path, self.now())
