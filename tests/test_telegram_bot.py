@@ -883,14 +883,15 @@ def test_source_command_found(make_core, case_store):
     assert "原始標題：Doe,Jane20080807-皮癢" in text
     assert "檔案：文字資料/03.倪海厦诊疗日志 医案/其他/Doe,Jane20080807-皮癢.doc" in text
     assert "出處：醫案 2008-08-07 皮癢（編號 3e13af0）" in text
-    assert "【這一段】</b>\n初診：皮膚癢 &lt;兩週&gt;。" in text
-    assert "【後一段】</b>\n處方：桂枝湯 &amp; 加減。" in text and "【前一段】" not in text
+    assert "<blockquote><b>這一段</b>\n初診：皮膚癢 &lt;兩週&gt;。</blockquote>" in text
+    assert "<blockquote expandable><b>後一段</b>\n處方：桂枝湯 &amp; 加減。</blockquote>" in text
+    assert "<b>前一段</b>" not in text
     # 純文字「原文 編號」也可以；中間那段有前後各一段
     run(bot_core.handle_message(bot, CHAT, USER, "原文 3E13AF1000000002"))
     text = bot.texts()[-1]
-    assert "【前一段】" in text and "【後一段】" in text and "複診：好轉。" in text
+    assert "<b>前一段</b>" in text and "<b>後一段</b>" in text and "複診：好轉。" in text
     run(bot_core.handle_message(bot, CHAT, USER, "/s_3e13af0@HaixiaBot"))
-    assert "【這一段】" in bot.texts()[-1]
+    assert "<b>這一段</b>" in bot.texts()[-1]
 
 
 def test_source_command_ambiguous_and_missing(make_core, case_store):
@@ -938,6 +939,74 @@ def test_source_formats_repaired_case_path_and_classic_source():
     shown = tg.format_source(classic, [], [])
     assert "檔案：中醫笈成《傷寒論（宋本）》" in shown
     assert "Drive 上的原檔名" not in shown
+
+
+def test_source_information_order_and_quote_types():
+    source = "虛構資料/範例.txt"
+    before = _doc("a0000001", source, "範例標題", "上一行 <甲>&")
+    target = {**_doc("a0000002", source, "範例標題", "本行 >乙&"), "section": "範例章"}
+    after = _doc("a0000003", source, "範例標題", "下一行 <丙>")
+    shown = tg.source_messages(target, [before], [after])
+    assert len(shown) == 1
+    text = shown[0]
+    positions = [text.index(label) for label in ("<b>原文（段落", "出處：", "原始標題：", "檔案：", "章節：",
+                                             "<b>前一段</b>", "<b>這一段</b>", "<b>後一段</b>")]
+    assert positions == sorted(positions)
+    assert "<blockquote expandable><b>前一段</b>\n上一行 &lt;甲&gt;&amp;</blockquote>" in text
+    assert "<blockquote><b>這一段</b>\n本行 &gt;乙&amp;</blockquote>" in text
+    assert "<blockquote expandable><b>後一段</b>\n下一行 &lt;丙&gt;</blockquote>" in text
+    assert "<pre>" not in text and "<code>" not in text
+
+
+def test_source_without_neighbors_keeps_note():
+    target = _doc("a0000002", "虛構資料/範例.txt", "範例標題", "單獨一段。")
+    shown = tg.source_messages(target, [], [])
+    assert len(shown) == 1
+    assert shown[0].endswith("</blockquote>\n\n（同一來源裡沒有相鄰的段落。）")
+
+
+def test_source_long_blocks_stay_complete_and_continue_at_newlines():
+    source = "虛構資料/範例.txt"
+    before = _doc("a0000001", source, "範例標題", "前段。")
+    target = _doc("a0000002", source, "範例標題", "甲" * 2400 + "\n" + "乙" * 2400)
+    after = _doc("a0000003", source, "範例標題", "後段。")
+    shown = tg.source_messages(target, [before], [after])
+    assert len(shown) == 5
+    assert shown[1] == "<blockquote expandable><b>前一段</b>\n前段。</blockquote>"
+    assert shown[2] == "<blockquote><b>這一段</b>\n" + "甲" * 2400 + "</blockquote>"
+    assert shown[3] == "<blockquote><b>這一段（續）</b>\n" + "乙" * 2400 + "</blockquote>"
+    assert shown[4] == "<blockquote expandable><b>後一段</b>\n後段。</blockquote>"
+    assert all(tg._plain_length(message) <= tg.ANSWER_LIMIT for message in shown)
+
+
+def test_source_oversized_single_line_keeps_complete_quotes():
+    target = _doc("a0000002", "虛構資料/範例.txt", "範例標題", "字" * 8100)
+    shown = tg.source_messages(target, [], [])
+    quotes = [message for message in shown if message.startswith("<blockquote>")]
+    assert len(quotes) == 3
+    assert quotes[0].startswith("<blockquote><b>這一段</b>\n")
+    assert all(message.endswith("</blockquote>") and tg._plain_length(message) <= tg.ANSWER_LIMIT
+               for message in quotes)
+    assert all("<b>這一段（續）</b>" in message for message in quotes[1:])
+
+
+def test_source_959_drive_filename_stays_between_file_and_section():
+    original_name = "示例20080101-範例".encode("big5").decode("gb18030") + ".doc"
+    source = "文字資料/倪海厦08年医案959篇-按人名分类(神州医料库）/" + original_name
+    target = {**_doc("a0000002", source, "範例標題", "虛構段落。"), "section": "範例章"}
+    shown = tg.source_messages(target, [], [])[0]
+    assert shown.index("出處：") < shown.index("原始標題：") < shown.index("檔案：")
+    assert shown.index("檔案：") < shown.index("Drive 上的原檔名：" + source) < shown.index("章節：")
+
+
+def test_source_html_rejection_falls_back_to_plain_text(make_core, case_store):
+    bot_core, _ = make_core(store=case_store)
+    bot = FakeBot(reject_html=True)
+    run(bot_core.handle_message(bot, CHAT, USER, "/source 3e13af0"))
+    sent = bot.messages()[-1][1]
+    assert "parse_mode" not in sent
+    assert "這一段\n初診：皮膚癢 <兩週>。" in sent["text"]
+    assert "<blockquote" not in sent["text"]
 
 
 # ---------- python-telegram-bot 介面 ----------

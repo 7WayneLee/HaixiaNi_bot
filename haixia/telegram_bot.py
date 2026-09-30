@@ -610,25 +610,78 @@ def display_source(source):
 
 
 def format_source(target, previous, following):
-    """/source 的回覆（HTML）：原始標題（可能含姓名）、檔案路徑、出處與前後各一段全文。只回給使用者本人。"""
+    """/source 的完整 HTML；傳送時由 source_messages 保持各引用區塊完整。"""
+    return "\n\n".join(_source_blocks(target, previous, following))
+
+
+def _source_blocks(target, previous, following):
+    """依原文順序組出資訊、前段、本段、後段。"""
     escape = lambda value: html.escape(str(value), quote=False)  # noqa: E731
     source = target["source"]
     shown_source = display_source(source)
     lines = [f"<b>原文（段落 {escape(target['id'])}）</b>",
+             f"出處：{escape(citation(target))}",
              f"原始標題：{escape(original_title(target) or '（無）')}",
              f"檔案：{escape(shown_source)}"]
     if shown_source != source and "倪海厦08年医案959篇" in source:
         lines.append(f"Drive 上的原檔名：{escape(source)}")
-    lines.append(f"出處：{escape(citation(target))}")
     if target.get("section"):
         lines.append(f"章節：{escape(target['section'])}")
     blocks = ["\n".join(lines)]
     for label, record in ([("前一段", item) for item in previous] + [("這一段", target)]
                           + [("後一段", item) for item in following]):
-        blocks.append(f"<b>【{label}】</b>\n{escape(record['text'].strip())}")
+        blocks.append(_quote(label, escape(record['text'].strip()), label != "這一段"))
     if not previous and not following:
         blocks.append("（同一來源裡沒有相鄰的段落。）")
-    return "\n\n".join(blocks)
+    return blocks
+
+
+def _source_text_chunks(body, title):
+    """在換行處切原文；超長單行才逐字切，保留 Telegram 的純文字餘裕。"""
+    limit = ANSWER_LIMIT - utf16_len(title) - 1
+    chunks, current = [], ""
+    for line in body.split("\n"):
+        candidate = current + "\n" + line if current else line
+        if utf16_len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while utf16_len(line) > limit:
+            size, end = 0, 0
+            for char in line:
+                width = utf16_len(char)
+                if size + width > limit:
+                    break
+                size += width
+                end += 1
+            piece = line[:end]
+            chunks.append(piece)
+            line = line[end:]
+        current = line
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def source_messages(target, previous, following):
+    """一則放得下就合併；否則資訊與每個完整引用區塊分則。"""
+    blocks = _source_blocks(target, previous, following)
+    combined = "\n\n".join(blocks)
+    if _plain_length(combined) <= ANSWER_LIMIT:
+        return [combined]
+    messages = split_html(blocks[0], limit=ANSWER_LIMIT)
+    for label, record in ([("前一段", item) for item in previous] + [("這一段", target)]
+                          + [("後一段", item) for item in following]):
+        body = record["text"].strip()
+        chunks = _source_text_chunks(body, label + "（續）")
+        for index, chunk in enumerate(chunks):
+            heading = label if index == 0 else label + "（續）"
+            messages.append(_quote(heading, html.escape(chunk, quote=False), label != "這一段"))
+    if not previous and not following:
+        messages.append(blocks[-1])
+    return messages
 
 
 def help_text(model, budget):
@@ -967,7 +1020,11 @@ class BotCore:
             text = await loop.run_in_executor(self.executor, self._source_job, code)
         finally:
             self.pending -= 1
-        await self.send_long(bot, chat_id, text)
+        if isinstance(text, list):
+            for message in text:
+                await self.send_html(bot, chat_id, message)
+        else:
+            await self.send_long(bot, chat_id, text)
 
     def _source_job(self, code):
         """worker 執行緒：用編號（id 前綴）找段落與前後各一段。"""
@@ -983,7 +1040,7 @@ class BotCore:
                 more = "（還有更多）" if len(matches) > 5 else ""
                 return f"編號 {code} 對應到不只一段{more}，請多打幾碼：\n{shown}"
             target, previous, following = store.neighbors(matches[0]["id"], 1, 1)
-            return format_source(target, previous, following)
+            return source_messages(target, previous, following)
         except Exception as problem:  # noqa: BLE001
             log.error("查原文失敗：%s", type(problem).__name__)
             return f"查原文時發生錯誤（{type(problem).__name__}）。"
