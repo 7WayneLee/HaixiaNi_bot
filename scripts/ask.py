@@ -52,7 +52,10 @@ def usage_line(usage, cost, rounds=None, requests=None, elapsed=None):
     return "；".join(parts)
 
 
-def show(result, conversation=None):
+def show(result, conversation=None, show_thinking=False):
+    if show_thinking:
+        print("［思考過程］", file=sys.stderr)
+        print(result.thinking or "（這題沒有思考內容）", file=sys.stderr)
     print(core.display_answer(result.text, conversation) if conversation is not None else result.text)
     print(file=sys.stderr)
     for note in result.notes:
@@ -63,7 +66,7 @@ def show(result, conversation=None):
                                  result.elapsed_sec), file=sys.stderr)
 
 
-def interactive(ask):
+def interactive(ask, show_thinking=False):
     conversation = core.Conversation()
     total = dict.fromkeys(core.USAGE_FIELDS, 0)
     cost = 0.0
@@ -85,7 +88,7 @@ def interactive(ask):
         result = ask(conversation, question)
         if result is None:
             continue
-        show(result, conversation)
+        show(result, conversation, show_thinking)
         for name in core.USAGE_FIELDS:
             total[name] += result.usage[name]
         cost += result.cost_usd
@@ -103,6 +106,7 @@ def main(argv=None):
     parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
                         default="default", help="Gemini 思考程度；default 用模型預設")
     parser.add_argument("--show-tools", action="store_true", help="印出每次搜尋的查詢與命中出處")
+    parser.add_argument("--show-thinking", action="store_true", help="在答案前把官方思考摘要印到 stderr")
     parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--bm25-only", action="store_true", help="不呼叫 Vertex，只用關鍵字搜尋")
     parser.add_argument("--max-tool-rounds", type=int, default=core.MAX_TOOL_ROUNDS)
@@ -153,13 +157,13 @@ def main(argv=None):
 
     try:
         if args.interactive:
-            interactive(ask)
+            interactive(ask, args.show_thinking)
             return 0
         conversation = core.Conversation()
         result = ask(conversation, args.question)
         if result is None:
             return 1
-        show(result, conversation)
+        show(result, conversation, args.show_thinking)
         return 0
     finally:
         answerer.close()

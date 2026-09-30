@@ -16,7 +16,7 @@ Telegram 輸入 `/model` 會開啟 Claude／Gemini 二級按鈕選單；用 `/mo
 
 ## 思考、工具與差異
 
-預設 `--gemini-thinking default` **不送** `thinking_config`，由模型決定思考程度：3.8 Flash 預設 `MEDIUM`，3.1 Pro 預設 `HIGH`。可選 `low`、`medium`、`high`，CLI 用 `--gemini-thinking medium`，Telegram 服務啟動參數相同；程式用 `ThinkingConfig(thinking_level="MEDIUM")`。這兩個模型都不支援 `MINIMAL`。兩個模型均保留思考，思考 token 算輸出費用，也佔 `max_output_tokens=8192` 的上限。Claude 的 `--effort`、`--fallback`、`block_binding` 設定不會送給 Gemini。
+預設 `--gemini-thinking default` 只送 `ThinkingConfig(include_thoughts=True)`，由模型決定思考程度：3.8 Flash 預設 `MEDIUM`，3.1 Pro 預設 `HIGH`。可選 `low`、`medium`、`high`，CLI 用 `--gemini-thinking medium`，Telegram 服務啟動參數相同；程式會同時送 `include_thoughts=True` 與 `thinking_level="MEDIUM"`。這兩個模型都不支援 `MINIMAL`。只收集官方回傳的 thought part 作為摘要；完整 `Content` 仍原樣放回歷史，答案文字不含 thought part。思考 token 算輸出費用，也佔 `max_output_tokens=8192` 的上限。Claude 的 `--effort`、`--fallback`、`block_binding` 設定不會送給 Gemini。
 
 Gemini 與 Claude 使用同一份 `data/system_prompt.md`，也共用 `search`（含經典原文）、`read_context` 和 `classic_commentary` 的驗證與執行。Gemini 關閉 SDK 自動 function calling，自行處理最多 8 輪；同回合多個工具結果一起回送。模型回傳的完整 `Content` 原樣追加到對話歷史，保留 Gemini 3 function call 的 thought signature。工具結果後若得到非安全擋下的空白答案，會在同一段只附加的歷史中要求 Gemini 依規定格式補答一次，這次不允許再呼叫工具；補答的用量照常計費並記在 notes。安全原因擋下時不執行工具，回覆友善說明。
 

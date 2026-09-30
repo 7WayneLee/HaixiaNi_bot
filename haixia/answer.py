@@ -476,6 +476,7 @@ class Answer:
     notes: list = field(default_factory=list)
     # 最後一個請求的輸入總量（input＋快取讀＋快取寫）＝目前對話的長度，下一題至少要重送這麼多
     context_tokens: int = 0
+    thinking: str = ""
 
 
 def log_answer(log_dir, model, effort, fallback_enabled, question, answer, error):
@@ -486,7 +487,8 @@ def log_answer(log_dir, model, effort, fallback_enabled, question, answer, error
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": model, "served_model": answer.model, "effort": effort,
         "fallback_enabled": fallback_enabled, "fallback_ran": answer.fallback,
-        "question": question, "answer": answer.text, "stop_reason": answer.stop_reason,
+        "question": question, "answer": answer.text, "thinking": answer.thinking,
+        "stop_reason": answer.stop_reason,
         "refused": answer.refused, "rounds": answer.rounds, "requests": answer.requests,
         "tool_calls": answer.tool_calls, "usage": answer.usage,
         "cost_usd": round(answer.cost_usd, 6), "elapsed_sec": answer.elapsed_sec,
@@ -561,7 +563,7 @@ class Answerer:
     # ----- 請求 -----
 
     def request_params(self, messages, allow_tools=True):
-        thinking = {"type": "adaptive"}
+        thinking = {"type": "adaptive", "display": "summarized"}
         betas = []
         params = {
             "model": self.model,
@@ -647,6 +649,11 @@ class Answerer:
             dropped = getattr(response, "input_transformations", None) or []
             if dropped:
                 answer.notes.append(f"API 丟掉了 {len(dropped)} 個思考區塊（input_transformations）")
+
+            summaries = [block.thinking for block in response.content
+                         if block.type == "thinking" and getattr(block, "thinking", "")]
+            if summaries:
+                answer.thinking = "\n\n".join(filter(None, [answer.thinking, *summaries]))
 
             if response.stop_reason == "refusal":
                 # 拒答（可能只有部分輸出）：不放回歷史、不執行任何工具

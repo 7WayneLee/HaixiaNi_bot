@@ -12,9 +12,11 @@
 """
 
 import asyncio
+from collections import Counter
 import html
 import json
 import logging
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +32,7 @@ log = logging.getLogger("haixia.bot")
 TAIPEI = timezone(timedelta(hours=8), "Asia/Taipei")   # 台灣沒有日光節約時間，用固定時差
 TWD_PER_USD = 32
 TELEGRAM_LIMIT = 4096
+ANSWER_LIMIT = 3900            # 依解析後純文字計，留給 Telegram 一點餘裕
 DEFAULT_DAILY_BUDGET = 3.0
 IDLE_RESET_SEC = 6 * 3600
 CONTEXT_RESET_TOKENS = 150_000
@@ -475,19 +478,110 @@ def error_message(problem, model=core.DEFAULT_MODEL):
             f"一直失敗的話請看 log：journalctl -u {SERVICE}")
 
 
-def answer_text(result, displayed=None):
-    """Answer → 要送出的文字：答案、搜尋退回關鍵字的註明、fallback、用量。"""
-    text = result.text if displayed is None else displayed
-    if result.refused:
-        text = text.replace("互動模式輸入 /new", "輸入 /new")
+def answer_notes(result):
+    """答案區塊後的提示。"""
     notes = []
     if any(call.get("mode") == "bm25" for call in result.tool_calls):
         notes.append(BM25_NOTE)
     if result.fallback:
         notes.append(f"（註：這題改由 {result.model} 回答（伺服器端 fallback）。）")
-    footer = (f"— {model_name(result.model)}｜約 NT${result.cost_usd * TWD_PER_USD:.1f}"
-              f"（US${result.cost_usd:.3f}）｜{result.elapsed_sec:.0f} 秒")
-    return "\n\n".join([text, *notes, footer])
+    if any("截斷" in note for note in result.notes):
+        notes.append("（註：這題的回答因長度上限而截斷。）")
+    if any("工具呼叫達到上限" in note for note in result.notes):
+        notes.append("（註：這題已達工具輪數上限。）")
+    return notes
+
+
+def answer_text(result, displayed=None):
+    """拒答與純文字用途；一般答案用 answer_messages 包成引用區塊。"""
+    text = result.text if displayed is None else displayed
+    if result.refused:
+        text = text.replace("互動模式輸入 /new", "輸入 /new")
+    return "\n\n".join([text, *answer_notes(result)])
+
+
+def _plain_length(markup):
+    return utf16_len(html_to_plain(markup))
+
+
+def _quote(title, body, expandable=True):
+    tag = "<blockquote expandable>" if expandable else "<blockquote>"
+    return f"{tag}<b>{html.escape(title, quote=False)}</b>\n{body}</blockquote>"
+
+
+def _short_question(question):
+    return question[:30] + ("…" if len(question) > 30 else "")
+
+
+_SUMMARY_LINE = re.compile(r"^(?:總結[：:]|【總結】)(.*)$")
+
+
+def _answer_title_and_body(question, displayed, model):
+    """只調整 Telegram 顯示；不修改 Answer、對話歷史或 JSONL。"""
+    lines = displayed.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first is not None:
+        found = _SUMMARY_LINE.match(lines[first].strip())
+        if found and found.group(1).strip():
+            summary = found.group(1).strip()
+            title = summary[:60]
+            if len(summary) > 60:
+                for citation in re.finditer(r"/s_[0-9a-f]{4,16}", summary):
+                    if citation.start() < 60 < citation.end():
+                        title = summary[:citation.start()].rstrip()
+                        break
+                title += "…"
+            body = "\n".join(lines[:first] + lines[first + 1:]).strip("\n")
+            return title, body
+    log.info("答案缺總結行：%s", model)
+    return _short_question(question), displayed
+
+
+def _trim_thinking(thinking, limit):
+    """思考摘要太長時截斷；省略數量以原始字數計。"""
+    if utf16_len(thinking) <= limit:
+        return thinking
+    kept = min(len(thinking), max(0, limit - 32))
+    while kept:
+        suffix = f"…（思考過程較長，後面省略約 {len(thinking) - kept} 字）"
+        if utf16_len(thinking[:kept] + suffix) <= limit:
+            return thinking[:kept] + suffix
+        kept -= 1
+    return f"…（思考過程較長，後面省略約 {len(thinking)} 字）"
+
+
+def answer_messages(question, answer, displayed, notices=()):
+    """每則都含完整引用標籤；長答案每則重新包一個回答引用區塊。"""
+    title = (f"{model_name(answer.model)}｜思考 {math.floor(answer.elapsed_sec + 0.5)} 秒｜"
+             f"{answer.cost_usd:.3f} USD ≈ {answer.cost_usd * TWD_PER_USD:.1f} TWD")
+    thinking = answer.thinking or "（這題沒有思考內容）"
+    answer_title, answer_body = _answer_title_and_body(question, displayed, answer.model)
+    answer_html = to_html(answer_body)
+    extras = "\n\n".join(html.escape(note, quote=False) for note in (*notices, *answer_notes(answer)))
+    thinking_block = _quote(title, to_html(thinking))
+    answer_block = _quote(answer_title, answer_html, False)
+    blocks = thinking_block + "\n" + answer_block
+    if _plain_length(blocks) <= ANSWER_LIMIT:
+        combined = blocks + ("\n\n" + extras if extras else "")
+        return [combined] if _plain_length(combined) <= ANSWER_LIMIT else [
+            blocks, *split_html(extras, limit=ANSWER_LIMIT)]
+
+    # 分則時思考獨立一則，回答依內容拆分，標題和提示也算進純文字上限。
+    thinking_limit = ANSWER_LIMIT - utf16_len(title) - 2
+    messages = [_quote(title, to_html(_trim_thinking(thinking, thinking_limit)))]
+    first_limit = ANSWER_LIMIT - utf16_len(answer_title) - 2
+    continuation_limit = ANSWER_LIMIT - utf16_len("（續）") - 2
+    chunks = split_html(answer_html, limit=min(first_limit, continuation_limit)) or ["（空白）"]
+    for index, chunk in enumerate(chunks):
+        heading = answer_title if index == 0 else "（續）"
+        messages.append(_quote(heading, chunk, False))
+    if extras:
+        candidate = messages[-1] + "\n\n" + extras
+        if _plain_length(candidate) <= ANSWER_LIMIT:
+            messages[-1] = candidate
+        else:
+            messages.extend(split_html(extras, limit=ANSWER_LIMIT))
+    return messages
 
 
 _SOURCE_CODE = re.compile(r"（編號 ([0-9a-f]{4,16})）")
@@ -645,6 +739,14 @@ def _retry_seconds(problem):
     return min(float(value), 30.0)
 
 
+def log_entity_counts(message):
+    """只記 Telegram 回傳的 entity 類型與數量，不記答案內容。"""
+    counts = Counter(getattr(entity, "type", "unknown") for entity in
+                     (getattr(message, "entities", None) or ()))
+    summary = "、".join(f"{kind} {count}" for kind, count in sorted(counts.items())) or "無"
+    log.info("答案訊息 entity：%s", summary)
+
+
 class BotCore:
     def __init__(self, allowed, pool, *, daily_budget=DEFAULT_DAILY_BUDGET, log_dir=core.DEFAULT_LOG_DIR,
                  default_model=core.DEFAULT_MODEL, clock=time.time, monotonic=time.monotonic,
@@ -696,33 +798,45 @@ class BotCore:
                     raise
                 await asyncio.sleep(wait)
 
-    async def send_html(self, bot, chat_id, text):
+    async def send_html(self, bot, chat_id, text, *, answer_message=False):
         """送一則 HTML 訊息；HTML 解析失敗就改送純文字。送不出去回傳 None（只記 log）。"""
         try:
-            return await self._call(bot.send_message, chat_id=chat_id, text=text, parse_mode="HTML")
+            sent = await self._call(bot.send_message, chat_id=chat_id, text=text, parse_mode="HTML")
+            if answer_message:
+                log_entity_counts(sent)
+            return sent
         except Exception as problem:  # noqa: BLE001
             if not _is_bad_request(problem):
                 log.error("送訊息失敗：%s", type(problem).__name__)
                 return None
+            log.warning("HTML 被 Telegram 拒絕：%s", type(problem).__name__)
         try:
-            return await self._call(bot.send_message, chat_id=chat_id, text=html_to_plain(text))
+            sent = await self._call(bot.send_message, chat_id=chat_id, text=html_to_plain(text))
+            if answer_message:
+                log_entity_counts(sent)
+            return sent
         except Exception as problem:  # noqa: BLE001
             log.error("送純文字訊息也失敗：%s", type(problem).__name__)
             return None
 
-    async def edit_html(self, bot, chat_id, message_id, text):
+    async def edit_html(self, bot, chat_id, message_id, text, *, answer_message=False):
         """把訊息改成 HTML；解析失敗改用純文字。成功回傳 True。"""
         try:
-            await self._call(bot.edit_message_text, chat_id=chat_id, message_id=message_id, text=text,
-                             parse_mode="HTML")
+            sent = await self._call(bot.edit_message_text, chat_id=chat_id, message_id=message_id, text=text,
+                                    parse_mode="HTML")
+            if answer_message:
+                log_entity_counts(sent)
             return True
         except Exception as problem:  # noqa: BLE001
             if not _is_bad_request(problem):
                 log.warning("改訊息失敗：%s", type(problem).__name__)
                 return False
+            log.warning("HTML 被 Telegram 拒絕：%s", type(problem).__name__)
         try:
-            await self._call(bot.edit_message_text, chat_id=chat_id, message_id=message_id,
-                             text=html_to_plain(text))
+            sent = await self._call(bot.edit_message_text, chat_id=chat_id, message_id=message_id,
+                                    text=html_to_plain(text))
+            if answer_message:
+                log_entity_counts(sent)
             return True
         except Exception as problem:  # noqa: BLE001
             log.warning("改成純文字也失敗：%s", type(problem).__name__)
@@ -742,6 +856,14 @@ class BotCore:
             await self.send_html(bot, chat_id, first)
         for chunk in rest:
             await self.send_html(bot, chat_id, chunk)
+
+    async def send_answer_messages(self, bot, chat_id, messages, status=None):
+        first, *rest = messages
+        if status is None or not await self.edit_html(bot, chat_id, status.message_id, first,
+                                                       answer_message=True):
+            await self.send_html(bot, chat_id, first, answer_message=True)
+        for chunk in rest:
+            await self.send_html(bot, chat_id, chunk, answer_message=True)
 
     async def _typing(self, bot, chat_id):
         while True:
@@ -899,8 +1021,12 @@ class BotCore:
                 typing.cancel()
         if progress is not None:
             await progress.drain()
-        text = "\n\n".join([*result.notices, result.text])
-        await self.send_long(bot, chat_id, to_html(text), status)
+        if result.kind == "answer" and result.answer is not None and not result.answer.refused:
+            messages = answer_messages(question, result.answer, result.text, result.notices)
+            await self.send_answer_messages(bot, chat_id, messages, status)
+        else:
+            text = "\n\n".join([*result.notices, result.text])
+            await self.send_long(bot, chat_id, to_html(text), status)
 
     def _question_job(self, chat_id, question, progress, queued):
         """worker 執行緒：自動重置、每日上限、呼叫 Answerer。"""
@@ -932,7 +1058,8 @@ class BotCore:
                  result.elapsed_sec, "（拒答）" if result.refused else "")
         displayed = core.display_answer(result.text, conversation)
         displayed = clickable_citations(displayed, self.pool.store)
-        return JobResult("answer", answer_text(result, displayed), notices, result)
+        return JobResult("answer", answer_text(result, displayed) if result.refused else displayed,
+                         notices, result)
 
 
 # ---------- python-telegram-bot ----------

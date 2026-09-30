@@ -59,12 +59,14 @@ def test_function_declarations_and_config():
     assert declarations[0].parameters_json_schema["properties"]["kind"]["enum"][-1] == "classic"
     config = answerer.request_config()
     assert config.automatic_function_calling.disable is True
-    assert config.thinking_config is None
+    assert config.thinking_config.include_thoughts is True
+    assert config.thinking_config.thinking_level is None
     assert config.max_output_tokens == 8192
     assert answerer.request_config(False).tool_config.function_calling_config.mode == "NONE"
     assert answerer.request_config(False).tools == [answerer.tool]
     medium, _ = make([], thinking_level="medium")
     assert medium.request_config().thinking_config.thinking_level == "MEDIUM"
+    assert medium.request_config().thinking_config.include_thoughts is True
     with pytest.raises(ValueError):
         make([], thinking_level="minimal")
 
@@ -100,6 +102,24 @@ def test_multiple_calls_one_response_and_signature_preserved():
     tool_content = conversation.messages[2]
     assert tool_content.role == "tool" and len(tool_content.parts) == 2
     assert all(part.function_response for part in tool_content.parts)
+
+
+def test_thought_parts_are_logged_and_excluded_from_answer(tmp_path):
+    first_thought = types.Part(text="先查原文", thought=True)
+    last_thought = types.Part(text="比較依據", thought=True)
+    first = reply([first_thought, types.Part(function_call=types.FunctionCall(
+        name="search", args={"query": "傷寒"}))])
+    final = reply([last_thought, types.Part.from_text(text="正式答案")])
+    answerer, client = make([first, final])
+    answerer.log_dir = tmp_path
+    conversation = core.Conversation()
+    result = answerer.ask(conversation, "問題")
+    assert result.thinking == "先查原文\n\n比較依據"
+    assert result.text == "正式答案"
+    assert conversation.messages[1] is first.candidates[0].content
+    assert conversation.messages[-1] is final.candidates[0].content
+    assert client.models.calls[0]["config"].thinking_config.include_thoughts is True
+    assert json.loads((tmp_path / core.LOG_NAME).read_text())["thinking"] == result.thinking
 
 
 def test_gemini_display_citation_does_not_change_history_or_log(tmp_path):
@@ -228,7 +248,7 @@ def test_log_schema_matches_claude_and_hides_exception_message(tmp_path):
     answerer.ask(core.Conversation(), "問題")
     entry = json.loads((tmp_path / core.LOG_NAME).read_text().strip())
     expected = {"time", "model", "served_model", "effort", "fallback_enabled", "fallback_ran",
-                "question", "answer", "stop_reason", "refused", "rounds", "requests", "tool_calls",
+                "question", "answer", "thinking", "stop_reason", "refused", "rounds", "requests", "tool_calls",
                 "usage", "cost_usd", "elapsed_sec", "notes", "error"}
     assert set(entry) == expected and entry["model"] == "gemini-3.8-flash"
     failed, _ = make([RuntimeError("private-token")])

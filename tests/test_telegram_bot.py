@@ -274,16 +274,190 @@ def test_split_html_counts_utf16_units():
     assert len(chunks) == 2 and all(tg.utf16_len(chunk) <= tg.TELEGRAM_LIMIT for chunk in chunks)
 
 
-def test_html_parse_error_falls_back_to_plain_text(make_core):
+def test_html_parse_error_falls_back_to_plain_text(make_core, caplog):
     bot_core, _ = make_core(lambda model, question, on_tool: make_answer("**粗體** 與 <符號>"))
     bot = FakeBot(reject_html=True)
     run(bot_core.handle_message(bot, CHAT, USER, "問題"))
     final = bot.messages()[-1][1]
     assert "parse_mode" not in final
-    assert final["text"].startswith("粗體 與 <符號>")
+    assert "粗體 與 <符號>" in final["text"]
+    assert "<blockquote" not in final["text"]
+    assert "HTML 被 Telegram 拒絕：BadRequest" in caplog.text
     # 直接送 HTML 失敗時也一樣
     run(bot_core.send_html(bot, CHAT, "<b>標題</b> &amp; 內文"))
     assert bot.messages()[-1] == ("send", {"chat_id": CHAT, "text": "標題 & 內文"})
+
+
+def test_two_blocks_title_escaping_and_no_nested_entities():
+    answer = make_answer("**重點**：<方>&\n【倪師原文依據】\n查 /s_a1b2c3", cost=0.036,
+                         thinking="先看 <原文> & 講義")
+    answer.elapsed_sec = 38.5
+    messages = tg.answer_messages("這題 <問>&" + "甲" * 31, answer, answer.text)
+    assert len(messages) == 1
+    markup = messages[0]
+    assert markup.startswith("<blockquote expandable><b>Opus 5.5｜思考 39 秒｜0.036 USD ≈ 1.2 TWD</b>")
+    assert "<b>這題 &lt;問&gt;&amp;" in markup and "…</b>" in markup
+    assert "先看 &lt;原文&gt; &amp; 講義" in markup
+    assert "<b>重點</b>：&lt;方&gt;&amp;" in markup
+    assert "/s_a1b2c3" in markup and "— Opus" not in markup
+    assert markup.count("<blockquote") == 2 and markup.count("</blockquote>") == 2
+    assert "<pre>" not in markup and "<code>" not in markup
+    assert "</blockquote>\n<blockquote" in markup
+
+
+def test_only_thinking_block_is_expandable():
+    markup = tg.answer_messages("問題", make_answer("答案"), "答案")[0]
+    assert markup.count("<blockquote expandable>") == 1
+    assert markup.count("<blockquote>") == 1
+
+
+def test_thinking_markdown_is_converted_inside_quote():
+    answer = make_answer("答案", thinking="# 判斷 <方>&\n**核對** 原文")
+    markup = tg.answer_messages("問題", answer, answer.text)[0]
+    thinking = markup.split("</blockquote>", 1)[0]
+    assert "<b>判斷 &lt;方&gt;&amp;</b>" in thinking
+    assert "<b>核對</b> 原文" in thinking
+    assert "**" not in thinking
+    assert "<pre>" not in thinking and "<code>" not in thinking
+
+
+@pytest.mark.parametrize("prefix", ["總結：", "總結:", "【總結】"])
+def test_summary_prefix_becomes_title_and_leaves_answer_body(prefix):
+    original = f"\n{prefix}先查桂枝湯（編號 a1b2c3）\n\n【經典原文】\n原文"
+    store = SimpleNamespace(find_prefix=lambda code, limit: [object()])
+    displayed = tg.clickable_citations(original, store)
+    answer = make_answer(original, thinking="摘要")
+    markup = tg.answer_messages("問題", answer, displayed)[0]
+    assert "<blockquote><b>先查桂枝湯 /s_a1b2c3</b>\n" in markup
+    assert "<b>【經典原文】</b>\n原文</blockquote>" in markup
+    assert prefix not in markup
+    assert answer.text == original
+
+
+def test_summary_title_is_truncated_and_html_is_escaped():
+    summary = "<方>&" + "甲" * 61
+    answer = make_answer(f"總結：{summary}\n答案")
+    markup = tg.answer_messages("問題", answer, answer.text)[0]
+    assert f"<blockquote><b>&lt;方&gt;&amp;{'甲' * 56}…</b>\n答案</blockquote>" in markup
+    assert "<方>" not in markup
+
+
+def test_summary_title_does_not_split_source_command():
+    answer = make_answer("總結：" + "甲" * 54 + " /s_a1b2c3 後文\n答案")
+    markup = tg.answer_messages("問題", answer, answer.text)[0]
+    assert f"<blockquote><b>{'甲' * 54}…</b>\n答案</blockquote>" in markup
+    assert "/s_a1" not in markup
+
+
+def test_missing_summary_uses_question_and_logs_model(caplog):
+    answer = make_answer("【倪師原文依據】\n答案")
+    with caplog.at_level(logging.INFO, logger="haixia.bot"):
+        markup = tg.answer_messages("問題" * 20, answer, answer.text)[0]
+    assert f"<blockquote><b>{'問題' * 15}…</b>" in markup
+    assert "答案缺總結行：claude-opus-5-5" in caplog.text
+    assert "倪師原文依據" not in caplog.text
+
+
+def test_summary_display_does_not_change_conversation_history(make_core):
+    original = "總結：先查桂枝湯\n【經典原文】\n原文"
+    answer = make_answer(original)
+    bot_core, _ = make_core(lambda model, question, on_tool: answer)
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "問題"))
+    assert bot_core.state(CHAT).conversation.messages == [
+        {"role": "user", "content": "問題"}, {"role": "assistant", "content": "…"}]
+    assert answer.text == original
+    assert "總結：" not in bot.texts()[-1]
+    assert "<blockquote><b>先查桂枝湯</b>" in bot.texts()[-1]
+
+
+def test_long_thinking_is_trimmed_and_answer_messages_continue():
+    answer = make_answer("總結：先看原文\n" + "字" * 8000,
+                         thinking="# 判斷 <方>&\n**核對** 原文\n" + "想" * 8000)
+    messages = tg.answer_messages("問題", answer, answer.text)
+    assert len(messages) >= 4
+    assert "思考過程較長，後面省略約" in messages[0]
+    assert "<b>判斷 &lt;方&gt;&amp;</b>" in messages[0]
+    assert "<b>核對</b> 原文" in messages[0]
+    assert "**" not in messages[0]
+    assert "<pre>" not in messages[0] and "<code>" not in messages[0]
+    assert messages[0].count("<blockquote") == 1
+    assert "<blockquote><b>先看原文</b>" in messages[1]
+    assert all("<b>（續）</b>" in message for message in messages[2:])
+    assert all("<blockquote expandable>" not in message for message in messages[1:])
+    assert all(tg._plain_length(message) <= tg.ANSWER_LIMIT for message in messages)
+    assert all(message.count("<blockquote") == message.count("</blockquote>") == 1
+               for message in messages)
+
+
+def test_split_answer_keeps_bold_tags_balanced():
+    answer = make_answer("【倪師原文依據】\n**" + "重" * 5000 + "**", thinking="摘要")
+    messages = tg.answer_messages("問題", answer, answer.text)
+    assert any("<b>重" in message for message in messages[1:])
+    assert all(tg.html_to_plain(message.split("\n", 1)[1]).strip() for message in messages[1:])
+    assert all(message.count("<b>") == message.count("</b>") for message in messages)
+    assert all(tg._plain_length(message) <= tg.ANSWER_LIMIT for message in messages)
+
+
+def test_split_answer_breaks_at_newlines_and_keeps_source_commands(monkeypatch):
+    monkeypatch.setattr(tg, "ANSWER_LIMIT", 160)
+    lines = [f"第{i:02d}行：{'字' * 15} /s_a1b2c3" for i in range(12)]
+    answer = make_answer("\n".join(lines), thinking="摘要")
+    messages = tg.answer_messages("問題", answer, answer.text)
+    assert len(messages) > 2
+    bodies = [message.split("\n", 1)[1].removesuffix("</blockquote>") for message in messages[1:]]
+    assert [line for body in bodies for line in body.splitlines()] == lines
+    assert all(body.startswith("第") and body.endswith("/s_a1b2c3") for body in bodies)
+    assert all(message.count("<blockquote>") == message.count("</blockquote>") == 1
+               for message in messages[1:])
+    assert all(message.count("/s_a1b2c3") == len(body.splitlines())
+               for message, body in zip(messages[1:], bodies))
+    assert all(tg._plain_length(message) <= tg.ANSWER_LIMIT for message in messages)
+
+
+def test_answer_length_counts_utf16_after_html_parsing():
+    answer = make_answer("**" + "😀" * 2500 + "**", thinking="🧠" * 3000)
+    messages = tg.answer_messages("問題", answer, answer.text)
+    assert "思考過程較長" in messages[0]
+    assert all(tg._plain_length(message) <= tg.ANSWER_LIMIT for message in messages)
+    assert all(message.count("<b>") == message.count("</b>") for message in messages)
+
+
+def test_one_message_when_plain_content_fits_even_with_escaped_characters():
+    answer = make_answer("<&>" * 500, thinking="摘要")
+    messages = tg.answer_messages("問題", answer, answer.text)
+    assert len(messages) == 1
+    assert tg._plain_length(messages[0]) < tg.ANSWER_LIMIT
+
+
+def test_extra_notice_does_not_split_two_blocks(monkeypatch):
+    monkeypatch.setattr(tg, "ANSWER_LIMIT", 110)
+    answer = make_answer("答案", thinking="摘要")
+    messages = tg.answer_messages("問題", answer, answer.text, ["提示" * 50])
+    assert messages[0].count("<blockquote") == 2
+    assert messages[1] == "提示" * 50
+
+
+def test_entity_counts_are_logged_after_send_and_refusal_stays_plain(make_core, caplog):
+    class EntityBot(FakeBot):
+        async def edit_message_text(self, **kwargs):
+            await super().edit_message_text(**kwargs)
+            return SimpleNamespace(entities=[SimpleNamespace(type="expandable_blockquote"),
+                                             SimpleNamespace(type="expandable_blockquote"),
+                                             SimpleNamespace(type="bold"),
+                                             SimpleNamespace(type="bot_command")])
+
+    bot_core, _ = make_core(lambda model, question, on_tool: make_answer("出處 /s_a1b2c3"))
+    bot = EntityBot()
+    with caplog.at_level(logging.INFO, logger="haixia.bot"):
+        run(bot_core.handle_message(bot, CHAT, USER, "問題"))
+    assert "expandable_blockquote 2" in caplog.text
+    assert "bold 1" in caplog.text and "bot_command 1" in caplog.text
+    refused = make_answer(core.REFUSAL_TEXT.format(category=""), refused=True)
+    other, _ = make_core(lambda model, question, on_tool: refused)
+    plain_bot = FakeBot()
+    run(other.handle_message(plain_bot, CHAT, USER, "問題"))
+    assert "<blockquote" not in plain_bot.texts()[-1]
 
 
 # ---------- 指令 ----------
@@ -535,7 +709,7 @@ def test_single_worker_thread_queues_questions(make_core):
     assert len({call["thread"] for call in calls}) == 1 and calls[0]["thread"] != threading.get_ident()
     edits = bot.texts("edit")
     assert "查詢中…" in edits                           # 輪到第二題時把「排隊中」改掉
-    assert edits[-1].startswith("答：二") and any(text.startswith("答：一") for text in edits)
+    assert "答：二</blockquote>" in edits[-1] and any("答：一</blockquote>" in text for text in edits)
     assert bot_core.pending == 0
 
 
@@ -579,7 +753,7 @@ def test_progress_edits_are_rate_limited(make_core):
     edits = bot.texts("edit")
     assert edits[:-1] == ["查詢中…\n已搜尋：查詢1、查詢2、查詢3",
                           "查詢中…\n已搜尋：查詢2、查詢3、查詢4、查詢5（共 5 次）"]
-    assert edits[-1].startswith("最後答案")
+    assert "最後答案</blockquote>" in edits[-1]
     assert any(name == "action" and kwargs["action"] == "typing" for name, kwargs in bot.calls)
     assert tg.progress_text(["搜尋：甲", "讀前後文", "讀前後文"]) == "查詢中…\n已搜尋：甲\n已讀前後文 2 次"
 
@@ -609,7 +783,8 @@ def test_long_answer_edits_status_then_sends_rest(make_core):
     rest = messages[2:]
     assert rest and all(name == "send" and kwargs["parse_mode"] == "HTML" for name, kwargs in rest)
     assert all(tg.utf16_len(kwargs["text"]) <= tg.TELEGRAM_LIMIT for _, kwargs in messages)
-    assert "— Opus 5.5" in rest[-1][1]["text"]
+    assert "— Opus 5.5" not in rest[-1][1]["text"]
+    assert "（續）" in rest[-1][1]["text"]
 
 
 def test_bm25_fallback_and_server_fallback_are_noted(make_core):
@@ -619,7 +794,7 @@ def test_bm25_fallback_and_server_fallback_are_noted(make_core):
     bot = FakeBot()
     run(bot_core.handle_message(bot, CHAT, USER, "問題"))
     final = bot.texts()[-1]
-    assert final.startswith("答案")
+    assert "答案</blockquote>" in final
     assert "只用關鍵字搜尋" in final and "改由 claude-opus-5 回答" in final
 
 

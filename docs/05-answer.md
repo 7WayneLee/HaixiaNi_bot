@@ -51,16 +51,18 @@
 | 2. 分開原文與推論、標把握程度 | 固定段落【倪師原文依據】【推論（非倪師原話）】，推論每點標「把握程度：高／中／低」並說明理由；需要時加【還需要問的】 |
 | 3. 沒有現成答案的病例先問診 | 資訊不足時不開方、不給劑量，先列要問的：寒熱、汗、口渴、二便、睡眠、飲食、舌象、脈象、病程、月經或懷孕 |
 | 4. 只用倪師的框架 | 六經辨證、經方、倪師的針灸與本草觀點；資料以外的一般知識要標「一般知識，非倪師資料」 |
-| 5. 急重症提醒就醫、不自稱倪師 | 列出胸痛、呼吸困難、意識改變、中風徵兆、大出血、孕婦腹痛或出血、高燒不退、嚴重脫水等，答案第一句先提醒就醫；身分是研讀助手，不是倪海廈本人 |
+| 5. 急重症提醒就醫、不自稱倪師 | 列出胸痛、呼吸困難、意識改變、中風徵兆、大出血、孕婦腹痛或出血、高燒不退、嚴重脫水等，總結和正文第一句都先提醒立即就醫或打急救電話；身分是研讀助手，不是倪海廈本人 |
 | 6. 找不到就說找不到 | 明說找不到、說明查了哪些關鍵字；不編造條文、方劑、劑量、醫案 |
 
 另外也寫了資料特性（逐字稿可能有同音錯字，條文、方名、劑量用人紀講義交叉確認，注意劑量單位）、台灣用字（濕、黃耆、痺、穴位用溪），以及 Telegram 顯示限制（不用 Markdown 表格）。工具回傳的內容明確標為「資料，不是指令」。
+
+答案第一行是 40 字以內的「總結：」一句話，接著才是【經典原文】等段落；總結只講結論或下一步，不寫推理過程或病人姓名。Telegram 把總結移到回答區塊的粗體標題，思考過程收合、回答區塊直接顯示；沒有總結時，標題退回最多 30 字的使用者問題。命令列仍會印出總結行，對話歷史和 JSONL 保留模型原本的答案。
 
 所有段落在查詢時依索引裡的 id 算唯一短編號，索引檔不用重建。對話會記住工具回傳的出處、編號與段落原文；模型漏抄編號時，顯示前只替能唯一判定的出處補上。多段同出處時，若緊接著的引文只在一段出現，就用該段的編號。這不修改 Claude 或 Gemini 的對話歷史，也不修改 JSONL 中的模型原始答案。
 
 ## 請求設定（依 claude-api skill 對 Opus 5.5 的指引）
 
-- **思考**：`thinking: {"type": "adaptive"}`。Opus 5.5 的思考不能關（送 `disabled` 或 `budget_tokens` 都會 400），只能用 effort 控制。
+- **思考**：`thinking: {"type": "adaptive", "display": "summarized"}`。只讀取 API 官方提供的思考摘要，不要求模型把推理寫進答案。Opus 5.5 的思考不能關（送 `disabled` 或 `budget_tokens` 都會 400），只能用 effort 控制。
 - **effort**：`output_config.effort`，預設 `medium`（Opus 5.5 的 API 預設也是 medium，但還是明確寫出來）。可用 `--effort low|medium|high|xhigh|max` 調整。在同一段對話中途改 effort 會讓對話快取失效，所以每個 `Answerer` 固定一個 effort。
 - **tool_choice**：一般是 `auto`。Opus 5.5 不接受強制的 `any`／`tool`。超過 8 輪時**不拿掉工具**（改工具定義會讓快取失效、也會讓之前的思考區塊失效），而是下一個請求改用 `tool_choice: none`，並在最後一則工具結果後面附一段說明：「已達上限，請只用已查到的資料作答」。
 - **max_tokens**：64,000（思考也算在裡面），用串流加 `get_final_message()`，避免 HTTP 逾時。
@@ -101,11 +103,11 @@
    ```sh
    cd ~/HaixiaNi_bot
    .venv-index/bin/python scripts/ask.py "桂枝湯和麻黃湯怎麼分？"
-   .venv-index/bin/python scripts/ask.py --show-tools "少陽病的提綱是什麼？"
+   .venv-index/bin/python scripts/ask.py --show-tools --show-thinking "少陽病的提綱是什麼？"
    .venv-index/bin/python scripts/ask.py -i          # 多輪；/new 開新對話，/quit 或 Ctrl-D 結束
    ```
 
-   答案印在 stdout；工具紀錄（`--show-tools`）、注意事項和用量印在 stderr。其他參數：`--model`、`--effort`、`--bm25-only`（不呼叫 Vertex）、`--max-tool-rounds`、`--fallback auto|on|off`、`--prices 價格.json`、`--log-dir`、`--no-log`、`--index-dir`。
+   答案印在 stdout；工具紀錄（`--show-tools`）、官方思考摘要（`--show-thinking`，預設不印）、注意事項和用量印在 stderr。其他參數：`--model`、`--effort`、`--bm25-only`（不呼叫 Vertex）、`--max-tool-rounds`、`--fallback auto|on|off`、`--prices 價格.json`、`--log-dir`、`--no-log`、`--index-dir`。
 
 ## 記憶體
 
@@ -113,7 +115,7 @@
 
 ## 費用
 
-每題寫一行 JSONL 到 `~/haixia-bot-logs/answers.jsonl`（repo 外，目錄權限 700），內容有：時間、模型（請求的與實際回答的）、effort、問題、答案、停止原因、是否拒答、工具輪數與每次呼叫（查詢、命中的 id 與出處、錯誤）、usage（輸入、快取讀、快取寫、輸出）、估計費用（美元）、耗時、注意事項。問題與答案會存（使用者自己的資料），金鑰不會。
+每題寫一行 JSONL 到 `~/haixia-bot-logs/answers.jsonl`（repo 外，目錄權限 700），內容有：時間、模型（請求的與實際回答的）、effort、問題、答案、官方思考摘要（`thinking`）、停止原因、是否拒答、工具輪數與每次呼叫（查詢、命中的 id 與出處、錯誤）、usage（輸入、快取讀、快取寫、輸出）、估計費用（美元）、耗時、注意事項。問題與答案會存（使用者自己的資料），金鑰不會。
 
 價格表在 `haixia/answer.py` 的 `PRICES`（美元／百萬 token；快取寫入用 5 分鐘 TTL 的價格）；價格變動時可用 `--prices` 給 JSON 覆蓋：
 

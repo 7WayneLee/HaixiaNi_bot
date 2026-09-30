@@ -62,8 +62,37 @@ def text(value):
     return SimpleNamespace(type="text", text=value)
 
 
-def thinking():
-    return SimpleNamespace(type="thinking", thinking="", signature="sig")
+def thinking(value=""):
+    return SimpleNamespace(type="thinking", thinking=value, signature="sig")
+
+
+def test_summarized_thinking_from_every_claude_turn_is_logged_without_changing_history(index_dir, tmp_path):
+    first = thinking("先查經典")
+    second = thinking("再核對講義")
+    answerer, client = make(index_dir, [
+        reply([first, tool("t1", "search", {"query": "桂枝湯"})], "tool_use"),
+        reply([second, text("答案")]),
+    ])
+    answerer.log_dir = tmp_path
+    conversation = core.Conversation()
+    result = answerer.ask(conversation, "問題")
+    assert result.thinking == "先查經典\n\n再核對講義"
+    assert conversation.messages[1]["content"][0] is first
+    assert conversation.messages[-1]["content"][0] is second
+    assert client.calls[1]["thinking"]["display"] == "summarized"
+    assert json.loads((tmp_path / core.LOG_NAME).read_text())["thinking"] == result.thinking
+
+
+def test_cli_show_thinking_is_opt_in(capsys):
+    from scripts import ask
+
+    result = core.Answer(text="答案", thinking="官方摘要", stop_reason="end_turn", model=MODEL)
+    ask.show(result)
+    output = capsys.readouterr()
+    assert output.out == "答案\n" and "官方摘要" not in output.err
+    ask.show(result, show_thinking=True)
+    output = capsys.readouterr()
+    assert output.out == "答案\n" and "［思考過程］\n官方摘要" in output.err
 
 
 def tool(tool_id, name, data):
@@ -160,6 +189,7 @@ def test_request_params_for_opus_5_5(index_dir):
     assert params["model"] == "claude-opus-5-5"
     assert params["max_tokens"] == 64000
     assert params["thinking"]["type"] == "adaptive" and "budget_tokens" not in params["thinking"]
+    assert params["thinking"]["display"] == "summarized"
     assert params["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
     assert params["output_config"] == {"effort": "medium"}
     assert params["tool_choice"] == {"type": "auto"}
@@ -178,7 +208,7 @@ def test_request_params_for_sonnet_and_options(index_dir):
     params = answerer.request_params([])
     assert params["model"] == "claude-sonnet-5-5"
     assert params["output_config"] == {"effort": "low"}
-    assert params["thinking"] == {"type": "adaptive"}
+    assert params["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert "fallbacks" not in params and "betas" not in params
     forced, _ = make(index_dir, [], model="claude-sonnet-5", fallback=True)
     assert forced.request_params([])["fallbacks"] == "default"
@@ -204,10 +234,22 @@ def test_system_prompt_file_covers_the_six_rules():
         assert phrase in prompt, phrase
 
 
+def test_system_prompt_requires_summary_before_sections_and_emergency_repeat():
+    prompt = core.SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    structure = prompt.split("# 答案的結構\n", 1)[1].split("\n# ", 1)[0]
+    assert "答案第一行寫「總結：」" in structure
+    assert "40 字以內" in structure
+    assert "要先問哪些" in structure and "總結就寫找不到" in structure
+    assert structure.index("總結之後") < structure.index("【經典原文】")
+    assert "總結不要寫推理過程或病人姓名" in structure
+    assert "總結那一行和正文第一句都先提醒立即就醫或打急救電話" in prompt
+    assert "之後仍照常查經典與倪師資料，完整回答問題" in prompt
+
+
 def test_system_prompt_keeps_emergency_retrieval_and_needle_details():
     prompt = core.SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
     emergency = prompt.split("# 急重症\n", 1)[1].split("\n# ", 1)[0]
-    for phrase in ("答案第一句先提醒立即就醫或打急救電話", "仍要照常用工具查經典原文與倪師講義、逐字稿",
+    for phrase in ("總結那一行和正文第一句都先提醒立即就醫或打急救電話", "仍要照常用工具查經典原文與倪師講義、逐字稿",
                    "穴位、取穴、手法與先後順序", "病人醒著就不要十宣放血", "本人懂針灸、會自己下針",
                    "針灸或放血的內容照資料完整提供"):
         assert phrase in emergency, phrase
@@ -723,7 +765,8 @@ def test_real_sdk_request_shape_and_round_trip(index_dir):
     assert set(first.headers["anthropic-beta"].split(",")) == {core.BINDING_BETA, core.FALLBACK_BETA}
     body = json.loads(first.content)
     assert body["model"] == MODEL and body["stream"] is True and body["max_tokens"] == 64000
-    assert body["thinking"] == {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+    assert body["thinking"] == {"type": "adaptive", "display": "summarized",
+                                "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
     assert body["output_config"] == {"effort": "medium"} and body["fallbacks"] == "default"
     assert body["tool_choice"] == {"type": "auto"} and body["cache_control"] == {"type": "ephemeral"}
     assert body["system"][0]["cache_control"] == {"type": "ephemeral"}

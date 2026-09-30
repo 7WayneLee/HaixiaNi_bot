@@ -94,8 +94,9 @@ class Answerer:
             tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(
                 mode="AUTO" if allow_tools else "NONE")),
         )
-        if self.thinking_level != "default":
-            config.thinking_config = types.ThinkingConfig(thinking_level=self.thinking_level.upper())
+        config.thinking_config = types.ThinkingConfig(
+            include_thoughts=True,
+            **({"thinking_level": self.thinking_level.upper()} if self.thinking_level != "default" else {}))
         return config
 
     def ask(self, conversation, question, on_tool=None):
@@ -156,6 +157,9 @@ class Answerer:
             # 完整物件原樣追加；Part 裡的 thought_signature 不拆、不重建。
             messages.append(content)
             parts = content.parts or []
+            summaries = [part.text for part in parts if part.thought and part.text]
+            if summaries:
+                answer.thinking = "\n\n".join(filter(None, [answer.thinking, *summaries]))
             calls = [part.function_call for part in parts if part.function_call is not None]
             if calls and allow_tools and reason == "STOP":
                 answer.rounds += 1
