@@ -7,6 +7,7 @@
 import hashlib
 import re
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -218,6 +219,67 @@ def title_for(rel_path):
 # ---------- 轉文字 ----------
 
 TXT_ENCODINGS = ("utf-8-sig", "utf-16", "gb18030", "big5")
+
+# 依原 doc 的 Wingdings／Symbol 字型位置和句子上下文核對；其他私用碼無可靠字義。
+SYMBOL_FONT_CHARS = {"\uf0e0": "→", "\uf0e8": "⇒", "\uf0df": "←",
+                     "\uf04a": "☺", "\uf0b2": "•"}
+
+
+def clean_extracted_text(text):
+    """只替換抽取器產生的私用碼與替代字元，保留其餘文字。"""
+    text = "".join(SYMBOL_FONT_CHARS.get(char, char) for char in text)
+
+    def replace_unknown(match):
+        before = text[match.start() - 1] if match.start() else ""
+        after = text[match.end()] if match.end() < len(text) else ""
+        if not before or not after or before.isspace() or after.isspace():
+            return ""
+        return " "
+
+    return re.sub(r"[\ue000-\uf8ff\ufffd]+", replace_unknown, text)
+
+
+def _garbage_ratio(text):
+    """MacRoman 誤解碼常見字元比例；正常省略號、破折號、中點不計。"""
+    if not text:
+        return 0.0, 0.0
+    suspicious = sum((0x80 <= ord(c) <= 0x24f or 0x370 <= ord(c) <= 0x3ff
+                      or 0x2200 <= ord(c) <= 0x22ff or c in "ﬁﬂ\uf8ff"
+                      or unicodedata.category(c) == "Cc") and c not in "\n\r\t" for c in text)
+    han = sum("\u3400" <= c <= "\u9fff" for c in text)
+    return suspicious / len(text), han / len(text)
+
+
+def is_garbage(text, min_length=20):
+    """兩種訊號同時成立才丟，避免正常的西文或中文標點誤判。"""
+    bad, han = _garbage_ratio(text)
+    return len(text) >= min_length and bad >= 0.30 and han < 0.10
+
+
+_WORD_FIELD = re.compile(r"\x13[^\x14]*\x14")
+_WORD_SEPARATORS = re.compile(r"[\r\x07\x0b]+")
+_WORD_ALLOWED = re.compile(r"[^\u3400-\u9fff\u2000-\u206f\u3000-\u303f\uff00-\uffef\x20-\x7e\n\t·→⇒←☺•]+")
+
+
+def recover_word_utf16(data):
+    """從 SAT 損壞的 OLE 位元組裡按原順序救出 UTF-16LE 內文。"""
+    decoded = data.decode("utf-16le", errors="replace")
+    paragraphs = []
+    fields = 0
+    for piece in _WORD_SEPARATORS.split(decoded):
+        piece, count = _WORD_FIELD.subn(" ", piece)
+        fields += count
+        piece = _WORD_ALLOWED.sub(" ", piece).replace("\n", " ").replace("\t", " ")
+        piece = clean_extracted_text(piece).strip()
+        if not piece or re.search(r"\b(?:PAGEREF|HYPERLINK|_Toc\d+|MERGEFORMAT)\b", piece):
+            continue
+        han = sum("\u3400" <= c <= "\u9fff" for c in piece)
+        uncommon = sum("\u3400" <= c <= "\u4dbf" for c in piece)
+        latin = sum("a" <= c.lower() <= "z" for c in piece)
+        if han < 5 or uncommon > han * 0.05 or latin > han * 2 or is_garbage(piece):
+            continue
+        paragraphs.append(piece)
+    return paragraphs, {"recovered_chars": sum(len(p) for p in paragraphs), "field_codes_removed": fields}
 
 
 def decode_txt(data):

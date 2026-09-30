@@ -62,7 +62,8 @@ scripts/sync_index.sh pull-ocr ~/haixia-index-build
 .venv/bin/python scripts/build_index.py chunks
 ```
 
-- 轉文字：`.doc`／`.docx`／`.htm` 用 macOS `textutil`；`.txt` 依序試 utf-8-sig、utf-16、gb18030、big5；PDF 用 PyMuPDF 逐頁；CHM 用 `7zz`（`brew install sevenzip`）解開後逐頁 `textutil`；沒有副檔名但檔頭是 OLE 的當 Word。
+- 轉文字：`.doc`／`.docx`／`.htm` 用 macOS `textutil`；`.txt` 依序試 utf-8-sig、utf-16、gb18030、big5；PDF 用 PyMuPDF 逐頁；CHM 用 `7zz`（`brew install sevenzip`）解開後逐頁 `textutil`；沒有副檔名但檔頭是 OLE 的當 Word。若舊版 Word 的抽取結果呈現 MacRoman 亂碼，從原始位元組的 UTF-16LE 文字片段救回內文，並在報告記錄檔案與救回字數。
+- 文件段落和 LRC 會在轉正體前清理 Word 符號字型的私用碼；仍呈亂碼的段落不進索引，數量記在 `dropped_garbage`。
 - PDF 的處理：依頁面旋轉轉座標、略過直排側欄與浮水印；在許多頁同一位置重複的頁首、頁尾、頁碼移除；一張紙印兩頁的先左欄後右欄；假粗體（同一字重畫多次）只留一次。
 - 顯示文字一律經 `to_traditional`；比對、去重、BM25 一律用 `search_key`。
 - 標題：去掉「（（守候诚实）淘宝店）」「(神州医料库）」「（二羊中医馆）」等來源標記和副檔名再轉正體；959 篇醫案的檔名是 Big5 被當成 GBK 的亂碼，會先轉回來。

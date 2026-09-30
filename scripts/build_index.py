@@ -115,6 +115,7 @@ class Extractor:
 
     def __init__(self, cache_dir, ocr_dir):
         self.cache = Path(cache_dir)
+        self.repaired = {}
         self.ocr = {}
         for path in sorted(Path(ocr_dir).glob("*.pages.json")) if Path(ocr_dir).exists() else []:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -129,7 +130,22 @@ class Extractor:
         return value
 
     def doc_text(self, path, md5):
-        return self._cached("text", md5, lambda: corpus.textutil_text(path))
+        try:
+            raw = self._cached("text", md5, lambda: corpus.textutil_text(path))
+        except ValueError:
+            raw = None
+        if raw is None or corpus.is_garbage(raw):
+            data = path.read_bytes()
+            if not data.startswith(corpus.OLE_MAGIC):
+                if raw is None:
+                    raise ValueError("textutil 失敗")
+                return raw
+            paragraphs, info = corpus.recover_word_utf16(data)
+            if not paragraphs:
+                raise ValueError("Word 文字無法修復")
+            self.repaired[md5] = info
+            return "\n".join(paragraphs)
+        return raw
 
     def pages(self, item):
         """回傳 [(頁碼或 None, 段落)]；CHM 另外處理。"""
@@ -259,7 +275,7 @@ def rar_check(items, cache_dir, raw_dir, private_path):
             "note": "未對到的檔案沒有自動加入索引"}
 
 
-def lrc_segments(path):
+def lrc_segments(path, stats=None):
     from scripts.lrc_to_transcript import STAMP, parse_lrc, read_lrc
 
     lines = []
@@ -271,7 +287,7 @@ def lrc_segments(path):
     # 有幾個檔的時間標記前後顛倒（差不到 1 秒），依時間穩定排序後再解析。
     lines.sort(key=lambda entry: entry[0])
     # 沒有音檔長度；以最後一條字幕後 5 秒當結尾。
-    return parse_lrc("\n".join(line for _stamp, line in lines), lines[-1][0] + 5.0)
+    return parse_lrc("\n".join(line for _stamp, line in lines), lines[-1][0] + 5.0, stats=stats)
 
 
 def lrc_episode(name):
@@ -326,7 +342,7 @@ def cmd_chunks(args):
 
     stats = defaultdict(lambda: {"files": 0, "paragraphs_before": 0, "chars_before": 0,
                                  "paragraphs_after": 0, "chars_after": 0, "boilerplate_paragraphs": 0,
-                                 "dropped_paragraph": 0, "dropped_sentence": 0,
+                                 "dropped_paragraph": 0, "dropped_sentence": 0, "dropped_garbage": 0,
                                  "chunks": 0, "chunk_chars": 0})
     errors = []
     temp = out_dir / ".chunks.jsonl.tmp"
@@ -374,7 +390,9 @@ def cmd_chunks(args):
         # 2. 梁冬對話 LRC
         for item in (i for i in kept if i["group"] == "lrc"):
             try:
-                segments = lrc_segments(item["path"])
+                lrc_stats = {}
+                segments = lrc_segments(item["path"], lrc_stats)
+                stats["lrc"]["dropped_garbage"] += lrc_stats.get("dropped_garbage", 0)
             except (OSError, ValueError) as error:
                 errors.append({"path": item["rel"], "error": str(error)})
                 continue
@@ -387,7 +405,8 @@ def cmd_chunks(args):
         # 3. 文件：依組別優先序做段落去重
         deduper = ParagraphDeduper()
         file_details = []
-        documents = sorted((i for i in kept if i["group"] not in ("lrc", "asr")), key=keep_order)
+        documents = sorted((i for i in kept if i["group"] not in ("lrc", "asr")),
+                           key=lambda i: (i["md5"] in extractor.repaired, keep_order(i)))
         log(f"切 {len(documents)} 個文件（段落去重順序：人紀 → 天紀 → 單篇醫案 → 日誌 → 文章 → 彙編）")
         failed_md5 = {i["md5"] for i in failures}
         for item in documents:
@@ -422,6 +441,12 @@ def cmd_chunks(args):
                     stats[group]["paragraphs_before"] += 1
                     stats[group]["chars_before"] += len(paragraph)
                     detail["chars_before"] += len(paragraph)
+                    paragraph = corpus.clean_extracted_text(paragraph)
+                    if not paragraph.strip():
+                        continue
+                    if corpus.is_garbage(paragraph):
+                        stats[group]["dropped_garbage"] += 1
+                        continue
                     if corpus.is_boilerplate(paragraph):
                         stats[group]["boilerplate_paragraphs"] += 1
                         continue
@@ -457,8 +482,12 @@ def cmd_chunks(args):
         "total_chunk_chars": sum(v["chunk_chars"] for v in stats.values()),
         "documents_chars_before_dedupe": doc_before,
         "documents_chars_after_dedupe": doc_after,
+        "dropped_garbage": sum(v["dropped_garbage"] for v in stats.values()),
         "groups": groups,
         "files": file_details,
+        "repaired_word_files": [{"path": corpus.safe_path(i["rel"], i["md5"]), "md5": i["md5"],
+                                 **extractor.repaired[i["md5"]]}
+                                for i in items if i["md5"] in extractor.repaired],
         "skipped": sorted(skipped, key=lambda s: s["path"]),
         "errors": errors,
         "warnings": warnings,

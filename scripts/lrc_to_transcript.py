@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from haixia.textnorm import to_traditional
+from haixia.corpus import clean_extracted_text, is_garbage
 from haixia.transcript import create, save
 
 STAMP = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
@@ -33,7 +34,7 @@ def _name(text):
     return SPEAKER_FIXES.get(name, name)
 
 
-def _entries(content):
+def _entries(content, stats=None):
     """先移除網址與製作名單；其餘文字留待頻率判斷。"""
     for raw in content.splitlines():
         match = STAMP.match(raw.strip())
@@ -43,19 +44,26 @@ def _entries(content):
         line = match[3].strip()
         if not line or URL.search(line):
             continue
+        line = clean_extracted_text(line)
+        if is_garbage(line):
+            if stats is not None:
+                stats["dropped_garbage"] = stats.get("dropped_garbage", 0) + 1
+            continue
+        if not line.strip():
+            continue
         normalized = to_traditional(line)
         if normalized.startswith(("字幕製作", "義務工作群", "字幕由")):
             continue
         yield start, line
 
 
-def parse_lrc(content, duration, min_speaker_count=10):
+def parse_lrc(content, duration, min_speaker_count=10, stats=None):
     """回傳不含引擎資訊的段落，結束時間為下一條有效字幕起點。"""
     if duration <= 0:
         raise ValueError("duration 必須大於零")
     if min_speaker_count < 1:
         raise ValueError("min_speaker_count 必須大於零")
-    entries = list(_entries(content))
+    entries = list(_entries(content, stats))
     counts = Counter(_name(match[1]) for _, line in entries
                      if (match := SPEAKER.match(line)))
     speakers = {name for name, count in counts.items() if count >= min_speaker_count}
