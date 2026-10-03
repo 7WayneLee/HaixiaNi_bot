@@ -151,6 +151,158 @@ def write_log(log_dir, entries):
                       + "\n")
 
 
+def _message(text=None, *, user_id=USER, is_bot=False, **fields):
+    """自行建立 PTB 訊息，不初始化連線。"""
+    telegram = pytest.importorskip("telegram")
+    return telegram.Message(message_id=1, date=datetime(2026, 10, 3, tzinfo=timezone.utc),
+                            chat=telegram.Chat(CHAT, "private"),
+                            from_user=telegram.User(user_id, "測試", is_bot), text=text, **fields)
+
+
+def _external_reply():
+    telegram = pytest.importorskip("telegram")
+    origin = telegram.MessageOriginHiddenUser(datetime(2026, 10, 3, tzinfo=timezone.utc), "測試來源")
+    return telegram.ExternalReplyInfo(origin)
+
+
+def _receive(bot_core, bot, message):
+    """走正式 on_message 入口，確認 PTB 的回覆欄位傳入核心。"""
+    telegram = pytest.importorskip("telegram")
+    application = tg.build_application(bot_core, "123456:TEST-TOKEN-NOT-REAL")
+    handler = application.handlers[0][0]
+    run(handler.callback(telegram.Update(1, message=message), SimpleNamespace(bot=bot)))
+
+
+# ---------- 回覆與選取引用 ----------
+
+@pytest.mark.parametrize("caption", [False, True])
+def test_reply_bot_answer_removes_thinking_using_utf16(make_core, caption):
+    telegram = pytest.importorskip("telegram")
+    original = "😀標頭\n思考𠀀🙂\n答案𠀀🙂 /s_a1b2c3"
+    # 😀 在區塊前面，𠀀🙂 在區塊裡和答案裡；位移與長度都是 UTF-16 單位。
+    entity = telegram.MessageEntity("expandable_blockquote", offset=5, length=6)
+    fields = {"caption": original, "caption_entities": [entity]} if caption else {
+        "text": original, "entities": [entity]}
+    replied = _message(user_id=9000, is_bot=True, **fields)
+    message = _message("再說明這段", reply_to_message=replied)
+    bot_core, pool = make_core(lambda model, question, on_tool: make_answer("新的答案"))
+    bot = FakeBot()
+    _receive(bot_core, bot, message)
+    expected = "【我回覆的訊息】（bot 之前的回覆）\n😀標頭\n\n答案𠀀🙂 /s_a1b2c3\n\n【問題】\n再說明這段"
+    assert pool.all_calls()[0]["question"] == expected
+    assert bot_core.state(CHAT).conversation.messages[0]["content"] == expected
+    assert "<blockquote><b>再說明這段</b>\n新的答案" in bot.texts()[-1]
+    assert "【我回覆的訊息】" not in bot.texts()[-1]
+    assert replied.text == (None if caption else original)
+
+
+def test_reply_source_removes_multiple_expandable_blocks():
+    telegram = pytest.importorskip("telegram")
+    original = "原文資訊😀\n前一段𠀀\n這一段😀\n後一段🙂"
+    entities = [telegram.MessageEntity("expandable_blockquote", 7, 5),
+                telegram.MessageEntity("expandable_blockquote", 19, 5)]
+    replied = _message(original, user_id=9000, is_bot=True, entities=entities)
+    result = tg.reply_question("解釋本段", _message("解釋本段", reply_to_message=replied), USER)
+    assert result == "【我回覆的訊息】（bot 之前的回覆）\n原文資訊😀\n\n這一段😀\n\n【問題】\n解釋本段"
+
+
+def test_selected_quote_keeps_chosen_thinking_and_omits_rest(make_core):
+    telegram = pytest.importorskip("telegram")
+    replied = _message("思考𠀀\n完整答案", user_id=9000, is_bot=True,
+                       entities=[telegram.MessageEntity("expandable_blockquote", 0, 4)])
+    message = _message("這句的意思？", reply_to_message=replied,
+                       quote=telegram.TextQuote("思考𠀀", position=0))
+    bot_core, pool = make_core()
+    _receive(bot_core, FakeBot(), message)
+    assert pool.all_calls()[0]["question"] == (
+        "【我引用的內容】（出自 bot 之前的回覆）\n思考𠀀\n\n【問題】\n這句的意思？")
+
+
+def test_external_reply_with_quote(make_core):
+    telegram = pytest.importorskip("telegram")
+    message = _message("怎麼理解？", external_reply=_external_reply(),
+                       quote=telegram.TextQuote("別的聊天選取的段落😀", position=3))
+    bot_core, pool = make_core()
+    _receive(bot_core, FakeBot(), message)
+    assert pool.all_calls()[0]["question"] == (
+        "【我引用的內容】（其他聊天的訊息）\n別的聊天選取的段落😀\n\n【問題】\n怎麼理解？")
+
+
+def test_external_reply_without_quote_logs_info_without_content(make_core, caplog):
+    message = _message("本次測試問題", external_reply=_external_reply())
+    bot_core, pool = make_core()
+    with caplog.at_level(logging.INFO, logger="haixia.bot"):
+        _receive(bot_core, FakeBot(), message)
+    assert pool.all_calls()[0]["question"] == "本次測試問題"
+    records = [record for record in caplog.records if "其他聊天的回覆" in record.getMessage()]
+    assert len(records) == 1 and records[0].levelno == logging.INFO
+    assert "本次測試問題" not in caplog.text and "測試來源" not in caplog.text
+
+
+@pytest.mark.parametrize("quote", [False, True])
+def test_reply_own_message_preserves_content(make_core, quote):
+    telegram = pytest.importorskip("telegram")
+    replied = _message("我先前寫的內容\n收合的補充", entities=[
+        telegram.MessageEntity("expandable_blockquote", 8, 5)])
+    fields = {"quote": telegram.TextQuote("收合的補充", position=8)} if quote else {}
+    message = _message("補問", reply_to_message=replied, **fields)
+    bot_core, pool = make_core()
+    _receive(bot_core, FakeBot(), message)
+    title, content = ("【我引用的內容】", "收合的補充") if quote else (
+        "【我回覆的訊息】", "我先前寫的內容\n收合的補充")
+    assert pool.all_calls()[0]["question"] == f"{title}（我之前的訊息）\n{content}\n\n【問題】\n補問"
+
+
+def test_reply_only_thinking_keeps_original(make_core):
+    telegram = pytest.importorskip("telegram")
+    original = " \n思考𠀀🙂\n\t"
+    replied = _message(original, user_id=9000, is_bot=True,
+                       entities=[telegram.MessageEntity("expandable_blockquote", 2, 6)])
+    message = _message("這段呢？", reply_to_message=replied)
+    bot_core, pool = make_core()
+    _receive(bot_core, FakeBot(), message)
+    assert pool.all_calls()[0]["question"] == f"【我回覆的訊息】（bot 之前的回覆）\n{original}\n\n【問題】\n這段呢？"
+
+
+@pytest.mark.parametrize("origin", ["reply", "quote", "external"])
+@pytest.mark.parametrize("length", [2000, 2001])
+def test_reply_content_limit_counts_characters(origin, length):
+    telegram = pytest.importorskip("telegram")
+    content = "𠀀" * length
+    replied = _message(content, user_id=9000, is_bot=True)
+    fields = {"external_reply": _external_reply()} if origin == "external" else {"reply_to_message": replied}
+    if origin != "reply":
+        fields["quote"] = telegram.TextQuote(content, position=0)
+    result = tg.reply_question("追問", _message("追問", **fields), USER)
+    included = result.split("\n", 1)[1].split("\n\n【問題】", 1)[0]
+    assert included == "𠀀" * 2000 + ("…（後略）" if length > 2000 else "")
+    assert result.endswith("【問題】\n追問")
+
+
+@pytest.mark.parametrize("command", ["/help", "/new", "/model sonnet", "/foo", "/s_5a5a5a", "原文 5a5a5a"])
+def test_reply_commands_do_not_attach_context(make_core, case_store, caplog, command):
+    message = _message(command, reply_to_message=_message("舊答案", user_id=9000, is_bot=True),
+                       external_reply=_external_reply())
+    bot_core, pool = make_core(store=case_store)
+    bot = FakeBot()
+    with caplog.at_level(logging.INFO, logger="haixia.bot"):
+        _receive(bot_core, bot, message)
+    assert pool.all_calls() == [] and bot.texts()
+    assert not any("【我回覆的訊息】" in text or "舊答案" in text for text in bot.texts())
+    assert "其他聊天的回覆" not in caplog.text
+
+
+@pytest.mark.parametrize("replied", [None, "non_text"])
+def test_message_without_reply_content_behaves_as_before(make_core, replied):
+    fields = {} if replied is None else {"reply_to_message": _message(user_id=9000, is_bot=True)}
+    message = _message("  一般問題  ", **fields)
+    bot_core, pool = make_core(lambda model, question, on_tool: make_answer("答案"))
+    bot = FakeBot()
+    _receive(bot_core, bot, message)
+    assert pool.all_calls()[0]["question"] == "一般問題"
+    assert "<blockquote><b>一般問題</b>\n答案</blockquote>" in bot.texts()[-1]
+
+
 # ---------- 設定與白名單 ----------
 
 def test_parse_allowed_ids():
@@ -589,6 +741,7 @@ def test_new_command_and_help(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "/start"))
     help_text = bot.texts()[-1]
     for words in ("/model 換模型", "/new 開新對話", "/cost 看花費", "/source 編號 看原文", "/s_…",
+                  "回覆 bot 的訊息再問，bot 會看到那段。",
                   "目前模型：Opus 5.5", "每日上限：2.500 USD ≈ 80.0 TWD"):
         assert words in help_text
     # 只寫給自己看：不重複免責聲明、不解釋答案格式

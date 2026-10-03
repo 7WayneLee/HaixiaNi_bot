@@ -372,6 +372,16 @@
     - `/cost` 依 JSONL 的 `model` 分開列 Claude（Anthropic 帳單）和 Gemini（GCP 帳單），今天和本月各有合計；每日上限仍算合計。金額一律「x.xxx USD ≈ y.y TWD」，共用 `money()`。
     - 使用者說 bot 只有自己用，文案要簡單：`/help`、排隊、開新對話、每日上限、錯誤、`/source` 提示都改成短句，拿掉給別人看的說明。答案內容和格式不變。
     - README 依現況重寫：功能、架構、資料規模、進度、文件、目錄、費用、隱私；不含電子郵件、Telegram ID、bot 帳號、token、病人資料。
+  - 2026-10-03 回覆與引用追問（程式：Orca 派 Codex GPT-6.1-Sol xhigh，655 個測試通過；文件：Orca 派 Antigravity Gemini 3.8 Flash High）：
+    - 回覆 bot 的訊息再問：被回覆的文字一起交給模型，bot 的答案會拿掉收合的思考區塊（依 UTF-16 entity offset）。
+    - 選取引用（quote）只帶選取的文字；引用其他聊天的訊息只帶得到選取的文字。超過 2,000 字截斷。
+    - 交給模型的格式：【我回覆的訊息】或【我引用的內容】＋來源，接著【問題】。JSONL 記組好的問題，Telegram 標題用使用者這次打的字。
+    - `read_context`、`classic_commentary` 也接受出處編號（`/s_…`、`s_…` 或至少 4 碼的唯一前綴）。
+    - 派工經過：
+      - Codex 第一次啟動時自動更新（0.159 → 0.160），派的工作被當成確認鍵吃掉。
+      - 之後 4 次卡在 agent_readiness：Orca 命令列已是 1.4.218，但執行中的主程式還是 1.4.212；使用者重啟 Orca 後就正常。
+      - Antigravity 兩次在 agy 啟動登入時就貼上任務，被吃掉（畫面停在空白輸入框）。改用 `--terminal` 交給已登入、待命的 agy 分頁就成功。
+      - Orca 重啟會清掉 scratchpad，等待用的 `wait_workers.py` 要重建。
 - [ ] 第五步：Telegram bot（2026-09-29 部署完成，待使用者實測）
   - 程式：commit 4b89cc1，515 個測試通過。
     - 前半由 Claude Code worker 撰寫；Claude 5 小時額度到 84% 時，依使用者指示「Work 你可以用 codex」停掉，改由 Codex 接手。

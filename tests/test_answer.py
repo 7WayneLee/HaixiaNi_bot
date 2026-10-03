@@ -5,6 +5,7 @@
 
 import copy
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ import pytest
 
 from haixia import answer as core
 from haixia.index_store import IndexStore, build_db
+from haixia.search import CitationStore
 
 REPO = Path(__file__).resolve().parents[1]
 MODEL = "claude-opus-5-5"
@@ -472,6 +474,98 @@ def test_read_context_tool_text(index_dir):
     store.close()
 
 
+@pytest.fixture
+def citation_store(tmp_path):
+    """只有虛構經文與講解的小索引，包含一組不唯一的前綴。"""
+    records = [
+        chunk("a1b2c30000000001", "虛構經典/甲.txt", "甲段測試原文。", kind="classic",
+              title="測試經典甲", episode="第1段"),
+        chunk("a1b2c40000000002", "虛構經典/乙.txt", "乙段測試原文。", kind="classic",
+              title="測試經典乙", episode="第2段"),
+        chunk("d4e5000000000003", "虛構講義/甲.txt", "甲段的測試講解。", kind="document",
+              title="測試講義", episode=None, start=None, end=None),
+    ]
+    path = tmp_path / "citations"
+    path.mkdir()
+    chunks_path = path / "chunks.jsonl"
+    chunks_path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records), encoding="utf-8")
+    build_db(chunks_path, path / "index.sqlite", log=lambda _: None)
+    with sqlite3.connect(path / "index.sqlite") as connection:
+        connection.execute("INSERT INTO classic_links VALUES (?,?,?,?,?,?)", (
+            "a1b2c30000000001", "d4e5000000000003", "document", 1.0, "測試連結", "1"))
+    store = CitationStore(path)
+    yield store
+    store.close()
+
+
+@pytest.mark.parametrize("name", ["read_context", "classic_commentary"])
+@pytest.mark.parametrize("code", ["a1b2c3", "/s_a1b2c3", "s_A1B2C3", "/s_a1b2c30000000001"])
+def test_tools_resolve_unique_citation_codes(citation_store, name, code):
+    conversation, calls = core.Conversation(), []
+    result, failed = core.execute_tool(SimpleNamespace(store=citation_store), name, {"id": code},
+                                        1, calls, conversation=conversation)
+    assert not failed and calls[0]["error"] is None
+    if name == "read_context":
+        assert "[命中段落] id=a1b2c30000000001" in result and "甲段測試原文。" in result
+        assert "內文見先前的搜尋結果" not in result
+        assert calls[0]["hits"][0]["id"] == "a1b2c30000000001"
+    else:
+        assert "id=d4e5000000000003" in result and "甲段的測試講解。" in result
+        assert "講義第1條" in result
+    assert conversation.citations
+
+
+def test_read_context_accepts_four_digit_prefix(citation_store):
+    result, failed = core.execute_tool(SimpleNamespace(store=citation_store), "read_context",
+                                        {"id": "d4e5", "before": 0, "after": 0}, 1, [])
+    assert not failed and "甲段的測試講解。" in result and "id=d4e5000000000003" in result
+
+
+@pytest.mark.parametrize("name", ["read_context", "classic_commentary"])
+@pytest.mark.parametrize("code, message", [
+    ("ffff", "找不到出處編號：ffff。索引更新過的話，舊編號會失效。"),
+    ("/s_ffff", "找不到出處編號：/s_ffff。索引更新過的話，舊編號會失效。"),
+    ("a1b2", "出處編號 a1b2 對應到不只一段，請多給幾碼。"),
+    ("s_a1b2", "出處編號 s_a1b2 對應到不只一段，請多給幾碼。"),
+    ("/s_abc", "出處編號要是至少 4 碼的十六進位字元，可帶 /s_ 或 s_ 開頭"),
+    ("s_非編號", "出處編號要是至少 4 碼的十六進位字元，可帶 /s_ 或 s_ 開頭"),
+])
+def test_citation_tool_errors_are_clear(citation_store, name, code, message):
+    calls = []
+    result, failed = core.execute_tool(SimpleNamespace(store=citation_store), name, {"id": code}, 1, calls)
+    assert failed and result == message and calls[0]["error"] == message
+    assert calls[0]["hits"] == []
+
+
+def test_full_classic_id_and_non_classic_citation(citation_store):
+    result, failed = core.execute_tool(SimpleNamespace(store=citation_store), "classic_commentary",
+                                        {"id": "a1b2c30000000001"}, 1, [])
+    assert not failed and "甲段的測試講解。" in result
+    result, failed = core.execute_tool(SimpleNamespace(store=citation_store), "classic_commentary",
+                                        {"id": "/s_d4e5"}, 1, [])
+    assert failed and result == "找不到經典段落 id：/s_d4e5"
+
+
+def test_citation_lookup_runs_without_search_and_sets_tool_result_error(index_dir, citation_store):
+    answerer, client = make(index_dir, [
+        reply([tool("t1", "read_context", {"id": "/s_a1b2c3"}),
+               tool("t2", "classic_commentary", {"id": "a1b2"})], "tool_use"),
+        reply([text("測試答案")]),
+    ])
+    answerer.searcher = SimpleNamespace(store=citation_store)
+    result = answerer.ask(core.Conversation(), "請讀這段 /s_a1b2c3")
+    blocks = client.calls[1]["messages"][-1]["content"]
+    assert "甲段測試原文。" in blocks[0]["content"] and "is_error" not in blocks[0]
+    assert blocks[1]["is_error"] is True and "對應到不只一段" in blocks[1]["content"]
+    assert [call["name"] for call in result.tool_calls] == ["read_context", "classic_commentary"]
+
+
+def test_tool_descriptions_accept_citation_codes():
+    for definition in core.TOOLS:
+        if definition["name"] in ("read_context", "classic_commentary"):
+            assert "出處裡的編號（例如 /s_a1b2c3）" in definition["description"]
+
+
 def test_validate_input_defaults():
     assert core.validate_input("search", {"query": " 桂枝湯 "}) == {"query": "桂枝湯", "kind": "any", "k": 8}
     assert core.validate_input("read_context", {"id": "a1"}) == {"id": "a1", "before": 1, "after": 1}
@@ -685,6 +779,21 @@ def test_answer_totals_and_jsonl_log(index_dir, tmp_path):
     assert entry["usage"] == result.usage and entry["cost_usd"] == pytest.approx(expected)
     assert entry["tool_calls"][0]["hits"] and entry["error"] is None
     assert (log_dir.stat().st_mode & 0o777) == 0o700
+
+
+def test_reply_question_is_model_input_history_and_jsonl_question(index_dir, tmp_path):
+    from haixia.telegram_bot import reply_question
+
+    replied = SimpleNamespace(text="虛構舊答案 /s_a1b2c3", from_user=SimpleNamespace(is_bot=True))
+    question = reply_question("說明這段", SimpleNamespace(reply_to_message=replied), 1001)
+    answerer, client = make(index_dir, [reply([text("測試答案")])], log_dir=tmp_path / "logs")
+    conversation = core.Conversation()
+    answerer.ask(conversation, question)
+    expected = "【我回覆的訊息】（bot 之前的回覆）\n虛構舊答案 /s_a1b2c3\n\n【問題】\n說明這段"
+    assert client.calls[0]["messages"][0]["content"] == expected
+    assert conversation.messages[0]["content"] == expected
+    entry = json.loads((tmp_path / "logs" / core.LOG_NAME).read_text(encoding="utf-8"))
+    assert entry["question"] == expected
 
 
 def test_api_error_is_logged_without_message(index_dir, tmp_path):

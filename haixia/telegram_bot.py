@@ -32,6 +32,7 @@ log = logging.getLogger("haixia.bot")
 TAIPEI = timezone(timedelta(hours=8), "Asia/Taipei")   # 台灣沒有日光節約時間，用固定時差
 TWD_PER_USD = 32
 TELEGRAM_LIMIT = 4096
+REPLY_LIMIT = 2000             # 交給模型的回覆或引用內容，依 Python 字數計
 ANSWER_LIMIT = 3900            # 依解析後純文字計，留給 Telegram 一點餘裕
 DEFAULT_DAILY_BUDGET = 3.0
 IDLE_RESET_SEC = 6 * 3600
@@ -201,6 +202,56 @@ def resolve_model(arg):
 def normalize_code(arg):
     found = _CODE.match((arg or "").strip())
     return found.group(1).lower() if found else None
+
+
+def _reply_text(message, is_bot):
+    """取文字或媒體說明；bot 的收合區塊以 UTF-16 位移移除。"""
+    text = getattr(message, "text", None)
+    if text:
+        entities = getattr(message, "entities", None) or ()
+    else:
+        text = getattr(message, "caption", None) or ""
+        entities = getattr(message, "caption_entities", None) or ()
+    if not text or not is_bot:
+        return text
+    encoded = text.encode("utf-16-le")
+    blocks = [entity for entity in entities if entity.type == "expandable_blockquote"]
+    # 從後面移除，前面的 entity 位移才不會改變；同樣適用擴充區漢字與 emoji。
+    for entity in sorted(blocks, key=lambda item: item.offset, reverse=True):
+        start, end = entity.offset * 2, (entity.offset + entity.length) * 2
+        encoded = encoded[:start] + encoded[end:]
+    remaining = encoded.decode("utf-16-le").strip()
+    return remaining if remaining else text
+
+
+def reply_question(question, message, user_id):
+    """把回覆或選取引用接在本次問題前；呼叫端先處理授權與指令。"""
+    quoted = getattr(getattr(message, "quote", None), "text", None)
+    external = getattr(message, "external_reply", None)
+    replied = getattr(message, "reply_to_message", None)
+    if external is not None:
+        if not quoted:
+            log.info("其他聊天的回覆沒有引用文字，照一般問題處理")
+            return question
+        content, source = quoted, "（其他聊天的訊息）"
+    elif replied is not None:
+        sender = getattr(replied, "from_user", None)
+        is_bot = bool(getattr(sender, "is_bot", False))
+        if is_bot:
+            source = "（出自 bot 之前的回覆）" if quoted else "（bot 之前的回覆）"
+        elif getattr(sender, "id", None) == user_id:
+            source = "（我之前的訊息）"
+        else:
+            source = "（聊天裡的訊息）"
+        content = quoted if quoted else _reply_text(replied, is_bot)
+    else:
+        return question
+    if not content or not content.strip():
+        return question
+    if len(content) > REPLY_LIMIT:
+        content = content[:REPLY_LIMIT] + "…（後略）"
+    title = "【我引用的內容】" if quoted else "【我回覆的訊息】"
+    return f"{title}{source}\n{content}\n\n【問題】\n{question}"
 
 
 # ---------- 格式 ----------
@@ -735,6 +786,7 @@ def source_messages(target, previous, following):
 
 def help_text(model, budget):
     return f"""直接打問題，病例寫越詳細越好。
+回覆 bot 的訊息再問，bot 會看到那段。
 
 /model 換模型
 /new 開新對話
@@ -965,7 +1017,7 @@ class BotCore:
 
     # ----- 訊息進來 -----
 
-    async def handle_message(self, bot, chat_id, user_id, text):
+    async def handle_message(self, bot, chat_id, user_id, text, *, message=None):
         if not self.is_allowed(user_id):
             log.warning("拒絕 user_id=%s", user_id)
             return
@@ -979,7 +1031,8 @@ class BotCore:
         if command is not None:
             await self.handle_command(bot, chat_id, command)
         else:
-            await self.handle_question(bot, chat_id, text)
+            question = reply_question(text, message, user_id)
+            await self.handle_question(bot, chat_id, question, display_question=text)
 
     async def handle_command(self, bot, chat_id, command):
         state = self.state(chat_id)
@@ -1079,7 +1132,7 @@ class BotCore:
             log.error("查原文失敗：%s", type(problem).__name__)
             return f"查原文出錯（{type(problem).__name__}），再試一次。"
 
-    async def handle_question(self, bot, chat_id, question):
+    async def handle_question(self, bot, chat_id, question, *, display_question=None):
         ahead = self.pending
         self.pending += 1
         typing = None
@@ -1113,7 +1166,8 @@ class BotCore:
         if progress is not None:
             await progress.drain()
         if result.kind == "answer" and result.answer is not None and not result.answer.refused:
-            messages = answer_messages(question, result.answer, result.text, result.notices)
+            messages = answer_messages(question if display_question is None else display_question,
+                                       result.answer, result.text, result.notices)
             await self.send_answer_messages(bot, chat_id, messages, status)
         else:
             text = "\n\n".join([*result.notices, result.text])
@@ -1163,7 +1217,8 @@ def build_application(bot_core, token):
         message, chat, user = update.effective_message, update.effective_chat, update.effective_user
         if message is None or chat is None:
             return
-        await bot_core.handle_message(context.bot, chat.id, user.id if user else None, message.text)
+        await bot_core.handle_message(context.bot, chat.id, user.id if user else None, message.text,
+                                      message=message)
 
     async def on_callback(update, context):
         query = update.callback_query

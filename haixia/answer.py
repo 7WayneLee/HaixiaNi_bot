@@ -98,11 +98,12 @@ TOOLS = [
     },
     {
         "name": "classic_commentary",
-        "description": "給經典段落 id，讀取已連結的倪師講義及上課逐字稿段落，附講義條號、出處與內文。",
+        "description": ("給經典段落 id，讀取已連結的倪師講義及上課逐字稿段落，附講義條號、出處與內文。"
+                        "也可以傳出處裡的編號（例如 /s_a1b2c3）。"),
         "strict": True,
         "eager_input_streaming": True,
         "input_schema": {
-            "type": "object", "properties": {"id": {"type": "string", "description": "經典搜尋回傳的段落 id。"}},
+            "type": "object", "properties": {"id": {"type": "string", "description": "經典段落 id，或至少 4 碼的十六進位出處編號（可帶 /s_ 或 s_）。"}},
             "required": ["id"], "additionalProperties": False,
         },
     },
@@ -111,13 +112,14 @@ TOOLS = [
         "description": (
             "讀取某個段落在同一來源（同一集逐字稿或同一份文件）裡前後相鄰的段落。"
             "搜尋命中的段落話講到一半、或需要前後文才能確定意思時使用。"
+            "也可以傳出處裡的編號（例如 /s_a1b2c3）。"
         ),
         "strict": True,
         "eager_input_streaming": True,
         "input_schema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "search 回傳的段落 id。"},
+                "id": {"type": "string", "description": "段落 id，或至少 4 碼的十六進位出處編號（可帶 /s_ 或 s_）。"},
                 "before": {"type": "integer", "enum": list(range(MAX_CONTEXT + 1)),
                            "description": f"要讀前面幾段，0–{MAX_CONTEXT}，預設 1。"},
                 "after": {"type": "integer", "enum": list(range(MAX_CONTEXT + 1)),
@@ -334,9 +336,26 @@ def run_search(searcher, args, remember=None):
     return "\n\n".join(blocks), hits, result["mode"]
 
 
+def _resolve_chunk_id(store, chunk_id):
+    """出處編號須唯一；其他完整 id 沿用原本的查詢方式。"""
+    found = re.fullmatch(r"(?:/s_|s_)?([0-9a-f]{4,})", chunk_id, re.I)
+    if found is None:
+        if chunk_id.lower().startswith(("/s_", "s_")):
+            raise ToolInputError("出處編號要是至少 4 碼的十六進位字元，可帶 /s_ 或 s_ 開頭")
+        return chunk_id
+    prefix = found.group(1).lower()
+    matches = store.find_prefix(prefix, limit=2)
+    if not matches:
+        raise ToolInputError(f"找不到出處編號：{chunk_id}。索引更新過的話，舊編號會失效。")
+    if len(matches) > 1:
+        raise ToolInputError(f"出處編號 {chunk_id} 對應到不只一段，請多給幾碼。")
+    return matches[0]["id"]
+
+
 def run_read_context(store, args, remember=None):
+    chunk_id = _resolve_chunk_id(store, args["id"])
     try:
-        target, previous, following = store.neighbors(args["id"], args["before"], args["after"])
+        target, previous, following = store.neighbors(chunk_id, args["before"], args["after"])
     except KeyError:
         raise ToolInputError(f"找不到段落 id：{args['id']}") from None
     if remember:
@@ -346,16 +365,21 @@ def run_read_context(store, args, remember=None):
         lines.append("同一來源裡沒有相鄰的段落（這一段就是開頭或結尾）。")
     for offset, record in enumerate(previous, -len(previous)):
         lines.append(format_record(record, f"[前 {-offset} 段]"))
-    lines.append(f"[命中段落 id={target['id']}：內文見先前的搜尋結果]")
+    # 直接用出處編號查詢時，這段未必出現在搜尋結果，必須一起提供原文。
+    cited = chunk_id != args["id"]
+    lines.append(format_record(target, "[命中段落]") if cited
+                 else f"[命中段落 id={target['id']}：內文見先前的搜尋結果]")
     for offset, record in enumerate(following, 1):
         lines.append(format_record(record, f"[後 {offset} 段]"))
-    hits = [{"id": record["id"], "citation": citation(record)} for record in previous + following]
+    records = [*previous, *([target] if cited else []), *following]
+    hits = [{"id": record["id"], "citation": citation(record)} for record in records]
     return "\n\n".join(lines), hits
 
 
 def run_classic_commentary(store, args, max_chars=9000, remember=None):
+    chunk_id = _resolve_chunk_id(store, args["id"])
     try:
-        records = store.classic_commentary(args["id"])
+        records = store.classic_commentary(chunk_id)
     except KeyError:
         raise ToolInputError(f"找不到經典段落 id：{args['id']}") from None
     if not records:
