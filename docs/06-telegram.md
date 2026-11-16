@@ -5,7 +5,7 @@ bot 用 long polling，不需要網域或 HTTPS。輪詢接收一般訊息（`me
 
 ## 建立 bot 與設定
 
-1. 在 Telegram 找 `@BotFather`，傳 `/newbot`，依提示設定名稱和以 `bot` 結尾的 username，保存它給的 token。可用 `/setcommands` 設定 `help`、`new`、`model`、`cost`、`source`。
+1. 在 Telegram 找 `@BotFather`，傳 `/newbot`，依提示設定名稱和以 `bot` 結尾的 username，保存它給的 token。可用 `/setcommands` 設定 `help`、`new`、`model`、`cost`、`source`、`key`（`setkey`、`usekey`、`delkey` 不放進選單，避免誤點）。
 2. 查自己的數字 Telegram 使用者 ID（例如用 Telegram 的 ID 查詢 bot）。要填的是**使用者 ID**，不是 username 或 chat ID。
 3. 在 movie-nas 的 `~/HaixiaNi_bot/.env` 設定以下欄位，並執行 `chmod 600 ~/HaixiaNi_bot/.env`。檔案不進 repo；環境變數有值時優先於 `.env`。
 
@@ -16,7 +16,7 @@ bot 用 long polling，不需要網域或 HTTPS。輪詢接收一般訊息（`me
    DAILY_BUDGET_USD=3
    ```
 
-   多個允許的 ID 用逗號分隔。組織層級 Anthropic 金鑰如有需要，另設 `ANTHROPIC_WORKSPACE_ID`；綁定 workspace 的金鑰不用。token 與金鑰不要貼到聊天、文件或 log。未列入白名單者不會收到訊息，也不會觸發 API 呼叫。
+   多個允許的 ID 用逗號分隔。組織層級 Anthropic 金鑰如有需要，另設 `ANTHROPIC_WORKSPACE_ID`；綁定 workspace 的金鑰不用。bot token 不要貼到聊天、文件或 log；Claude 金鑰也不要貼到文件或 log（在 Telegram 用 `/setkey` 換金鑰時，bot 會自動刪掉訊息）。未列入白名單者不會收到訊息，也不會觸發 API 呼叫。
 
 ## 在 movie-nas 安裝服務
 
@@ -45,11 +45,11 @@ cd ~/HaixiaNi_bot && git pull
 sudo systemctl restart haixia-bot.service
 ```
 
-若 unit 檔有改動，更新時再複製一次並執行 `sudo systemctl daemon-reload`。修改 `.env` 後也要重啟服務。service 設定失敗時會在 journal 顯示設定名稱，但不顯示 token 或金鑰。重啟會清空記憶體裡的對話。
+若 unit 檔有改動，更新時再複製一次並執行 `sudo systemctl daemon-reload`。手動修改 `.env` 後要重啟服務（在 Telegram 用 `/setkey` 或 `/key` 換 Claude 金鑰不用重啟）。service 設定失敗時會在 journal 顯示設定名稱，但不顯示 token 或金鑰。重啟會清空記憶體裡的對話。
 
 ## 使用方式與費用
 
-直接傳正體中文問題；連續問題會排隊。`/help` 或 `/start` 看用法，`/new` 開新對話。`/model` 會送出 inline 二級選單：第一層顯示目前模型，按鈕是「Claude」「Gemini」；第二層顯示該服務的兩個模型，目前模型標「（目前）」，另有「‹ 返回」。換層會編輯同一則訊息；選模型後改成確認文字並移除按鈕。只有白名單使用者能操作按鈕。`/model opus`、`/model sonnet`、`/model gemini-flash`、`/model gemini-pro` 文字捷徑仍可切換模型；切換只影響這個 chat 的下一題，並開新對話。`/cost` 看台灣時間今天與本月的題數和花費，依 JSONL 的 `model` 欄位分開列 Claude（Anthropic 帳單）和 Gemini（GCP 帳單），有其他模型的紀錄時另列「其他」，最後列合計、每日上限與今天剩餘。金額格式和答案標題一樣是「0.117 USD ≈ 3.8 TWD」。Gemini 的 Vertex 設定、價格與思考參數見 [08-gemini.md](08-gemini.md)。經典、逐字稿、講義與醫案的出處都有編號；答案中可點 `/s_編號` 看該段原文，也可用 `/source 編號` 或「原文 編號」。醫案引用會隱藏姓名。只有白名單使用者能查原始標題、路徑、該段與前後段。959 篇醫案的路徑會顯示修復後名稱，並附 Drive 上原本的亂碼路徑以便找檔。對話閒置超過 6 小時或最後一個請求的輸入約超過 15 萬 token，下一題前會自動開新對話。
+直接傳正體中文問題；連續問題會排隊。`/help` 或 `/start` 看用法，`/new` 開新對話。`/model` 會送出 inline 二級選單：第一層顯示目前模型，按鈕是「Claude」「Gemini」；第二層顯示該服務的模型（Claude：Opus 5.5、Sonnet 5.5、Fable 5.2；Gemini：Gemini 4 Hydrogen、Gemini 4 Argon、Gemini 3.8 Flash），目前模型標「（目前）」，另有「‹ 返回」。換層會編輯同一則訊息；選模型後改成確認文字並移除按鈕。只有白名單使用者能操作按鈕。`/model opus`、`/model sonnet`、`/model fable`、`/model gemini-flash`、`/model gemini-pro`、`/model gemini-3.8-flash` 文字捷徑仍可切換模型；切換只影響這個 chat 的下一題，並開新對話。`/cost` 看台灣時間今天與本月的題數和花費，依 JSONL 的 `model` 欄位分開列 Claude（Anthropic 帳單）和 Gemini（GCP 帳單），有其他模型的紀錄時另列「其他」，最後列合計、每日上限與今天剩餘。金額格式和答案標題一樣是「0.117 USD ≈ 3.8 TWD」。Gemini 的 Vertex 設定、價格與思考參數見 [08-gemini.md](08-gemini.md)。經典、逐字稿、講義與醫案的出處都有編號；答案中可點 `/s_編號` 看該段原文，也可用 `/source 編號` 或「原文 編號」。醫案引用會隱藏姓名。只有白名單使用者能查原始標題、路徑、該段與前後段。959 篇醫案的路徑會顯示修復後名稱，並附 Drive 上原本的亂碼路徑以便找檔。對話閒置超過 6 小時或最後一個請求的輸入約超過 15 萬 token，下一題前會自動開新對話。
 
 `/source` 會留在聊天室裡顯示：最上方依序列出段落編號、出處、原始標題、檔案、959 篇醫案的 Drive 原檔名（若有）、章節（若有）。接著依原文順序顯示前一段、這一段、後一段；前後段是預設收合的引用區塊，這一段直接顯示。沒有相鄰段落時會在末尾註明。內容太長時，每個引用區塊會各自成一則；單段仍太長時會在換行處分則，續則標「（續）」。Telegram 拒絕 HTML 時改送純文字。
 
@@ -64,4 +64,14 @@ sudo systemctl restart haixia-bot.service
 - **回覆與引用**：回覆 bot 的答案時，會自動移除收合的思考過程，只保留回答內文與出處；若使用 Telegram 的選取引用（quote），則只帶入選取的文字。也支援引用其他聊天的訊息（僅帶入選取的文字）。
 - **長度與格式**：交給模型時加上「【我回覆的訊息】」（或「【我引用的內容】」）與「【問題】」標註。被引用的內容超過 2,000 字時會自動截斷並附註「…（後略）」。
 - **查原文支援**：模型回答追問時，可直接用前次回答裡的出處編號（`/s_…`）呼叫 `read_context` 或 `classic_commentary` 查閱原文與前後段，不需重新搜尋。
-- **指令不受影響**：回覆訊息時如果輸入的是指令（例如 `/help`、`/new`、`/model`、`/cost`、`/source`），仍正常執行指令，不觸發問答。
+- **指令不受影響**：回覆訊息時如果輸入的是指令（例如 `/help`、`/new`、`/model`、`/cost`、`/source`、`/key`），仍正常執行指令，不觸發問答。
+
+## 換 Claude 金鑰（`/setkey`、`/key`）
+
+不用登入主機，直接在 Telegram 就能新增或切換 Claude API 金鑰（最多存 10 把）：
+
+- **新增或更新**：傳 `/setkey 金鑰`（存成「預設」）或 `/setkey 名稱 金鑰`。組織層級金鑰在最後加上 workspace ID：`/setkey 名稱 金鑰 wrkspc_…`（或 `/setkey 金鑰 wrkspc_…`）。
+- **處理流程**：bot 收到 `/setkey` 後會先刪掉該則訊息（若刪除失敗會提醒手動刪除），檢查格式後呼叫免費的 Anthropic `models.list` 驗證。驗證通過才以權限 `600` 原子更新 `.anthropic_keys.json` 與 `.env`，並讓下一題重建 Claude client 生效（不需重啟服務，進行中的題目用舊金鑰答完；Gemini、對話歷史與 `/cost` 不受影響）。
+- **查看、切換與刪除**：`/key` 列出已存名稱、金鑰後 4 碼（以及 workspace ID 後 4 碼，若有）並附上切換按鈕；也可用 `/usekey 名稱`（切換前會重新驗證）與 `/delkey 名稱`（使用中的不能刪）。任何回覆都只顯示後 4 碼，且不會寫入 log 或 JSONL。
+- **環境變數優先**：若環境變數已設定 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_WORKSPACE_ID`，會蓋過 `.env`，此時會拒絕從 Telegram 更換。
+- **安全提醒**：透過 `/setkey` 傳送時，金鑰會經過 Telegram 伺服器；若不希望經過 Telegram，仍可 SSH 到主機修改 `.env` 後重啟服務。換掉或停用的舊金鑰，記得到 Anthropic Console 撤銷。

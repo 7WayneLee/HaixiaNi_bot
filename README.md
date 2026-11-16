@@ -11,7 +11,8 @@
 - **回覆追問**：回覆或選取引用 bot 的答案繼續發問，bot 會看見被回覆的內容。
 - **回答格式**：先列【經典原文】，再分開【倪師原文依據】和【推論（非倪師原話）】，推論標把握程度；資訊不夠時先問診。
 - **思考過程**：答案上方有可收合的區塊，標題是「模型｜思考 N 秒｜花費」，內容是模型的思考摘要。
-- **換模型**：`/model` 切換 Opus 5.5、Sonnet 5.5、Gemini 3.8 Flash、Gemini 3.1 Pro（預設 Opus 5.5）。
+- **換模型**：`/model` 切換 Opus 5.5、Sonnet 5.5、Fable 5.2、Gemini 4 Hydrogen、Gemini 4 Argon、Gemini 3.8 Flash（預設 Opus 5.5）。
+- **換 Claude 金鑰**：`/setkey` 新增或更換金鑰（自動刪訊息並驗證，不需重啟），`/key` 查看或切換已存金鑰。
 - **花費**：`/cost` 分開列 Claude（Anthropic 帳單）和 Gemini（GCP 帳單），另有每日上限。
 
 ## 架構
@@ -94,8 +95,10 @@
 |---|---|---|
 | Opus 5.5 | 0.08–0.12 USD | 約 30 秒 |
 | Sonnet 5.5 | 0.04 USD | 約 15 秒 |
+| Fable 5.2 | 尚未實測 | 尚未實測 |
+| Gemini 4 Hydrogen | 尚未實測 | 尚未實測 |
+| Gemini 4 Argon | 尚未實測 | 尚未實測 |
 | Gemini 3.8 Flash | 0.02 USD | 約 40 秒 |
-| Gemini 3.1 Pro | 0.08 USD | 約 35 秒 |
 
 ## 隱私與機密
 

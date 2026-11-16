@@ -60,19 +60,22 @@
 
 所有段落在查詢時依索引裡的 id 算唯一短編號，索引檔不用重建。對話會記住工具回傳的出處、編號與段落原文；模型漏抄編號時，顯示前只替能唯一判定的出處補上。多段同出處時，若緊接著的引文只在一段出現，就用該段的編號。這不修改 Claude 或 Gemini 的對話歷史，也不修改 JSONL 中的模型原始答案。
 
-## 請求設定（依 claude-api skill 對 Opus 5.5 的指引）
+## 請求設定（依 claude-api skill 對 Opus 5.5 與 Fable 5.2 的指引）
 
-- **思考**：`thinking: {"type": "adaptive", "display": "summarized"}`。只讀取 API 官方提供的思考摘要，不要求模型把推理寫進答案。Opus 5.5 的思考不能關（送 `disabled` 或 `budget_tokens` 都會 400），只能用 effort 控制。
-- **effort**：`output_config.effort`，預設 `medium`（Opus 5.5 的 API 預設也是 medium，但還是明確寫出來）。可用 `--effort low|medium|high|xhigh|max` 調整。在同一段對話中途改 effort 會讓對話快取失效，所以每個 `Answerer` 固定一個 effort。
-- **tool_choice**：一般是 `auto`。Opus 5.5 不接受強制的 `any`／`tool`。超過 8 輪時**不拿掉工具**（改工具定義會讓快取失效、也會讓之前的思考區塊失效），而是下一個請求改用 `tool_choice: none`，並在最後一則工具結果後面附一段說明：「已達上限，請只用已查到的資料作答」。
+目前支援的三個 Claude 模型為 `claude-opus-5-5`（預設）、`claude-sonnet-5-5` 與 `claude-fable-5-2`：
+
+- **思考**：`thinking: {"type": "adaptive", "display": "summarized"}`。只讀取 API 官方提供的思考摘要，不要求模型把推理寫進答案。Opus 5.5 與 Fable 5.2 的思考都不能關（送 `disabled` 或 `budget_tokens` 都會 400），只用 effort 控制。只有 Fable 5.2 與 Mythos 5.2 讀得懂 Fable 5.2 的 thinking 區塊（換模型會開新對話）。
+- **effort**：`output_config.effort`。不指定 `--effort` 時依模型預設：`claude-opus-5-5`、`claude-sonnet-5-5` 為 `medium`，`claude-fable-5-2` 為 `high`（官方建議從 high 開始）。可用 `--effort low|medium|high|xhigh|max` 套用到所有 Claude 模型。在同一段對話中途改 effort 會讓對話快取失效，所以每個 `Answerer` 固定一個 effort。
+- **tool_choice**：一般是 `auto`。Opus 5.5 與 Fable 5.2 都不接受強制的 `any`／`tool`。超過 8 輪時**不拿掉工具**（改工具定義會讓快取失效、也會讓之前的思考區塊失效），而是下一個請求改用 `tool_choice: none`，並在最後一則工具結果後面附一段說明：「已達上限，請只用已查到的資料作答」。
 - **max_tokens**：64,000（思考也算在裡面），用串流加 `get_final_message()`，避免 HTTP 逾時。
 - **prompt caching**：system prompt 最後一塊加 `cache_control`（工具定義排在 system 前面，所以一起快取）；另外開頂層自動快取（`cache_control: {"type": "ephemeral"}`），讓工具迴圈與多輪對話每次只寫入新增的部分。TTL 用預設的 5 分鐘：工具迴圈的請求間隔遠小於 5 分鐘；兩題之間隔超過 5 分鐘時，下一題會重新寫入快取。system prompt 裡不放日期或任何會變的東西。
-- **preserved thinking（只附加、不改寫）**：`Conversation.messages` 只會在後面追加；每次把完整的 `response.content`（包含內容是空的 thinking 區塊）放回歷史。system 和工具在 `Answerer` 建立後就不再變動。另外設定 `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`（beta `thinking-binding-controls-2026-08-01`）：萬一前綴對不上，API 會丟掉失效的思考區塊繼續回答，不會直接 400；被丟掉的數量寫在 log 的 `notes`。要在測試時把錯誤直接暴露出來，可以改成 `prefix_mismatch="error"`。
+- **preserved thinking（只附加、不改寫）**：`Conversation.messages` 只會在後面追加；每次把完整的 `response.content`（包含內容是空的 thinking 區塊）放回歷史（Fable 5.2 對每個帳號都會檢查歷史不可改寫）。system 和工具在 `Answerer` 建立後就不再變動。另外設定 `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`（beta `thinking-binding-controls-2026-08-01`）：萬一前綴對不上，API 會丟掉失效的思考區塊繼續回答，不會直接 400；被丟掉的數量寫在 log 的 `notes`。要在測試時把錯誤直接暴露出來，可以改成 `prefix_mismatch="error"`。
+- **資料保存需求**：Fable 5.2 需要組織開啟 30 天資料保存（zero-data-retention 組織呼叫會回 400）。
 - **拒答**：先檢查 `stop_reason == "refusal"`，再讀內容。拒答時回一段友善的說明，附上 `stop_details.category`（例如 `bio`），並建議換個說法或開新對話。拒答那一輪的輸出**不放回歷史**，也不執行其中的工具呼叫；使用者的問題已經在歷史裡，下一題會接成連續的 user 訊息（API 會合併）。
-- **伺服器端 fallback（已啟用）**：Opus 5.5 加入了生物（`bio`）與 `reasoning_extraction` 分類器，中藥毒性等正常問題也可能被誤判。依 skill「從第一天就開」的建議，`claude-opus-5-5`（以及 `claude-opus-5`、`claude-fable-5-1`）預設送 `fallbacks: "default"`（beta `server-side-fallback-2026-07-01`）：被分類器擋下時，API 在同一個請求裡改用 Anthropic 建議的模型回答。
+- **伺服器端 fallback（已啟用）**：Opus 5.5 與 Fable 5.2 加入了生物（`bio`）與 `reasoning_extraction` 等分類器，中藥毒性等正常問題也可能被誤判。依 skill「從第一天就開」的建議，`claude-opus-5-5` 與 `claude-fable-5-2`（以及 `claude-opus-5`、`claude-fable-5-1`）預設送 `fallbacks: "default"`（beta `server-side-fallback-2026-07-01`）：被分類器擋下時，API 在同一個請求裡改用 Anthropic 建議的模型回答（Fable 5.2 拒答時只會改由 Opus 4.8 或 Opus 5 回答）。
   - 改由別的模型回答時，答案下方會顯示「這題改由 … 回答」，log 的 `fallback_ran` 是 true。
   - 費用依 `usage.iterations` 逐次、依實際執行的模型計價。
-  - 備用模型讀不到 Opus 5.5 的思考區塊，之後大約一小時會固定由備用模型回答（sticky routing）。
+  - 備用模型讀不到原模型的思考區塊，之後大約一小時會固定由備用模型回答（sticky routing）。
   - `reasoning_extraction` 類的拒答不會轉給備用模型。
   - 不想用時加 `--fallback off`；Sonnet 預設不開（`--fallback on` 可強制開）。
 - 中途發生 fallback 時，照規定把最後一個 `fallback` 區塊之前的 thinking、tool_use 等區塊拿掉再放回歷史（`history_content()`）；這是唯一會動到回應內容的地方，而且是在追加之前處理，不會改到已經存在的歷史。
@@ -117,27 +120,30 @@
 
 每題寫一行 JSONL 到 `~/haixia-bot-logs/answers.jsonl`（repo 外，目錄權限 700），內容有：時間、模型（請求的與實際回答的）、effort、問題、答案、官方思考摘要（`thinking`）、停止原因、是否拒答、工具輪數與每次呼叫（查詢、命中的 id 與出處、錯誤）、usage（輸入、快取讀、快取寫、輸出）、估計費用（美元）、耗時、注意事項。問題與答案會存（使用者自己的資料），金鑰不會。
 
-價格表在 `haixia/answer.py` 的 `PRICES`（美元／百萬 token；快取寫入用 5 分鐘 TTL 的價格）；價格變動時可用 `--prices` 給 JSON 覆蓋：
+價格表在 `haixia/answer.py` 的 `PRICES`（美元／百萬 token；快取寫入用 5 分鐘 TTL 的價格，2026-11-16 依官方價格頁確認）；價格變動時可用 `--prices` 給 JSON 覆蓋：
 
 | 模型 | 輸入 | 輸出 | 快取寫入 | 快取讀取 |
 |---|---|---|---|---|
+| claude-fable-5-2 | 8.00 | 40.00 | 10.00 | 0.20 |
 | claude-opus-5-5 | 4.00 | 20.00 | 5.00 | 0.20 |
-| claude-sonnet-5-5、claude-sonnet-5 | 2.00 | 10.00 | 2.50 | 0.20 |
+| claude-sonnet-5-5 | 2.00 | 10.00 | 2.50 | 0.10 |
+| claude-sonnet-5 | 2.00 | 10.00 | 2.50 | 0.20 |
 | claude-opus-5、claude-opus-4-8（fallback 用） | 5.00 | 25.00 | 6.25 | 0.50 |
 
 粗估一題（實際以 log 為準）：
 - system prompt＋工具定義約 3–4 千 token；一次搜尋（8 段）約 5 千 token。
 - 常見的一題查 3–4 輪，共 4–5 個請求：快取寫入約 2.5 萬 token（每段內容只寫一次）、快取讀取約 5–7 萬 token、輸出（思考＋工具呼叫＋答案）約 3–6 千 token。
-- 估算結果：Opus 5.5（medium）每題約 0.20–0.26 美元（約 6–8 台幣）；Sonnet 5.5 約 0.10–0.14 美元。
+- 估算結果：Opus 5.5（medium）每題約 0.20–0.26 美元（約 6–8 台幣）；Sonnet 5.5 約 0.10–0.14 美元；Fable 5.2（high）尚未實測，單價為 Opus 5.5 兩倍（快取讀取同為 $0.20）且思考較多。
 - 查到 8 輪上限的題目可能要 0.5 美元以上。多輪對話的追問會重讀前面的歷史，5 分鐘內追問時大多是便宜的快取讀取。
 
 ## 換模型比較（第六步）
 
-模型和 effort 都是參數，同一批題目可以這樣跑：
+模型和 effort 都是參數（不傳 `--effort` 時依模型預設），同一批題目可以這樣跑：
 
 ```sh
-.venv-index/bin/python scripts/ask.py --model claude-opus-5-5 --effort medium "…"
-.venv-index/bin/python scripts/ask.py --model claude-sonnet-5-5 --effort medium "…"
+.venv-index/bin/python scripts/ask.py --model claude-opus-5-5 "…"
+.venv-index/bin/python scripts/ask.py --model claude-sonnet-5-5 "…"
+.venv-index/bin/python scripts/ask.py --model claude-fable-5-2 "…"
 ```
 
 程式裡則是 `Answerer(index_dir, model="claude-sonnet-5-5", effort="low")`。比較時從 log 依 `model`、`effort` 分組，看 `cost_usd`、`usage`、`rounds`、`elapsed_sec`，再對照答案的準確率。注意：快取依模型分開，換模型時第一題會重新寫入快取。

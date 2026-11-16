@@ -38,7 +38,7 @@
     - 指揮原本以為 Sonnet 5.5 不存在，是資料過期；使用者指正後，用 Models API 確認有這個模型。
   - 官方價格（每百萬 token）：
     - Opus 5.5：輸入 $4、輸出 $20、5 分鐘快取寫入 $5、快取讀取 $0.20。
-    - Sonnet 5.5：輸入 $2、輸出 $10、快取寫入 $2.50、快取讀取 $0.20。
+    - Sonnet 5.5：輸入 $2、輸出 $10、快取寫入 $2.50、快取讀取 $0.10（2026-11-16 依官方價格表更正）。
     - Sonnet 5 和 Sonnet 5.5 同價。
   - Anthropic API 金鑰由使用者自己寫進 movie-nas 的 `~/HaixiaNi_bot/.env`（`ANTHROPIC_API_KEY=`），不貼在對話裡。
   - Gemini：2026-09-29 使用者決定 bot 也要能用 Gemini，走 GCP 的 Vertex AI，不用 AI Studio 的免費額度（免費版的資料可能被拿去訓練，醫案有病人資料）。
@@ -382,6 +382,17 @@
       - 之後 4 次卡在 agent_readiness：Orca 命令列已是 1.4.218，但執行中的主程式還是 1.4.212；使用者重啟 Orca 後就正常。
       - Antigravity 兩次在 agy 啟動登入時就貼上任務，被吃掉（畫面停在空白輸入框）。改用 `--terminal` 交給已登入、待命的 agy 分頁就成功。
       - Orca 重啟會清掉 scratchpad，等待用的 `wait_workers.py` 要重建。
+  - 2026-11-16 換金鑰、Gemini 新模型、Fable（commit cfd1832、fd09ffd、8e99a19；803 個測試通過）：
+    - 派工：使用者要求指揮與 worker 之間用英文；Codex 寫 /setkey 到一半額度用完，程式角色改用 Opus worker（使用者要求 effort medium）；文件 worker 改用 Antigravity 的 Gemini 4 Hydrogen High（使用者要求不用 3.8）。
+    - `/setkey [名稱] 金鑰 [wrkspc_…]`、`/key`（按鈕切換）、`/usekey`、`/delkey`：先刪含金鑰的訊息，用免費的 models.list 驗證後才存；清單在 repo 根目錄 `.anthropic_keys.json`（600，gitignore），使用中的寫進 `.env`；只重建 Claude 的 Answerer，不用重啟。
+    - 使用者換了組織層級金鑰，需要 `ANTHROPIC_WORKSPACE_ID`（`wrkspc_` 開頭，不是 Organization ID）；指揮寫進 movie-nas 的 `.env`，用 models.retrieve 驗證 Opus、Fable 都可用。舊金鑰（10/3）已失效，回 401。
+    - Gemini 選單：gemini-flash → `gemini-4-hydrogen`、gemini-pro → `gemini-4-argon`，保留 `gemini-3.8-flash`（年底前半價）；3.1 Pro 停用，選到它會退回 Opus。
+      - 不用 `gemini-4-carbon`：它是 Google Frontier Model，提示和回答會保留最多 30 天、可能人工審查，醫案有病人資料。
+      - Argon 試打時沒回傳思考摘要，且有一次 53 秒、一次 504。Google 建議 google-genai ≥ 2.34，movie-nas 仍是 2.25（bot 用到的功能都正常）。
+      - 價格：Hydrogen $1.50/$7.50；Argon 11/30 前 $2/$10、12/1 起 $4/$20；3.8 Flash 2027/1/1 起 $1.50/$7.50（程式依日期自動換價）。
+    - Claude 加入 Fable 5.2（`claude-fable-5-2`，$8/$40，快取讀 $0.20，effort high，fallbacks 開）；Opus、Sonnet 預設 effort medium。實測一次 0.013 美元，估計每題 0.20–0.35 美元。
+    - 修正 Sonnet 5.5 快取讀取價格：官方是 $0.10（之前記 $0.20）。
+    - 白名單現在有 2 個使用者，兩人都能換金鑰。
 - [ ] 第五步：Telegram bot（2026-09-29 部署完成，待使用者實測）
   - 程式：commit 4b89cc1，515 個測試通過。
     - 前半由 Claude Code worker 撰寫；Claude 5 小時額度到 84% 時，依使用者指示「Work 你可以用 codex」停掉，改由 Codex 接手。
