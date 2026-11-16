@@ -30,8 +30,14 @@ ENV_BEFORE = ("# 保留註解\r\nOTHER='不動'\r\n\r\nANTHROPIC_API_KEY=" + OLD
 OPUS, SONNET, FLASH = tg.MODELS["opus"], tg.MODELS["sonnet"], tg.MODELS["gemini-flash"]
 
 
-def env_with(key):
-    return ENV_BEFORE.replace(OLD_KEY, key).encode()
+def env_with(key, workspace="wrkspc_test"):
+    """.env 換成 key；workspace=None 時那一行被刪掉（綁定 workspace 的金鑰）。"""
+    text = ENV_BEFORE.replace(OLD_KEY, key)
+    if workspace is None:
+        text = text.replace("\r\nANTHROPIC_WORKSPACE_ID=wrkspc_test", "")
+    else:
+        text = text.replace("wrkspc_test", workspace)
+    return text.encode()
 
 
 @pytest.fixture(autouse=True)
@@ -59,8 +65,19 @@ def write_store(key_env, active, keys, mode=0o600):
     return key_env.keys.read_bytes(), key_env.env.read_bytes()
 
 
-def saved(key_env):
+def saved_raw(key_env):
     return json.loads(key_env.keys.read_text(encoding="utf-8"))
+
+
+def saved(key_env):
+    """清單裡的 {active, keys: {名稱: 金鑰}}；workspace 另用 saved_workspaces 看。"""
+    data = saved_raw(key_env)
+    return {"active": data["active"],
+            "keys": {name: entry["key"] for name, entry in data["keys"].items()}}
+
+
+def saved_workspaces(key_env):
+    return {name: entry["workspace"] for name, entry in saved_raw(key_env)["keys"].items()}
 
 
 def mode(path):
@@ -176,7 +193,9 @@ def test_setkey_success_preserves_file_history_costs_and_gemini(key_env, validat
         _receive(bot_core, bot, _message(f"/setkey@HaixiaBot   {NEW_KEY}  "))
         assert bot.calls[0] == ("delete", {"chat_id": CHAT, "message_id": 1})
         # 第一次寫入：.env 原有的金鑰是「預設」，只打金鑰就是更新「預設」。
-        assert key_env.env.read_bytes() == env_with(NEW_KEY)
+        # 沒給 workspace id＝綁定 workspace 的金鑰，.env 的 ANTHROPIC_WORKSPACE_ID 那一行刪掉。
+        assert key_env.env.read_bytes() == env_with(NEW_KEY, None)
+        assert saved_workspaces(key_env) == {"預設": None}
         assert saved(key_env) == {"active": "預設", "keys": {"預設": NEW_KEY}}
         assert mode(key_env.env) == mode(key_env.keys) == 0o600
         assert folder_names(key_env) == [".anthropic_keys.json", ".env"]
@@ -184,7 +203,7 @@ def test_setkey_success_preserves_file_history_costs_and_gemini(key_env, validat
         worker_id = validation.events[0][-1]
         assert worker_id != threading.get_ident()
         assert validation.events == [
-            ("create", NEW_KEY, "wrkspc_test", {"timeout": 10.0, "max_retries": 0}, worker_id),
+            ("create", NEW_KEY, None, {"timeout": 10.0, "max_retries": 0}, worker_id),
             ("list", {"limit": 1}, worker_id), ("close", worker_id)]
         assert opus.closed_on == sonnet.closed_on == [worker_id]
         assert not gemini.closed_on and pool.get(FLASH) is gemini
@@ -209,7 +228,9 @@ def test_setkey_with_name_adds_key_and_switches(make_core, key_env, validation, 
     _receive(bot_core, bot, _message(f"/setkey 備用-2 {NEW_KEY}"))
     assert bot.texts() == ["已存 備用-2 …abcd 並改用，下一題開始生效。"]
     assert saved(key_env) == {"active": "備用-2", "keys": {"預設": OLD_KEY, "備用-2": NEW_KEY}}
-    assert key_env.env.read_bytes() == env_with(NEW_KEY) and mode(key_env.keys) == 0o600
+    assert key_env.env.read_bytes() == env_with(NEW_KEY, None) and mode(key_env.keys) == 0o600
+    # 從 .env 帶進來的「預設」保留原本的 workspace id
+    assert saved_workspaces(key_env) == {"預設": "wrkspc_test", "備用-2": None}
     assert set(pool.answerers) == {FLASH} and pool.get(FLASH) is gemini
     assert validation.verified() == [NEW_KEY]
     assert_no_keys(bot, caplog)
@@ -222,7 +243,7 @@ def test_setkey_replaces_named_key(make_core, key_env, validation, caplog):
     _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY}"))
     assert bot.texts() == ["已更新 備用 …abcd，下一題開始生效。舊金鑰記得到 Anthropic Console 撤銷。"]
     assert saved(key_env) == {"active": "備用", "keys": {"預設": OLD_KEY, "備用": NEW_KEY}}
-    assert key_env.env.read_bytes() == env_with(NEW_KEY)
+    assert key_env.env.read_bytes() == env_with(NEW_KEY, None)
     # 同一把再存一次：不提醒撤銷（沒有被換掉的舊金鑰）。
     _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY}"))
     assert bot.texts()[-1] == "已更新 備用 …abcd，下一題開始生效。"
@@ -264,12 +285,12 @@ def test_setkey_connection_failure_does_not_write(make_core, key_env, validation
     ("wrong-" + "x" * 60, "金鑰格式不對。"),
     ("sk-ant-test-" + "x" * 300, "金鑰格式不對。"),
     ("備用 " + INVALID_KEY, "金鑰格式不對。"),
-    (NEW_KEY + " 另一項", "格式不對。用法：/setkey 名稱 金鑰"),
-    (NEW_KEY + "\n另一項", "格式不對。用法：/setkey 名稱 金鑰"),
-    ("名 稱 " + NEW_KEY, "格式不對。用法：/setkey 名稱 金鑰"),
+    (NEW_KEY + " 另一項", tg.SETKEY_FORMAT),
+    (NEW_KEY + "\n另一項", tg.SETKEY_FORMAT),
+    ("名 稱 " + NEW_KEY, tg.SETKEY_FORMAT),
     ("一二三四五六七八九十一二三四五六七八九十多 " + NEW_KEY, tg.NAME_RULE),
     ("壞/名 " + NEW_KEY, tg.NAME_RULE),
-    ("sk-ant-x " + NEW_KEY, "格式不對。用法：/setkey 名稱 金鑰"),
+    ("sk-ant-x " + NEW_KEY, tg.SETKEY_FORMAT),
 ], ids=["bad-char", "short", "wrong-prefix", "too-long", "named-bad-key", "trailing-word", "trailing-line",
         "three-parts", "long-name", "slash-name", "key-like-name"])     # 測試名稱不帶金鑰
 def test_setkey_bad_input_deletes_without_validation(make_core, key_env, validation, caplog, arg, reply):
@@ -394,7 +415,9 @@ def test_key_lists_names_suffixes_and_switch_buttons(make_core, key_env, validat
     _receive(bot_core, bot, _message("/key"))
     [(kind, sent)] = bot.calls
     assert kind == "send"
-    assert sent["text"] == ("Claude 金鑰：\n✓ 預設 …OLD1（使用中）\n・備用 …abcd\n・第三 …wxyz\n"
+    # 舊格式清單的每把金鑰都沿用 .env 的 workspace id，只顯示後 4 碼
+    assert sent["text"] == ("Claude 金鑰：\n✓ 預設 …OLD1 wrkspc_…test（使用中）\n・備用 …abcd wrkspc_…test\n"
+                            "・第三 …wxyz wrkspc_…test\n"
                             "點按鈕切換。新增：/setkey 名稱 金鑰")
     buttons = [[(button.text, button.callback_data) for button in row] for row in sent["reply_markup"].inline_keyboard]
     assert buttons == [[("改用 備用", "k:" + tg.key_token("備用"))], [("改用 第三", "k:" + tg.key_token("第三"))]]
@@ -407,7 +430,7 @@ def test_key_first_run_uses_env_key_without_writing(make_core, key_env, validati
     bot_core, _ = make_core()
     bot = FakeBot()
     _receive(bot_core, bot, _message("/key"))
-    assert bot.texts() == ["Claude 金鑰：\n✓ 預設 …OLD1（使用中）\n新增：/setkey 名稱 金鑰"]
+    assert bot.texts() == ["Claude 金鑰：\n✓ 預設 …OLD1 wrkspc_…test（使用中）\n新增：/setkey 名稱 金鑰"]
     assert "reply_markup" not in calls_named(bot, "send")[0]
     assert folder_names(key_env) == [".env"] and not validation.events
     assert_no_keys(bot, caplog)
@@ -566,7 +589,7 @@ def test_environment_override_refuses_changes(make_core, key_env, validation, mo
     _receive(bot_core, bot, _message("/key"))
     texts = bot.texts()
     assert texts[:2] == [tg.ENV_OVERRIDE, tg.ENV_OVERRIDE] and texts[3] == tg.ENV_OVERRIDE
-    assert texts[4] == ("Claude 金鑰：\n・預設 …OLD1\n・備用 …abcd\n"
+    assert texts[4] == ("Claude 金鑰：\n・預設 …OLD1 wrkspc_…test\n・備用 …abcd wrkspc_…test\n"
                         "現在用環境變數的 …wxyz，不能從這裡換。\n新增：/setkey 名稱 金鑰")
     assert "reply_markup" not in calls_named(bot, "send")[-1]
     assert bot.calls[0][0] == "delete"                     # 含金鑰的訊息照樣刪
@@ -578,7 +601,7 @@ def test_environment_override_refuses_changes(make_core, key_env, validation, mo
 
 def test_first_run_store_comes_from_env_without_writing(key_env, tmp_path):
     store = core.load_key_store()
-    assert store == core.KeyStore("預設", {"預設": OLD_KEY})
+    assert store == core.KeyStore("預設", {"預設": OLD_KEY}, {"預設": "wrkspc_test"})
     assert folder_names(key_env) == [".env"]
     assert core.keys_path() == key_env.keys
     empty = tmp_path / "empty" / ".env"
@@ -604,7 +627,7 @@ def test_broken_store_is_never_overwritten(make_core, key_env, validation, caplo
 
 def test_store_with_missing_active_falls_back_to_none(key_env):
     key_env.keys.write_text(json.dumps({"active": "不見了", "keys": {"備用": NEW_KEY}}))
-    assert core.load_key_store() == core.KeyStore(None, {"備用": NEW_KEY})
+    assert core.load_key_store() == core.KeyStore(None, {"備用": NEW_KEY}, {"備用": "wrkspc_test"})
 
 
 @pytest.mark.parametrize("name, ok", [("預設", True), ("backup_2", True), ("備用-A", True), ("一" * 20, True),
@@ -764,3 +787,167 @@ def test_logging_blocks_ptb_and_sdk_debug_after_rotation(caplog):
         for name, logger in logging.root.manager.loggerDict.items():
             if isinstance(logger, logging.Logger):
                 logger.setLevel(saved_levels.get(name, logging.NOTSET))
+
+
+# ---------- 組織層級金鑰：workspace id ----------
+
+WORKSPACE = "wrkspc_01TestWorkspaceZw9V"
+OTHER_WORKSPACE = "wrkspc_02OtherWorkspaceQq7X"
+
+
+def message_problem(status, message):
+    """帶 API 錯誤訊息的假例外（body 跟 Anthropic API 一樣是 {"type": "error", "error": {...}}）。"""
+    import anthropic
+    import httpx2
+
+    request = httpx2.Request("GET", "https://example.invalid/v1/models")
+    response = httpx2.Response(status, request=request)
+    body = {"type": "error", "error": {"type": "invalid_request_error", "message": message}}
+    return anthropic.APIStatusError(message, response=response, body=body)
+
+
+NOT_SCOPED = ("This API key is not scoped to a workspace, so this request must include the "
+              "anthropic-workspace-id header with the ID of the workspace to use.")
+
+
+@pytest.mark.parametrize("arg, name", [(f"備用 {NEW_KEY} {WORKSPACE}", "備用"), (f"{NEW_KEY} {WORKSPACE}", "預設")],
+                         ids=["named", "default-name"])
+def test_setkey_with_workspace_verifies_and_writes_both(make_core, key_env, validation, caplog, arg, name):
+    bot_core, pool = make_core()
+    pool.get(OPUS)
+    bot = FakeBot()
+    _receive(bot_core, bot, _message(f"/setkey {arg}"))
+    assert bot.calls[0][0] == "delete"
+    assert [event[2] for event in validation.events if event[0] == "create"] == [WORKSPACE]
+    assert key_env.env.read_bytes() == env_with(NEW_KEY, WORKSPACE)
+    assert core.resolve_workspace_id() == WORKSPACE and core.resolve_api_key() == NEW_KEY
+    assert saved(key_env)["active"] == name and saved(key_env)["keys"][name] == NEW_KEY
+    assert saved_workspaces(key_env)[name] == WORKSPACE
+    assert saved_raw(key_env)["keys"][name] == {"key": NEW_KEY, "workspace": WORKSPACE}
+    assert OPUS not in pool.answerers
+    _receive(bot_core, bot, _message("/key"))
+    assert f"✓ {name} …abcd wrkspc_…Zw9V（使用中）" in bot.texts()[-1]
+    assert WORKSPACE not in caplog.text and WORKSPACE not in repr(bot.calls)
+    assert_no_keys(bot, caplog)
+
+
+def test_setkey_without_workspace_on_org_key_asks_for_it(make_core, key_env, validation, caplog):
+    validation.problems[NEW_KEY] = message_problem(400, NOT_SCOPED)
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY}"))
+    assert bot.texts() == ["這是組織層級金鑰，要加 workspace ID：/setkey 名稱 金鑰 wrkspc_…"]
+    assert key_env.env.read_bytes() == key_env.before and not key_env.keys.exists()
+    assert "HTTP 400" in caplog.text and "not scoped" not in caplog.text
+    assert_no_keys(bot, caplog)
+
+
+@pytest.mark.parametrize("status", [400, 403, 404])
+def test_setkey_with_rejected_workspace(make_core, key_env, validation, caplog, status):
+    validation.problems[NEW_KEY] = message_problem(status, f"Workspace {WORKSPACE} not found or not accessible.")
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY} {WORKSPACE}"))
+    assert bot.texts() == ["workspace ID 不對（要 wrkspc_ 開頭，在 Console → Settings → Workspaces）"]
+    assert key_env.env.read_bytes() == key_env.before and not key_env.keys.exists()
+    assert WORKSPACE not in caplog.text
+    assert_no_keys(bot, caplog)
+
+
+def test_setkey_other_failures_with_workspace_keep_old_replies(make_core, key_env, validation, caplog):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    validation.problems[NEW_KEY] = message_problem(401, "invalid x-api-key")
+    _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY} {WORKSPACE}"))
+    validation.problems[NEW_KEY] = message_problem(500, "Internal server error")
+    _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY} {WORKSPACE}"))
+    assert bot.texts() == ["金鑰無效或沒有權限，沒有更換。", "暫時無法驗證，沒有更換，稍後再試。"]
+    assert key_env.env.read_bytes() == key_env.before and not key_env.keys.exists()
+
+
+@pytest.mark.parametrize("workspace", ["wrkspc_", "wrkspc_ab", "wrkspc_有中文", "wrkspc_a-b-c-d", "WRKSPC_abcdef",
+                                       "wrkspc_" + "a" * 81], ids=["empty", "short", "cjk", "dash", "upper", "long"])
+def test_setkey_bad_workspace_format_skips_validation(make_core, key_env, validation, caplog, workspace):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    _receive(bot_core, bot, _message(f"/setkey 備用 {NEW_KEY} {workspace}"))
+    assert bot.texts() == [tg.BAD_WORKSPACE]
+    assert not validation.events and bot.calls[0][0] == "delete"
+    assert key_env.env.read_bytes() == key_env.before and not key_env.keys.exists()
+
+
+def test_workspace_format_rule():
+    assert core.is_workspace_format(WORKSPACE) and core.is_workspace_format("wrkspc_abcd")
+    for bad in ("wrkspc_abc", "wrkspc_", "workspace_abcd", "wrkspc_ab cd", None, 3):
+        assert not core.is_workspace_format(bad)
+
+
+def test_usekey_switches_key_and_workspace_together(make_core, key_env, validation, caplog):
+    key_env.keys.write_text(json.dumps({"active": "組織", "keys": {
+        "組織": {"key": OLD_KEY, "workspace": WORKSPACE}, "綁定": {"key": NEW_KEY, "workspace": None},
+        "另一個": {"key": SPARE_KEY, "workspace": OTHER_WORKSPACE}}}, ensure_ascii=False))
+    key_env.env.write_bytes(env_with(OLD_KEY, WORKSPACE))
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    _receive(bot_core, bot, _message("/usekey 組織"))
+    assert bot.texts()[-1] == "已經在用 組織。" and not validation.events
+    _receive(bot_core, bot, _message("/usekey 綁定"))
+    assert bot.texts()[-1] == "已改用 綁定 …abcd，下一題開始生效。"
+    assert key_env.env.read_bytes() == env_with(NEW_KEY, None) and core.resolve_workspace_id() is None
+    _receive(bot_core, bot, _message("/usekey 另一個"))
+    # workspace 那一行先前被刪掉，這次加在檔尾；其他行原樣保留
+    env = core.read_env_file(key_env.env)
+    assert (env["ANTHROPIC_API_KEY"], env["ANTHROPIC_WORKSPACE_ID"]) == (SPARE_KEY, OTHER_WORKSPACE)
+    assert key_env.env.read_bytes() == env_with(SPARE_KEY, None) + f"\r\nANTHROPIC_WORKSPACE_ID={OTHER_WORKSPACE}\r\n".encode()
+    _receive(bot_core, bot, _message("/usekey 組織"))
+    assert key_env.env.read_bytes() == env_with(OLD_KEY, None) + f"\r\nANTHROPIC_WORKSPACE_ID={WORKSPACE}\r\n".encode()
+    assert [event[1:3] for event in validation.events if event[0] == "create"] == [
+        (NEW_KEY, None), (SPARE_KEY, OTHER_WORKSPACE), (OLD_KEY, WORKSPACE)]
+    # 同一把金鑰但 .env 的 workspace 被改掉：不算「已經在用」，重新寫入
+    key_env.env.write_bytes(env_with(OLD_KEY, OTHER_WORKSPACE))
+    _receive(bot_core, bot, _message("/usekey 組織"))
+    assert bot.texts()[-1] == "已改用 組織 …OLD1，下一題開始生效。"
+    assert key_env.env.read_bytes() == env_with(OLD_KEY, WORKSPACE)
+    assert WORKSPACE not in caplog.text and OTHER_WORKSPACE not in caplog.text
+    assert_no_keys(bot, caplog)
+
+
+def test_usekey_reports_workspace_problems(make_core, key_env, validation, caplog):
+    write_store(key_env, "預設", {"預設": OLD_KEY, "備用": NEW_KEY})
+    key_env.env.write_bytes(env_with(OLD_KEY, None))      # 舊清單＋.env 沒有 workspace → 備用也沒有
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    validation.problems[NEW_KEY] = message_problem(400, NOT_SCOPED)
+    _receive(bot_core, bot, _message("/usekey 備用"))
+    assert bot.texts()[-1] == ("備用 …abcd 是組織層級金鑰，要加 workspace ID：/setkey 備用 金鑰 wrkspc_…，沒有切換。")
+    assert key_env.env.read_bytes() == env_with(OLD_KEY, None)
+
+
+def test_legacy_store_migrates_to_new_format_on_write(make_core, key_env, validation, caplog):
+    write_store(key_env, "預設", {"預設": OLD_KEY, "備用": NEW_KEY})
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    _receive(bot_core, bot, _message(f"/setkey 第三 {SPARE_KEY} {WORKSPACE}"))
+    assert saved_raw(key_env) == {"active": "第三", "keys": {
+        "預設": {"key": OLD_KEY, "workspace": "wrkspc_test"},
+        "備用": {"key": NEW_KEY, "workspace": "wrkspc_test"},
+        "第三": {"key": SPARE_KEY, "workspace": WORKSPACE}}}
+    assert core.load_key_store().workspaces == {"預設": "wrkspc_test", "備用": "wrkspc_test", "第三": WORKSPACE}
+
+
+@pytest.mark.parametrize("entry", [{"key": NEW_KEY, "workspace": 3}, {"key": NEW_KEY, "workspace": " "},
+                                   {"workspace": WORKSPACE}, {"key": "  "}, [NEW_KEY]])
+def test_bad_new_format_entries_are_rejected(key_env, entry):
+    key_env.keys.write_text(json.dumps({"active": "a", "keys": {"a": entry}}))
+    with pytest.raises(core.KeyStoreError):
+        core.load_key_store()
+
+
+def test_workspace_environment_variable_blocks_switching(make_core, key_env, validation, monkeypatch, caplog):
+    monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", WORKSPACE)
+    write_store(key_env, "預設", {"預設": OLD_KEY, "備用": NEW_KEY})
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    _receive(bot_core, bot, _message("/usekey 備用"))
+    _receive(bot_core, bot, _message(f"/setkey 新的 {NEW_KEY} {WORKSPACE}"))
+    assert bot.texts() == [tg.ENV_OVERRIDE, tg.ENV_OVERRIDE] and not validation.events

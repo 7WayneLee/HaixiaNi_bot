@@ -220,6 +220,41 @@ def test_request_params_for_sonnet_and_options(index_dir):
         make(index_dir, [], model="claude-unknown")
 
 
+def test_request_params_for_fable_5_2(index_dir):
+    assert core.FABLE_MODEL == "claude-fable-5-2" and core.FABLE_MODEL in core.CLAUDE_MODELS
+    client = FakeClient([])
+    answerer = core.Answerer(index_dir, core.FABLE_MODEL, client=client, embedder=FakeEmbedder(),
+                             system_prompt="測試用 system prompt", log_dir=None)
+    params = answerer.request_params([{"role": "user", "content": "問"}])
+    assert params["model"] == "claude-fable-5-2"
+    # 思考一定開：只送 adaptive，不送 disabled／budget_tokens
+    assert params["thinking"] == {"type": "adaptive", "display": "summarized",
+                                  "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+    # 預設 effort 依模型：Fable 5.2 是 high
+    assert answerer.effort == "high" and params["output_config"] == {"effort": "high"}
+    # 不強制工具：只用 auto／none
+    assert params["tool_choice"] == {"type": "auto"}
+    assert answerer.request_params([], allow_tools=False)["tool_choice"] == {"type": "none"}
+    assert params["fallbacks"] == "default"
+    assert params["betas"] == [core.BINDING_BETA, core.FALLBACK_BETA]
+    assert params["tools"] is core.TOOLS and params["max_tokens"] == core.MAX_TOKENS
+
+
+def test_default_effort_depends_on_model(index_dir):
+    assert core.default_effort(core.FABLE_MODEL) == "high"
+    assert core.default_effort(core.DEFAULT_MODEL) == "medium"
+    assert core.default_effort(core.COMPARE_MODEL) == "medium"
+    for model, expected in [(core.DEFAULT_MODEL, "medium"), (core.COMPARE_MODEL, "medium"),
+                            (core.FABLE_MODEL, "high")]:
+        answerer = core.Answerer(index_dir, model, client=FakeClient([]), embedder=FakeEmbedder(),
+                                 system_prompt="x", log_dir=None)
+        assert answerer.request_params([])["output_config"] == {"effort": expected}
+    # 明確指定的 effort 優先
+    low = core.Answerer(index_dir, core.FABLE_MODEL, "low", client=FakeClient([]), embedder=FakeEmbedder(),
+                        system_prompt="x", log_dir=None)
+    assert low.request_params([])["output_config"] == {"effort": "low"}
+
+
 def test_system_prompt_file_covers_the_six_rules():
     prompt = core.SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
     for phrase in [
@@ -733,6 +768,36 @@ def test_write_api_key_creates_missing_env(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize("before, workspace, expected", [
+    # 新增 workspace 一行
+    ("OTHER=1\nANTHROPIC_API_KEY=舊\n", "wrkspc_new1", "OTHER=1\nANTHROPIC_API_KEY={key}\nANTHROPIC_WORKSPACE_ID=wrkspc_new1\n"),
+    # 換掉原有的值，保留位置與註解
+    ("ANTHROPIC_WORKSPACE_ID=wrkspc_old1  # 註解\r\nANTHROPIC_API_KEY=舊\r\n", "wrkspc_new1",
+     "ANTHROPIC_WORKSPACE_ID=wrkspc_new1  # 註解\r\nANTHROPIC_API_KEY={key}\r\n"),
+    # None＝刪掉那一行（重複的也全刪），其他行不動
+    ("ANTHROPIC_WORKSPACE_ID=a\nOTHER=1\nANTHROPIC_API_KEY=舊\nexport ANTHROPIC_WORKSPACE_ID=b", None,
+     "OTHER=1\nANTHROPIC_API_KEY={key}\n"),
+    ("ANTHROPIC_API_KEY=舊", None, "ANTHROPIC_API_KEY={key}"),
+    ("# 只有註解", "wrkspc_new1", "# 只有註解\nANTHROPIC_API_KEY={key}\nANTHROPIC_WORKSPACE_ID=wrkspc_new1\n"),
+])
+def test_write_api_key_with_workspace(tmp_path, before, workspace, expected):
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    path = tmp_path / ".env"
+    path.write_bytes(before.encode())
+    core.write_api_key(key, path, workspace=workspace)
+    assert path.read_bytes() == expected.format(key=key).encode()
+    assert core.resolve_api_key({}, path) == key and core.resolve_workspace_id({}, path) == workspace
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_api_key_default_leaves_workspace_alone(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text("ANTHROPIC_API_KEY=舊\nANTHROPIC_WORKSPACE_ID=wrkspc_keep\n")
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    core.write_api_key(key, path)
+    assert core.resolve_workspace_id({}, path) == "wrkspc_keep" and core.resolve_api_key({}, path) == key
+
+
 def test_env_file_handles_inline_comments_and_quoted_hash(tmp_path):
     path = tmp_path / ".env"
     path.write_text('A=one # 註解\nB="two#three" # 註解\nC=\'four#five\'\nD=six#seven\nE=eight\t# 註解\n')
@@ -777,8 +842,14 @@ def test_cli_without_key_exits_cleanly(tmp_path, monkeypatch, capsys):
 def test_usage_cost_uses_price_table():
     opus = core.PRICES["claude-opus-5-5"]
     assert opus == {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0}
-    for sonnet in ("claude-sonnet-5-5", "claude-sonnet-5"):
-        assert core.PRICES[sonnet] == {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5}
+    # 官方價格頁（2026-11-16）：Sonnet 5.5 的快取讀取是 $0.10，Sonnet 5 是 $0.20
+    assert core.PRICES["claude-sonnet-5-5"] == {"input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_write": 2.5}
+    assert core.PRICES["claude-sonnet-5"] == {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5}
+    fable = core.PRICES["claude-fable-5-2"]
+    assert fable == {"input": 8.0, "output": 40.0, "cache_read": 0.2, "cache_write": 10.0}
+    assert core.usage_cost(dict.fromkeys(core.USAGE_FIELDS, 1_000_000), fable) == pytest.approx(8 + 40 + 0.2 + 10)
+    # Fable 5.2 拒答時的 fallback 目標（Opus 4.8、Opus 5）也要有價格
+    assert {"claude-opus-4-8", "claude-opus-5"} <= set(core.PRICES)
     one_each = dict.fromkeys(core.USAGE_FIELDS, 1_000_000)
     assert core.usage_cost(one_each, opus) == pytest.approx(4 + 20 + 0.2 + 5)
     use = {"input_tokens": 2000, "cache_read_input_tokens": 10000, "cache_creation_input_tokens": 3000,

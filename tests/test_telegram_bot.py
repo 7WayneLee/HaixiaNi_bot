@@ -641,6 +641,9 @@ def test_parse_command_variants():
     assert tg.normalize_code("編號 3E13AF") == "3e13af"
     assert tg.normalize_code("xyz") is None and tg.normalize_code("abc") is None
     assert tg.resolve_model("Sonnet") == "claude-sonnet-5-5" and tg.resolve_model("opus") == "claude-opus-5-5"
+    assert tg.resolve_model("fable") == "claude-fable-5-2" and tg.resolve_model("Fable") == "claude-fable-5-2"
+    assert tg.resolve_model("claude-fable-5-2") == "claude-fable-5-2"
+    assert tg.parse_command("/model fable") == tg.Command("model", "fable", "model")
     assert tg.resolve_model("gpt") is None
 
 
@@ -698,7 +701,7 @@ def test_model_callback_menu_navigation_and_switch(make_core):
     old.messages.append({"role": "user", "content": "舊題"})
     run(bot_core.handle_message(bot, CHAT, USER, "/model"))
     assert len(bot.messages()) == 1
-    for data, expected in [("m:c", ["Opus 5.5（目前）", "Sonnet 5.5", "‹ 返回"]),
+    for data, expected in [("m:c", ["Opus 5.5（目前）", "Sonnet 5.5", "Fable 5.2", "‹ 返回"]),
                            ("m:b", ["Claude", "Gemini"]),
                            ("m:g", ["Gemini 4 Hydrogen", "Gemini 4 Argon", "Gemini 3.8 Flash", "‹ 返回"])]:
         callback = FakeCallback(data)
@@ -740,7 +743,7 @@ def test_gemini_menu_follows_lineup():
         "gemini-flash": "gemini-4-hydrogen", "gemini-pro": "gemini-4-argon",
         "gemini-3.8-flash": "gemini-3.8-flash"}
     assert {data: tg.MODELS[alias] for data, alias in tg.MODEL_CALLBACKS.items()} == {
-        "m:o": "claude-opus-5-5", "m:s": "claude-sonnet-5-5", "m:f": "gemini-4-hydrogen",
+        "m:o": "claude-opus-5-5", "m:s": "claude-sonnet-5-5", "m:fa": "claude-fable-5-2", "m:f": "gemini-4-hydrogen",
         "m:p": "gemini-4-argon", "m:3": "gemini-3.8-flash"}
     assert len(set(tg.MODEL_CALLBACKS)) == len(tg.MODEL_CALLBACKS)
     assert "gemini-3.1-pro-preview" not in tg.MODELS.values()
@@ -839,6 +842,7 @@ def _entry(when, cost, model):
 
 def test_provider_of_model_field():
     assert tg.provider_of("claude-opus-5-5") == tg.provider_of("claude-sonnet-5-5") == "Claude"
+    assert tg.provider_of("claude-fable-5-2") == "Claude"
     assert tg.provider_of("gemini-3.8-flash") == tg.provider_of("gemini-3.1-pro-preview") == "Gemini"
     for other in ("gpt-6-sol", "", None, 42, "Claude-opus"):
         assert tg.provider_of(other) == "其他"
@@ -881,6 +885,41 @@ def test_costs_split_claude_and_gemini():
         "",
         "每日上限 3.000 USD，今天還剩 2.720 USD",
     ])
+
+
+def test_fable_counts_as_claude_in_costs():
+    now = datetime(2026, 11, 16, 4, 0, tzinfo=timezone.utc)
+    lines = [_entry("2026-11-16T01:00:00+00:00", 0.25, "claude-fable-5-2"),
+             _entry("2026-11-16T02:00:00+00:00", 0.10, "claude-opus-5-5"),
+             _entry("2026-11-16T03:00:00+00:00", 0.02, "gemini-3.8-flash")]
+    summary = tg.summarize_costs(lines, now)
+    assert summary.today["Claude"].count == 2 and summary.today["Claude"].usd == pytest.approx(0.35)
+    assert summary.today["Gemini"].count == 1 and "其他" not in summary.today
+
+
+def test_fable_in_claude_menu_and_switch(make_core):
+    bot_core, pool = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    _, rows = tg.model_menu(core.DEFAULT_MODEL, "claude")
+    assert [row[0] for row in rows] == [("Opus 5.5（目前）", "m:o"), ("Sonnet 5.5", "m:s"),
+                                        ("Fable 5.2", "m:fa"), ("‹ 返回", "m:b")]
+    run(bot_core.handle_message(bot, CHAT, USER, "/model"))
+    callback = FakeCallback("m:fa")
+    run(bot_core.handle_model_callback(bot, callback, USER))
+    assert callback.answers == [{}]
+    assert state.model == "claude-fable-5-2" and not state.conversation.messages
+    assert "已切換到 Fable 5.2" in bot.messages()[-1][1]["text"]
+    _, rows = tg.model_menu(state.model, "claude")
+    assert rows[2][0] == ("Fable 5.2（目前）", "m:fa")
+    run(bot_core.handle_message(bot, CHAT, USER, "/model fable"))
+    assert "已經是 Fable 5.2" in bot.texts()[-1]
+    run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
+    assert state.model == core.DEFAULT_MODEL
+    run(bot_core.handle_message(bot, CHAT, USER, "/model fable"))
+    assert bot.texts()[-1] == "已切換到 Fable 5.2，開新對話。" and state.model == "claude-fable-5-2"
+    run(bot_core.handle_message(bot, CHAT, USER, "問題"))
+    assert pool.answerers["claude-fable-5-2"].calls[0]["messages"] == 0
 
 
 def test_costs_with_only_one_provider_still_list_both():

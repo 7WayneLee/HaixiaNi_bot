@@ -1,16 +1,17 @@
 """第四步：Claude 問答核心——搜尋工具、工具迴圈、多輪對話與費用紀錄。
 
-設計重點（依 claude-api skill 對 Opus 5.5 的指引）：
-- 思考不能關（Opus 5.5 送 disabled 會 400），只用 thinking adaptive＋output_config.effort 控制，預設 medium。
-- Opus 5.5 不接受強制 tool_choice（any／tool），只用 auto；工具用 strict: true。
+設計重點（依 claude-api skill 對 Opus 5.5 與 Fable 5.2 的指引）：
+- 思考不能關（Opus 5.5、Fable 5.2 送 disabled 或 budget_tokens 都會 400），只用 thinking adaptive＋
+  output_config.effort 控制；預設 effort 依模型：Opus 5.5 medium、Fable 5.2 high（見 MODEL_EFFORTS）。
+- Opus 5.5、Fable 5.2 都不接受強制 tool_choice（any／tool），只用 auto（或 none）；工具用 strict: true。
   串流時工具另加 eager_input_streaming，伺服器不再驗證輸入，所以執行前自己驗證。
-- 對話只附加、不改寫（preserved thinking）：每輪把完整的 response.content 放回歷史，
+- 對話只附加、不改寫（preserved thinking；Fable 5.2 對每個帳號都檢查）：每輪把完整的 response.content 放回歷史，
   system prompt 與工具定義在 Answerer 建立時就固定，之後不動。
 - 超過工具輪數上限時，不拿掉工具（會改到快取與思考綁定的前綴），而是改送 tool_choice none，
   並在最後一則工具結果後面附一段說明。
 - prompt caching：system 最後一塊加 cache_control（連同前面的工具定義一起快取），
   另開頂層自動快取給持續變長的對話。
-- 拒答：先看 stop_reason == "refusal" 再讀內容；Opus 5.5 預設開伺服器端 fallback（"default"）。
+- 拒答：先看 stop_reason == "refusal" 再讀內容；Opus 5.5、Fable 5.2 預設開伺服器端 fallback（"default"）。
 """
 
 import json
@@ -34,22 +35,29 @@ LOG_NAME = "answers.jsonl"
 
 DEFAULT_MODEL = "claude-opus-5-5"
 COMPARE_MODEL = "claude-sonnet-5-5"   # 第六步比較用（2026-09-28 推出，與 Sonnet 5 同價）
+FABLE_MODEL = "claude-fable-5-2"      # 最強的公開模型，價格是 Opus 5.5 的兩倍；需要 30 天資料保存
+CLAUDE_MODELS = (DEFAULT_MODEL, COMPARE_MODEL, FABLE_MODEL)   # bot 選單與 ask.py 說明列的 Claude 模型
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT = "medium"
+# 各模型的預設 effort（沒列的用 DEFAULT_EFFORT）。Fable 5.2 官方建議從 high 開始，再往上收益不穩定。
+MODEL_EFFORTS = {FABLE_MODEL: "high"}
 MAX_TOKENS = 64000          # 串流請求的建議值；思考也算在裡面
 MAX_TOOL_ROUNDS = 8
 JSON_RETRIES = 2            # 串流中工具輸入的 JSON 完全解析不了時，重送同一個請求的次數
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"   # fallbacks: "default"
 BINDING_BETA = "thinking-binding-controls-2026-08-01"
-# 預設開伺服器端 fallback 的模型（skill：Opus 5.5／Opus 5／Fable 5.1 從第一天就開）
-FALLBACK_DEFAULT_MODELS = frozenset({"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1"})
+# 預設開伺服器端 fallback 的模型（skill：Opus 5.5／Opus 5／Fable 5.1／Fable 5.2 從第一天就開）。
+# Fable 5.2 拒答時只會改由 Opus 4.8 或 Opus 5 回答（兩者都在 PRICES 裡）。
+FALLBACK_DEFAULT_MODELS = frozenset({"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", FABLE_MODEL})
 
 # 美元／百萬 token。cache_write 是 5 分鐘快取的寫入價（輸入價的 1.25 倍）。
-# Opus 5.5 的快取讀取是輸入價的 0.05 倍，Sonnet 5／5.5 是 $0.20，其他是 0.1 倍。可用 load_prices() 以 JSON 覆蓋。
+# 快取讀取（2026-11-16 依官方價格頁確認）：Fable 5.2 是輸入價的 0.025 倍（$0.20），Opus 5.5、Sonnet 5.5
+# 是 0.05 倍（$0.20、$0.10），Sonnet 5 是 $0.20，其他是 0.1 倍。可用 load_prices() 以 JSON 覆蓋。
 PRICES = {
     "claude-opus-5-5": {"input": 4.00, "output": 20.00, "cache_read": 0.20, "cache_write": 5.00},
-    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50},
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00, "cache_read": 0.10, "cache_write": 2.50},
+    "claude-fable-5-2": {"input": 8.00, "output": 40.00, "cache_read": 0.20, "cache_write": 10.00},
     "claude-sonnet-5": {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50},
     # fallback 可能改由下面的模型回答
     "claude-opus-5": {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
@@ -253,37 +261,55 @@ def atomic_write(path, data):
             temporary.unlink(missing_ok=True)
 
 
-def write_api_key(api_key, env_path=None):
-    """原子更新金鑰；其他行與換行原樣保留，不留備份。呼叫端先驗證金鑰。"""
+def write_env_values(values, env_path=None):
+    """原子更新 .env 的幾個設定 {名稱: 值或 None}；None＝刪掉那一行。其他行與換行原樣保留，不留備份。"""
     path = Path(ENV_PATH if env_path is None else env_path)
     try:
         text = path.read_bytes().decode("utf-8")
     except FileNotFoundError:
         text = ""
-    lines, changed = [], False
+    names = "|".join(re.escape(name) for name in values)
+    pattern = re.compile(rf"([ \t]*(?:export[ \t]+)?({names})[ \t]*=[ \t]*)([^\r\n]*)(\r\n|\r|\n)?")
+    lines, changed = [], set()
     for line in text.splitlines(keepends=True):
-        found = re.fullmatch(r"([ \t]*(?:export[ \t]+)?ANTHROPIC_API_KEY[ \t]*=[ \t]*)([^\r\n]*)(\r\n|\r|\n)?", line)
+        found = pattern.fullmatch(line)
         if found:
-            # 重複設定也全部換掉，避免最後一行的舊金鑰蓋回來。
-            comment = re.search(r"[ \t]+#.*$", found[2])
-            line = found[1] + api_key + (comment[0] if comment else "") + (found[3] or "")
-            changed = True
+            # 重複設定也全部換掉，避免最後一行的舊值蓋回來。
+            changed.add(found[2])
+            value = values[found[2]]
+            if value is None:
+                continue
+            comment = re.search(r"[ \t]+#.*$", found[3])
+            line = found[1] + value + (comment[0] if comment else "") + (found[4] or "")
         lines.append(line)
-    if not changed:
-        newline = "\r\n" if "\r\n" in text else "\n"
-        if text and not text.endswith(("\r", "\n")):
+    newline = "\r\n" if "\r\n" in text else "\n"
+    for name, value in values.items():
+        if name in changed or value is None:
+            continue
+        if lines and not lines[-1].endswith(("\r", "\n")):
             lines.append(newline)
-        lines.append(f"ANTHROPIC_API_KEY={api_key}{newline}")
+        lines.append(f"{name}={value}{newline}")
     atomic_write(path, "".join(lines).encode("utf-8"))
 
 
-# ----- 多把金鑰：.env 旁邊的 JSON，{"active": 名稱, "keys": {名稱: 金鑰}} -----
+def write_api_key(api_key, env_path=None, workspace=False):
+    """原子更新金鑰；workspace 給字串或 None 時，連 ANTHROPIC_WORKSPACE_ID 一起寫（None＝刪掉）。
+    預設（False）不動 workspace。呼叫端先驗證金鑰。"""
+    values = {"ANTHROPIC_API_KEY": api_key}
+    if workspace is not False:
+        values["ANTHROPIC_WORKSPACE_ID"] = workspace
+    write_env_values(values, env_path)
+
+
+# ----- 多把金鑰：.env 旁邊的 JSON，{"active": 名稱, "keys": {名稱: {"key": 金鑰, "workspace": id 或 null}}} -----
+# 舊格式 {名稱: 金鑰} 讀得懂：那時每把金鑰都配 .env 的 ANTHROPIC_WORKSPACE_ID，所以沿用它；下次存檔改成新格式。
 
 KEYS_NAME = ".anthropic_keys.json"
 DEFAULT_KEY_NAME = "預設"
 MAX_SAVED_KEYS = 10
 _KEY_FORMAT = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
 _KEY_NAME = re.compile(r"[\w-]{1,20}")      # \w 含中文、字母、數字與 _
+_WORKSPACE_FORMAT = re.compile(r"wrkspc_[A-Za-z0-9]{4,80}")
 
 
 class KeyStoreError(RuntimeError):
@@ -294,10 +320,19 @@ class KeyStoreError(RuntimeError):
 class KeyStore:
     active: str | None
     keys: dict          # 名稱 → 金鑰，依加入順序
+    workspaces: dict = field(default_factory=dict)   # 名稱 → workspace id；沒有（綁定 workspace 的金鑰）是 None
+
+    def workspace(self, name):
+        return self.workspaces.get(name)
 
 
 def is_key_format(key):
     return 40 <= len(key) <= 300 and _KEY_FORMAT.fullmatch(key) is not None
+
+
+def is_workspace_format(workspace):
+    """組織層級金鑰要配的 workspace id：wrkspc_ 加字母數字。"""
+    return isinstance(workspace, str) and _WORKSPACE_FORMAT.fullmatch(workspace) is not None
 
 
 def is_key_name(name):
@@ -308,34 +343,57 @@ def keys_path(env_path=None):
     return Path(ENV_PATH if env_path is None else env_path).with_name(KEYS_NAME)
 
 
+def _key_entry(value, env_workspace):
+    """清單裡的一筆 → (金鑰, workspace)；格式不對回傳 None。"""
+    if isinstance(value, str):
+        return (value.strip(), env_workspace) if value.strip() else None
+    if not isinstance(value, dict):
+        return None
+    key, workspace = value.get("key"), value.get("workspace")
+    if not isinstance(key, str) or not key.strip():
+        return None
+    if workspace is not None and not (isinstance(workspace, str) and workspace.strip()):
+        return None
+    return key.strip(), workspace.strip() if workspace else None
+
+
 def load_key_store(env_path=None):
-    """讀金鑰清單；檔案還沒建立時，把 .env 的金鑰當成「預設」（不寫檔）。"""
+    """讀金鑰清單；檔案還沒建立時，把 .env 的金鑰（連同 workspace id）當成「預設」（不寫檔）。"""
     path = keys_path(env_path)
+    env = read_env_file(ENV_PATH if env_path is None else env_path)
+    env_workspace = (env.get("ANTHROPIC_WORKSPACE_ID") or "").strip() or None
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        key = (read_env_file(ENV_PATH if env_path is None else env_path).get("ANTHROPIC_API_KEY") or "").strip()
-        return KeyStore(DEFAULT_KEY_NAME, {DEFAULT_KEY_NAME: key}) if key else KeyStore(None, {})
+        key = (env.get("ANTHROPIC_API_KEY") or "").strip()
+        if not key:
+            return KeyStore(None, {})
+        return KeyStore(DEFAULT_KEY_NAME, {DEFAULT_KEY_NAME: key}, {DEFAULT_KEY_NAME: env_workspace})
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise KeyStoreError("金鑰清單不是有效的 JSON") from None
     keys = data.get("keys") if isinstance(data, dict) else None
-    if not isinstance(keys, dict) or not all(isinstance(name, str) and isinstance(key, str) and key.strip()
-                                             for name, key in keys.items()):
+    if not isinstance(keys, dict) or not all(isinstance(name, str) for name in keys):
+        raise KeyStoreError("金鑰清單的格式不對")
+    entries = {name: _key_entry(value, env_workspace) for name, value in keys.items()}
+    if any(entry is None for entry in entries.values()):
         raise KeyStoreError("金鑰清單的格式不對")
     active = data.get("active")
     return KeyStore(active if isinstance(active, str) and active in keys else None,
-                    {name: key.strip() for name, key in keys.items()})
+                    {name: key for name, (key, _) in entries.items()},
+                    {name: workspace for name, (_, workspace) in entries.items()})
 
 
 def save_key_store(store, env_path=None):
-    data = {"active": store.active, "keys": store.keys}
+    keys = {name: {"key": key, "workspace": store.workspace(name)} for name, key in store.keys.items()}
+    data = {"active": store.active, "keys": keys}
     atomic_write(keys_path(env_path), (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
 def activate_key_store(store, env_path=None):
-    """先寫清單，再把使用中的金鑰寫進 .env；.env 寫不進去就把清單還原，兩邊不會不一致。"""
+    """先寫清單，再把使用中的金鑰與 workspace id 寫進 .env（沒有 workspace 就刪掉那一行）；
+    .env 寫不進去就把清單還原，兩邊不會不一致。"""
     path = keys_path(env_path)
     try:
         previous = path.read_bytes()
@@ -343,7 +401,7 @@ def activate_key_store(store, env_path=None):
         previous = None
     save_key_store(store, env_path)
     try:
-        write_api_key(store.keys[store.active], env_path)
+        write_api_key(store.keys[store.active], env_path, workspace=store.workspace(store.active))
     except BaseException:
         try:
             if previous is None:
@@ -393,6 +451,11 @@ def default_embedder(timeout=10):
 
 
 # ---------- 費用 ----------
+
+def default_effort(model):
+    """模型的預設 effort：Fable 5.2 是 high，其他（Opus 5.5、Sonnet 5.5…）是 DEFAULT_EFFORT。"""
+    return MODEL_EFFORTS.get(model, DEFAULT_EFFORT)
+
 
 def load_prices(path, base=PRICES):
     """讀 JSON 價格表 {模型: {input, output, cache_read, cache_write}}，覆蓋預設值。"""
@@ -731,13 +794,14 @@ def history_content(content):
 
 
 class Answerer:
-    def __init__(self, index_dir, model=DEFAULT_MODEL, effort=DEFAULT_EFFORT, *, client=None,
+    def __init__(self, index_dir, model=DEFAULT_MODEL, effort=None, *, client=None,
                  api_key=None, workspace_id=None, embedder="vertex", system_prompt=None,
                  max_tool_rounds=MAX_TOOL_ROUNDS, max_tokens=MAX_TOKENS, fallback=None,
                  prefix_mismatch="drop_block",
                  log_dir=DEFAULT_LOG_DIR, prices=None, clock=time.monotonic, searcher=None):
         """client：anthropic.Anthropic（或同介面物件）；None 時用 api_key（與 workspace_id）建立。
 
+        effort：None＝依模型的預設（default_effort）。
         embedder："vertex"＝用 Vertex 算查詢向量；None＝只用 BM25；或傳入同介面物件（測試用）。
         fallback：None＝依模型決定（Opus 5.5 等預設開）；True／False 強制。
         prefix_mismatch：思考區塊綁定檢查不符時的處理（"drop_block"／"error"／None＝不送）。
@@ -745,6 +809,8 @@ class Answerer:
         searcher：共用現成的 Searcher（Telegram bot 切換模型時用），這時不看 index_dir 與 embedder；
         close() 也不會關掉它，由建立的人負責。
         """
+        if effort is None:
+            effort = default_effort(model)
         if effort not in EFFORTS:
             raise ValueError(f"effort 只能是 {'、'.join(EFFORTS)}")
         self.prices = PRICES if prices is None else prices

@@ -48,7 +48,8 @@ def main(argv=None):
     parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--log-dir", type=Path, default=core.DEFAULT_LOG_DIR,
                         help="問答紀錄 JSONL 的資料夾（每日花費也從這裡加總）")
-    parser.add_argument("--effort", choices=core.EFFORTS, default=core.DEFAULT_EFFORT)
+    parser.add_argument("--effort", choices=core.EFFORTS, default=None,
+                        help="Claude 思考深度，套用到所有 Claude 模型；不指定時依模型（Fable 5.2 high，其他 medium）")
     parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
                         default="default", help="Gemini 思考程度；default 用模型預設")
     parser.add_argument("--bm25-only", action="store_true", help="不呼叫 Vertex，只用關鍵字搜尋")
@@ -91,7 +92,7 @@ def main(argv=None):
     bot_core = bot.BotCore(config.allowed, pool, daily_budget=config.daily_budget, log_dir=args.log_dir)
     application = bot.build_application(bot_core, config.token)
     log.info("bot 啟動：允許 %d 個使用者，每日上限 US$%.2f，預設模型 %s，effort %s%s",
-             len(config.allowed), config.daily_budget, core.DEFAULT_MODEL, args.effort,
+             len(config.allowed), config.daily_budget, core.DEFAULT_MODEL, args.effort or "依模型",
              "，只用關鍵字搜尋" if args.bm25_only else "")
     application.run_polling(allowed_updates=bot.ALLOWED_UPDATES)
     log.info("bot 已停止")

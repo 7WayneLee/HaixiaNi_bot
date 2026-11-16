@@ -100,10 +100,11 @@ def main(argv=None):
     parser.add_argument("question", nargs="?", help="問題（用 -i 時可省略）")
     parser.add_argument("-i", "--interactive", action="store_true", help="多輪互動")
     parser.add_argument("--model", default=core.DEFAULT_MODEL,
-                        help=f"模型（預設 {core.DEFAULT_MODEL}；可用 {core.COMPARE_MODEL}、"
-                             + "、".join(core.GEMINI_MODELS) + "）")
-    parser.add_argument("--effort", choices=core.EFFORTS, default=core.DEFAULT_EFFORT,
-                        help=f"Claude 思考深度（預設 {core.DEFAULT_EFFORT}）")
+                        help=f"模型（預設 {core.DEFAULT_MODEL}；可用 "
+                             + "、".join(core.CLAUDE_MODELS[1:] + tuple(core.GEMINI_MODELS)) + "）")
+    parser.add_argument("--effort", choices=core.EFFORTS, default=None,
+                        help=f"Claude 思考深度（預設依模型：{core.FABLE_MODEL} 是 "
+                             f"{core.default_effort(core.FABLE_MODEL)}，其他 {core.DEFAULT_EFFORT}）")
     parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
                         default="default", help="Gemini 思考程度；default 用各模型的預設")
     parser.add_argument("--show-tools", action="store_true", help="印出每次搜尋的查詢與命中出處")
@@ -112,7 +113,7 @@ def main(argv=None):
     parser.add_argument("--bm25-only", action="store_true", help="不呼叫 Vertex，只用關鍵字搜尋")
     parser.add_argument("--max-tool-rounds", type=int, default=core.MAX_TOOL_ROUNDS)
     parser.add_argument("--fallback", choices=["auto", "on", "off"], default="auto",
-                        help="伺服器端 fallback（auto：Opus 5.5 等模型開）")
+                        help="伺服器端 fallback（auto：Opus 5.5、Fable 5.2 等模型開）")
     parser.add_argument("--prices", type=Path, help="JSON 價格表，覆蓋預設價格")
     parser.add_argument("--log-dir", type=Path, default=core.DEFAULT_LOG_DIR)
     parser.add_argument("--no-log", action="store_true", help="不寫 JSONL 紀錄")

@@ -44,17 +44,17 @@ PROGRESS_QUERIES = 4            # 進度訊息最多列幾個查詢
 SERVICE = "haixia-bot"
 ALLOWED_UPDATES = ("message", "callback_query")
 
-CLAUDE_ALIASES = ("opus", "sonnet")
+CLAUDE_ALIASES = ("opus", "sonnet", "fable")
 GEMINI_ALIASES = tuple(item.alias for item in core.GEMINI_LINEUP)   # 陣容定義在 answer.GEMINI_LINEUP
-MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
+MODELS = {"opus": core.DEFAULT_MODEL, "sonnet": core.COMPARE_MODEL, "fable": core.FABLE_MODEL,
           **{item.alias: item.id for item in core.GEMINI_LINEUP}}
-MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
+MODEL_NAMES = {core.DEFAULT_MODEL: "Opus 5.5", core.COMPARE_MODEL: "Sonnet 5.5", core.FABLE_MODEL: "Fable 5.2",
                **{item.id: item.name for item in core.GEMINI_LINEUP}, **core.RETIRED_MODELS}
 COMMANDS = {"start", "help", "new", "model", "cost", "source", "key", "setkey", "usekey", "delkey"}
 # /setkey、/delkey 不放進選單，避免誤點；/key 有切換按鈕，/usekey 也不必放。
 BOT_COMMANDS = [("help", "說明"), ("new", "開新對話"), ("model", "換模型"),
                 ("cost", "看花費"), ("source", "看原文：/source 編號"), ("key", "看、換 Claude 金鑰")]
-MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", **{item.callback: item.alias for item in core.GEMINI_LINEUP}}
+MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:fa": "fable", **{item.callback: item.alias for item in core.GEMINI_LINEUP}}
 KEY_CALLBACK = re.compile(r"k:([0-9a-f]{8})")     # 只帶名稱的雜湊，不帶金鑰
 
 BM25_NOTE = "（語意搜尋失敗，這題只用關鍵字）"
@@ -201,7 +201,7 @@ def retired_notice(model, default_model):
 
 
 def resolve_model(arg):
-    """opus／sonnet（或完整模型 id）→ 模型 id；不認得回傳 None。停用的 id 原樣傳回，由呼叫端處理。"""
+    """opus／sonnet／fable（或完整模型 id）→ 模型 id；不認得回傳 None。停用的 id 原樣傳回，由呼叫端處理。"""
     arg = (arg or "").strip().lower()
     if arg in MODELS:
         return MODELS[arg]
@@ -865,7 +865,11 @@ def key_error(problem, key=None):
 
 # ---------- Claude 金鑰 ----------
 
-SETKEY_USAGE = "用法：/setkey 名稱 金鑰\n只打金鑰會存成「預設」。\n會自動刪掉含金鑰的訊息。"
+SETKEY_USAGE = ("用法：/setkey 名稱 金鑰\n只打金鑰會存成「預設」。\n"
+                "組織層級金鑰後面加 workspace ID：/setkey 名稱 金鑰 wrkspc_…\n會自動刪掉含金鑰的訊息。")
+SETKEY_FORMAT = "格式不對。用法：/setkey 名稱 金鑰（組織層級金鑰再加 wrkspc_…）"
+NEEDS_WORKSPACE = "這是組織層級金鑰，要加 workspace ID：/setkey 名稱 金鑰 wrkspc_…"
+BAD_WORKSPACE = "workspace ID 不對（要 wrkspc_ 開頭，在 Console → Settings → Workspaces）"
 NAME_RULE = "名稱要 1–20 字，只能用字母、數字、中文、_、-。"
 ENV_OVERRIDE = "環境變數 ANTHROPIC_API_KEY 會蓋過 .env，不能從這裡換。拿掉它、重啟 bot 後再試。"
 STORE_BROKEN = "金鑰清單讀不到，沒有更換。"
@@ -878,6 +882,29 @@ def key_suffix(key):
     return "…" + key[-4:]
 
 
+def workspace_suffix(workspace):
+    """workspace id 不算機密，但也只顯示後 4 碼，例如 wrkspc_…zw9V。"""
+    return "wrkspc_…" + workspace[-4:]
+
+
+def looks_like_workspace(text):
+    return (text or "").lower().startswith("wrkspc")
+
+
+def verify_verdict(problem, workspace):
+    """驗證失敗的種類：needs_workspace、bad_workspace、invalid 或 unverified。只看狀態碼與錯誤訊息，不記錄訊息。"""
+    status = getattr(problem, "status_code", None)
+    body = getattr(problem, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    text = error.get("message") if isinstance(error, dict) else None
+    text = str(text or getattr(problem, "message", "") or "").lower()
+    if status == 400 and "not scoped to a workspace" in text:
+        return "needs_workspace"
+    if workspace and status in (400, 403, 404) and "workspace" in text:
+        return "bad_workspace"
+    return "invalid" if status in (401, 403) else "unverified"
+
+
 def key_token(name):
     """按鈕的 callback data 用名稱雜湊，不帶金鑰；清單改過時對不到就當作過期。"""
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
@@ -888,8 +915,8 @@ def looks_like_key(text):
 
 
 def env_key_override():
-    """環境變數優先於 .env；設了就不能從 Telegram 換（重啟後環境變數又會蓋回來）。"""
-    return bool((os.environ.get("ANTHROPIC_API_KEY") or "").strip())
+    """環境變數優先於 .env；金鑰或 workspace id 設了就不能從 Telegram 換（重啟後環境變數又會蓋回來）。"""
+    return any((os.environ.get(name) or "").strip() for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_WORKSPACE_ID"))
 
 
 def active_key_name(store, effective):
@@ -907,7 +934,9 @@ def key_list(store, effective, override):
     lines = ["Claude 金鑰："]
     for name, key in store.keys.items():
         # 全形「・」本身有間距，打勾後面補一個空白。
+        workspace = store.workspace(name)
         lines.append(f"{'✓ ' if name == active else '・'}{name} {key_suffix(key)}"
+                     + (f" {workspace_suffix(workspace)}" if workspace else "")
                      + ("（使用中）" if name == active else ""))
     if not store.keys:
         lines.append("（還沒有存）")
@@ -1207,16 +1236,19 @@ class BotCore:
             return
         deleted = await self._delete_secret(bot, chat_id, message)    # 不論後面成功與否都先刪
         parts = arg.split()
+        workspace = parts.pop() if len(parts) in (2, 3) and looks_like_workspace(parts[-1]) else None
         name, key = ((core.DEFAULT_KEY_NAME, parts[0]) if len(parts) == 1 else
                      tuple(parts) if len(parts) == 2 else (None, None))
         if name is None or looks_like_key(name):
-            text = "格式不對。用法：/setkey 名稱 金鑰"
+            text = SETKEY_FORMAT
         elif not core.is_key_name(name):
             text = NAME_RULE
         elif not core.is_key_format(key):
             text = "金鑰格式不對。"
+        elif workspace is not None and not core.is_workspace_format(workspace):
+            text = BAD_WORKSPACE
         else:
-            text = await self._key_job(self._setkey_job, name, key)
+            text = await self._key_job(self._setkey_job, name, key, workspace)
         await self.send_html(bot, chat_id, html.escape(text + ("" if deleted else DELETE_REMINDER), quote=False))
 
     async def handle_key_name(self, bot, chat_id, command, message):
@@ -1236,16 +1268,17 @@ class BotCore:
             text = await self._key_job(job, name)
         await self.send_html(bot, chat_id, html.escape(text, quote=False))
 
-    def _verify_key(self, key):
-        """用不計費的 Models API 驗證；回傳 ok、invalid（401／403）或 unverified（網路、逾時、其他狀態碼）。"""
+    def _verify_key(self, key, workspace=None):
+        """用不計費的 Models API 驗證（組織層級金鑰帶 workspace id）。回傳 ok、needs_workspace（組織層級金鑰沒給
+        workspace）、bad_workspace、invalid（401／403）或 unverified（網路、逾時、其他狀態碼）。"""
         client = None
         try:
-            client = core.make_client(key, core.resolve_workspace_id(), timeout=10.0, max_retries=0)
+            client = core.make_client(key, workspace, timeout=10.0, max_retries=0)
             client.models.list(limit=1)
             return "ok"
         except Exception as problem:  # noqa: BLE001
             log.warning("驗證金鑰失敗：%s", key_error(problem, key))
-            return "invalid" if getattr(problem, "status_code", None) in (401, 403) else "unverified"
+            return verify_verdict(problem, workspace)
         finally:
             if client is not None:
                 try:
@@ -1273,8 +1306,8 @@ class BotCore:
             return "金鑰清單讀不到，看 bot 的 log。", []
         return key_list(store, core.env_setting("ANTHROPIC_API_KEY"), env_key_override())
 
-    def _setkey_job(self, name, key):
-        """驗證成功才存；存了就改用。對話歷史與花費紀錄不動。"""
+    def _setkey_job(self, name, key, workspace=None):
+        """驗證成功才存（連同 workspace id）；存了就改用。對話歷史與花費紀錄不動。"""
         if env_key_override():
             return ENV_OVERRIDE
         store = self._load_store()
@@ -1283,12 +1316,17 @@ class BotCore:
         old = store.keys.get(name)
         if old is None and len(store.keys) >= core.MAX_SAVED_KEYS:
             return f"最多存 {core.MAX_SAVED_KEYS} 把，先 /delkey 刪一把。"
-        verdict = self._verify_key(key)
+        verdict = self._verify_key(key, workspace)
+        if verdict == "needs_workspace":
+            return NEEDS_WORKSPACE
+        if verdict == "bad_workspace":
+            return BAD_WORKSPACE
         if verdict == "invalid":
             return "金鑰無效或沒有權限，沒有更換。"
         if verdict != "ok":
             return "暫時無法驗證，沒有更換，稍後再試。"
         store.keys[name] = key
+        store.workspaces[name] = workspace
         try:
             self._activate(store, name)
         except Exception as problem:  # noqa: BLE001
@@ -1313,10 +1351,15 @@ class BotCore:
                 return STALE_KEYS
         elif name not in store.keys:
             return f"沒有「{name}」。/key 看清單。"
-        key = store.keys[name]
-        if store.active == name and core.env_setting("ANTHROPIC_API_KEY") == key:
+        key, workspace = store.keys[name], store.workspace(name)
+        if (store.active == name and core.env_setting("ANTHROPIC_API_KEY") == key
+                and core.env_setting("ANTHROPIC_WORKSPACE_ID") == workspace):
             return f"已經在用 {name}。"
-        verdict = self._verify_key(key)
+        verdict = self._verify_key(key, workspace)
+        if verdict == "needs_workspace":
+            return f"{name} {key_suffix(key)} 是組織層級金鑰，要加 workspace ID：/setkey {name} 金鑰 wrkspc_…，沒有切換。"
+        if verdict == "bad_workspace":
+            return BAD_WORKSPACE + "，沒有切換。"
         if verdict == "invalid":
             return f"{name} {key_suffix(key)} 無效或沒有權限，沒有切換。"
         if verdict != "ok":
