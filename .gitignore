@@ -1,5 +1,8 @@
-# 機密資訊
+# 機密資訊（金鑰清單與寫入時的暫存檔也是）
 .env
+.env.tmp-*
+.anthropic_keys.json
+.anthropic_keys.json.tmp-*
 rclone.conf
 
 # 盤點與執行產生的檔案

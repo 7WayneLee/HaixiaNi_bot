@@ -2,8 +2,7 @@
 
 結構：
 - 純函式：白名單、指令解析、HTML 格式轉換、切訊息、每日花費加總、對話自動重置、醫案原文的格式。
-- BotCore：處理一則訊息的流程。只用到 bot 物件的 send_message、edit_message_text、send_chat_action
-  三個 async 方法（python-telegram-bot 的 Bot 就有），測試用假的 bot 物件。
+- BotCore：處理一則訊息的流程。用假的 bot 物件測試傳送、編輯、刪除與輸入中提示。
 - build_application()：接上 python-telegram-bot（只有這裡 import telegram）。
 
 執行緒：Answerer.ask 是同步、會阻塞的，SQLite 連線也不跨執行緒用，所以所有問答與查原文都丟給
@@ -13,10 +12,12 @@
 
 import asyncio
 from collections import Counter
+import hashlib
 import html
 import json
 import logging
 import math
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -47,10 +48,12 @@ MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
           "gemini-flash": "gemini-3.8-flash", "gemini-pro": "gemini-3.1-pro-preview"}
 MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
                "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.1-pro-preview": "Gemini 3.1 Pro"}
-COMMANDS = {"start", "help", "new", "model", "cost", "source"}
+COMMANDS = {"start", "help", "new", "model", "cost", "source", "key", "setkey", "usekey", "delkey"}
+# /setkey、/delkey 不放進選單，避免誤點；/key 有切換按鈕，/usekey 也不必放。
 BOT_COMMANDS = [("help", "說明"), ("new", "開新對話"), ("model", "換模型"),
-                ("cost", "看花費"), ("source", "看原文：/source 編號")]
+                ("cost", "看花費"), ("source", "看原文：/source 編號"), ("key", "看、換 Claude 金鑰")]
 MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:f": "gemini-flash", "m:p": "gemini-pro"}
+KEY_CALLBACK = re.compile(r"k:([0-9a-f]{8})")     # 只帶名稱的雜湊，不帶金鑰
 
 BM25_NOTE = "（語意搜尋失敗，這題只用關鍵字）"
 
@@ -164,7 +167,7 @@ class RedactFilter(logging.Filter):
 
 @dataclass(frozen=True)
 class Command:
-    name: str           # start、help、new、model、cost、source，其他的是 unknown
+    name: str           # COMMANDS 裡的指令，其他的是 unknown
     arg: str = ""
     raw: str = ""
 
@@ -226,6 +229,7 @@ def _reply_text(message, is_bot):
 
 def reply_question(question, message, user_id):
     """把回覆或選取引用接在本次問題前；呼叫端先處理授權與指令。"""
+    question = core.redact(question)
     quoted = getattr(getattr(message, "quote", None), "text", None)
     external = getattr(message, "external_reply", None)
     replied = getattr(message, "reply_to_message", None)
@@ -248,6 +252,7 @@ def reply_question(question, message, user_id):
         return question
     if not content or not content.strip():
         return question
+    content = core.redact(content)
     if len(content) > REPLY_LIMIT:
         content = content[:REPLY_LIMIT] + "…（後略）"
     title = "【我引用的內容】" if quoted else "【我回覆的訊息】"
@@ -553,7 +558,7 @@ def error_message(problem, model=core.DEFAULT_MODEL):
     except ImportError:  # pragma: no cover — 部署環境一定有
         anthropic = None
     if isinstance(problem, core.MissingApiKey):
-        return "缺 ANTHROPIC_API_KEY，寫進 .env 後重啟 bot。"
+        return "沒有 Claude 金鑰，用 /setkey 金鑰 設定。"
     if gemini:
         import httpx
         if isinstance(problem, httpx.TimeoutException):
@@ -569,7 +574,7 @@ def error_message(problem, model=core.DEFAULT_MODEL):
     if status in (401, 403):
         if gemini:
             return f"Gemini 權限錯誤（HTTP {status}），檢查服務帳號的 Vertex AI 權限。"
-        return f"Claude 金鑰被拒（HTTP {status}），檢查 .env 的 ANTHROPIC_API_KEY。"
+        return f"Claude 金鑰被拒（HTTP {status}），/key 看金鑰，/setkey 換。"
     if status == 400:
         return f"{service} 不接受這次請求（HTTP 400），/new 開新對話再問。"
     if isinstance(status, int) and status >= 500:
@@ -792,6 +797,10 @@ def help_text(model, budget):
 /new 開新對話
 /cost 看花費
 /source 編號 看原文
+/key 看、換 Claude 金鑰
+/setkey 名稱 金鑰 存金鑰
+/usekey 名稱 改用金鑰
+/delkey 名稱 刪金鑰
 點出處後面的 /s_… 看原文
 
 目前模型：{model_name(model)}
@@ -827,6 +836,83 @@ class AnswererPool:
             answerer.close()
         if self.searcher is not None:
             self.searcher.close()
+
+    def invalidate_claude(self):
+        """只在 worker 執行緒輪換 Claude；先移除，關閉失敗也不會沿用舊 client。"""
+        for model in list(self.answerers):
+            if not model.startswith("claude-"):
+                continue
+            answerer = self.answerers.pop(model)
+            try:
+                answerer.close()
+            except Exception as problem:  # noqa: BLE001
+                log.warning("關閉舊 Claude 失敗：%s", key_error(problem))
+
+
+def key_error(problem, key=None):
+    """金鑰流程只記錯誤類型與數字狀態碼，不記例外訊息。"""
+    status = getattr(problem, "status_code", None)
+    return core.redact(f"{type(problem).__name__}（HTTP {status if isinstance(status, int) else None}）", key)
+
+
+# ---------- Claude 金鑰 ----------
+
+SETKEY_USAGE = "用法：/setkey 名稱 金鑰\n只打金鑰會存成「預設」。\n會自動刪掉含金鑰的訊息。"
+NAME_RULE = "名稱要 1–20 字，只能用字母、數字、中文、_、-。"
+ENV_OVERRIDE = "環境變數 ANTHROPIC_API_KEY 會蓋過 .env，不能從這裡換。拿掉它、重啟 bot 後再試。"
+STORE_BROKEN = "金鑰清單讀不到，沒有更換。"
+STALE_KEYS = "清單過期了，重打 /key"
+DELETE_REMINDER = "\n請手動刪掉剛才那則訊息。"
+
+
+def key_suffix(key):
+    """只顯示後 4 碼。"""
+    return "…" + key[-4:]
+
+
+def key_token(name):
+    """按鈕的 callback data 用名稱雜湊，不帶金鑰；清單改過時對不到就當作過期。"""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+
+
+def looks_like_key(text):
+    return "sk-ant-" in (text or "")
+
+
+def env_key_override():
+    """環境變數優先於 .env；設了就不能從 Telegram 換（重啟後環境變數又會蓋回來）。"""
+    return bool((os.environ.get("ANTHROPIC_API_KEY") or "").strip())
+
+
+def active_key_name(store, effective):
+    """實際生效的金鑰對應到哪個名稱；以生效的金鑰為準，清單的 active 只在重複時優先。"""
+    if not effective:
+        return None
+    if store.active is not None and store.keys.get(store.active) == effective:
+        return store.active
+    return next((name for name, key in store.keys.items() if key == effective), None)
+
+
+def key_list(store, effective, override):
+    """/key 的文字與按鈕規格；只顯示名稱與後 4 碼。"""
+    active = active_key_name(store, effective)
+    lines = ["Claude 金鑰："]
+    for name, key in store.keys.items():
+        # 全形「・」本身有間距，打勾後面補一個空白。
+        lines.append(f"{'✓ ' if name == active else '・'}{name} {key_suffix(key)}"
+                     + ("（使用中）" if name == active else ""))
+    if not store.keys:
+        lines.append("（還沒有存）")
+    if override:
+        lines.append(f"現在用環境變數的 {key_suffix(effective)}，不能從這裡換。")
+    elif not effective:
+        lines.append("現在沒有金鑰。")
+    elif active is None:
+        lines.append(f"現在用的 {key_suffix(effective)} 不在清單裡。")
+    rows = [] if override else [[(f"改用 {name}", f"k:{key_token(name)}")]
+                                for name in store.keys if name != active]
+    lines.append(("點按鈕切換。" if rows else "") + "新增：/setkey 名稱 金鑰")
+    return "\n".join(lines), rows
 
 
 @dataclass
@@ -929,6 +1015,8 @@ class BotCore:
 
     async def _call(self, method, **kwargs):
         """呼叫 Telegram；被限速（RetryAfter）或網路逾時時重試兩次。"""
+        if "text" in kwargs:
+            kwargs["text"] = core.redact(kwargs["text"])
         for attempt in range(3):
             try:
                 return await method(**kwargs)
@@ -1029,12 +1117,12 @@ class BotCore:
             return
         command = parse_command(text)
         if command is not None:
-            await self.handle_command(bot, chat_id, command)
+            await self.handle_command(bot, chat_id, command, message=message)
         else:
             question = reply_question(text, message, user_id)
-            await self.handle_question(bot, chat_id, question, display_question=text)
+            await self.handle_question(bot, chat_id, question, display_question=core.redact(text))
 
-    async def handle_command(self, bot, chat_id, command):
+    async def handle_command(self, bot, chat_id, command, *, message=None):
         state = self.state(chat_id)
         if command.name in ("start", "help"):
             await self.send_html(bot, chat_id, help_text(state.model, self.daily_budget))
@@ -1053,8 +1141,202 @@ class BotCore:
             await self.send_html(bot, chat_id, html.escape(cost_message(summary, self.daily_budget), quote=False))
         elif command.name == "source":
             await self.handle_source(bot, chat_id, command.arg)
+        elif command.name == "key":
+            await self.handle_key(bot, chat_id)
+        elif command.name == "setkey":
+            await self.handle_setkey(bot, chat_id, command.arg, message)
+        elif command.name in ("usekey", "delkey"):
+            await self.handle_key_name(bot, chat_id, command, message)
         else:
             await self.send_html(bot, chat_id, f"不認得 /{html.escape(command.raw)}，/help 看指令。")
+
+    # ----- Claude 金鑰 -----
+    # 讀寫金鑰、驗證與重建 Claude 都在 worker 執行緒依序做：金鑰操作彼此不會交錯，
+    # 也不會在一題回答到一半時換掉 client（那一題用舊金鑰答完）。
+
+    async def _key_job(self, job, *args, **kwargs):
+        self.pending += 1
+        try:
+            return await asyncio.get_running_loop().run_in_executor(
+                self.executor, lambda: self._guard_key_job(job, *args, **kwargs))
+        finally:
+            self.pending -= 1
+
+    @staticmethod
+    def _guard_key_job(job, *args, **kwargs):
+        try:
+            return job(*args, **kwargs)
+        except Exception as problem:  # noqa: BLE001 — 只記類型與狀態碼
+            log.error("金鑰操作失敗：%s", key_error(problem))
+            return "金鑰操作出錯，沒有更換，稍後再試。"
+
+    async def _delete_secret(self, bot, chat_id, message):
+        """刪掉含金鑰的訊息；成功回傳 True。失敗只記類型（不記訊息內容）。"""
+        try:
+            message_id = getattr(message, "message_id", None)
+            if message_id is None:
+                raise LookupError("沒有訊息編號")
+            if not await self._call(bot.delete_message, chat_id=chat_id, message_id=message_id):
+                raise RuntimeError("Telegram 沒有刪除")
+            return True
+        except Exception as problem:  # noqa: BLE001
+            log.warning("刪除金鑰訊息失敗：%s", key_error(problem))
+            return False
+
+    async def handle_key(self, bot, chat_id):
+        text, rows = await self._key_job(self._list_keys_job)
+        if not rows:
+            await self.send_html(bot, chat_id, html.escape(text, quote=False))
+            return
+        try:
+            await self._call(bot.send_message, chat_id=chat_id, text=text, reply_markup=model_keyboard(rows))
+        except Exception as problem:  # noqa: BLE001
+            log.error("送金鑰清單失敗：%s", type(problem).__name__)
+
+    async def handle_setkey(self, bot, chat_id, arg, message):
+        if not arg:
+            await self.send_html(bot, chat_id, html.escape(SETKEY_USAGE, quote=False))
+            return
+        deleted = await self._delete_secret(bot, chat_id, message)    # 不論後面成功與否都先刪
+        parts = arg.split()
+        name, key = ((core.DEFAULT_KEY_NAME, parts[0]) if len(parts) == 1 else
+                     tuple(parts) if len(parts) == 2 else (None, None))
+        if name is None or looks_like_key(name):
+            text = "格式不對。用法：/setkey 名稱 金鑰"
+        elif not core.is_key_name(name):
+            text = NAME_RULE
+        elif not core.is_key_format(key):
+            text = "金鑰格式不對。"
+        else:
+            text = await self._key_job(self._setkey_job, name, key)
+        await self.send_html(bot, chat_id, html.escape(text + ("" if deleted else DELETE_REMINDER), quote=False))
+
+    async def handle_key_name(self, bot, chat_id, command, message):
+        """/usekey、/delkey 只收名稱；誤貼了金鑰就先刪掉那則訊息。"""
+        name = command.arg
+        if not name:
+            usage = "用法：/usekey 名稱（/key 看清單）" if command.name == "usekey" else "用法：/delkey 名稱"
+            await self.send_html(bot, chat_id, html.escape(usage, quote=False))
+            return
+        if looks_like_key(name):
+            deleted = await self._delete_secret(bot, chat_id, message)
+            text = "這裡要打名稱，不是金鑰。" + ("已刪掉那則訊息。" if deleted else DELETE_REMINDER)
+        elif not core.is_key_name(name):
+            text = NAME_RULE
+        else:
+            job = self._usekey_job if command.name == "usekey" else self._delkey_job
+            text = await self._key_job(job, name)
+        await self.send_html(bot, chat_id, html.escape(text, quote=False))
+
+    def _verify_key(self, key):
+        """用不計費的 Models API 驗證；回傳 ok、invalid（401／403）或 unverified（網路、逾時、其他狀態碼）。"""
+        client = None
+        try:
+            client = core.make_client(key, core.resolve_workspace_id(), timeout=10.0, max_retries=0)
+            client.models.list(limit=1)
+            return "ok"
+        except Exception as problem:  # noqa: BLE001
+            log.warning("驗證金鑰失敗：%s", key_error(problem, key))
+            return "invalid" if getattr(problem, "status_code", None) in (401, 403) else "unverified"
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as problem:  # noqa: BLE001
+                    log.warning("關閉驗證連線失敗：%s", key_error(problem, key))
+
+    def _activate(self, store, name):
+        """寫清單與 .env，再讓 Claude 下一題重建（重建時重讀 .env）；Gemini 不動。失敗時丟例外。"""
+        store.active = name
+        core.activate_key_store(store)
+        self.pool.invalidate_claude()
+        log.info("Claude 金鑰改用：%s", name)
+
+    def _load_store(self):
+        try:
+            return core.load_key_store()
+        except (core.KeyStoreError, OSError) as problem:
+            log.error("讀金鑰清單失敗：%s", key_error(problem))
+            return None
+
+    def _list_keys_job(self):
+        store = self._load_store()
+        if store is None:
+            return "金鑰清單讀不到，看 bot 的 log。", []
+        return key_list(store, core.env_setting("ANTHROPIC_API_KEY"), env_key_override())
+
+    def _setkey_job(self, name, key):
+        """驗證成功才存；存了就改用。對話歷史與花費紀錄不動。"""
+        if env_key_override():
+            return ENV_OVERRIDE
+        store = self._load_store()
+        if store is None:
+            return STORE_BROKEN
+        old = store.keys.get(name)
+        if old is None and len(store.keys) >= core.MAX_SAVED_KEYS:
+            return f"最多存 {core.MAX_SAVED_KEYS} 把，先 /delkey 刪一把。"
+        verdict = self._verify_key(key)
+        if verdict == "invalid":
+            return "金鑰無效或沒有權限，沒有更換。"
+        if verdict != "ok":
+            return "暫時無法驗證，沒有更換，稍後再試。"
+        store.keys[name] = key
+        try:
+            self._activate(store, name)
+        except Exception as problem:  # noqa: BLE001
+            log.warning("寫入金鑰失敗：%s", key_error(problem, key))
+            return "寫入金鑰失敗，沒有更換，稍後再試。"
+        if old is None:
+            return f"已存 {name} {key_suffix(key)} 並改用，下一題開始生效。"
+        reminder = ("舊金鑰記得到 Anthropic Console 撤銷。"
+                    if old != key and old not in store.keys.values() else "")
+        return f"已更新 {name} {key_suffix(key)}，下一題開始生效。" + reminder
+
+    def _usekey_job(self, name=None, token=None):
+        """切換前重新驗證；無效或驗證不了就維持現在的金鑰。"""
+        if env_key_override():
+            return ENV_OVERRIDE
+        store = self._load_store()
+        if store is None:
+            return STORE_BROKEN
+        if token is not None:
+            name = next((item for item in store.keys if key_token(item) == token), None)
+            if name is None:
+                return STALE_KEYS
+        elif name not in store.keys:
+            return f"沒有「{name}」。/key 看清單。"
+        key = store.keys[name]
+        if store.active == name and core.env_setting("ANTHROPIC_API_KEY") == key:
+            return f"已經在用 {name}。"
+        verdict = self._verify_key(key)
+        if verdict == "invalid":
+            return f"{name} {key_suffix(key)} 無效或沒有權限，沒有切換。"
+        if verdict != "ok":
+            return "暫時無法驗證，沒有切換，稍後再試。"
+        try:
+            self._activate(store, name)
+        except Exception as problem:  # noqa: BLE001
+            log.warning("寫入金鑰失敗：%s", key_error(problem, key))
+            return "寫入失敗，沒有切換，稍後再試。"
+        return f"已改用 {name} {key_suffix(key)}，下一題開始生效。"
+
+    def _delkey_job(self, name):
+        """不能刪使用中的金鑰；只改清單，不動 .env 與 Claude。"""
+        store = self._load_store()
+        if store is None:
+            return "金鑰清單讀不到，沒有刪除。"
+        if name not in store.keys:
+            return f"沒有「{name}」。/key 看清單。"
+        if name in (store.active, active_key_name(store, core.env_setting("ANTHROPIC_API_KEY"))):
+            return f"{name} 正在使用，不能刪。先 /usekey 換別把。"
+        key = store.keys.pop(name)
+        try:
+            core.save_key_store(store)
+        except Exception as problem:  # noqa: BLE001
+            log.warning("刪除金鑰失敗：%s", key_error(problem, key))
+            return "刪除失敗，稍後再試。"
+        log.info("Claude 金鑰已刪除：%s", name)
+        return f"已刪掉 {name} {key_suffix(key)}。"
 
     def switch_model(self, state, arg):
         model = resolve_model(arg)
@@ -1065,6 +1347,36 @@ class BotCore:
         state.model = model
         state.reset()
         return f"已切換到 {model_name(model)}，開新對話。"
+
+    async def handle_callback(self, bot, query, user_id):
+        """依 callback data 分派：k: 是金鑰按鈕，其他交給模型選單。"""
+        data = getattr(query, "data", None)
+        if isinstance(data, str) and data.startswith("k:"):
+            await self.handle_key_callback(bot, query, user_id)
+        else:
+            await self.handle_model_callback(bot, query, user_id)
+
+    async def handle_key_callback(self, bot, query, user_id):
+        """金鑰按鈕：先確認白名單、一定先 answer，再到 worker 驗證與切換。"""
+        try:
+            await query.answer()
+        except Exception as problem:  # noqa: BLE001 — 停止轉圈失敗不影響切換
+            log.info("回應按鈕失敗：%s", type(problem).__name__)
+        if not self.is_allowed(user_id):
+            log.warning("拒絕 key callback user_id=%s", user_id)
+            return
+        message = query.message
+        if message is None:
+            return
+        chat_id, message_id = message.chat_id, message.message_id
+        found = KEY_CALLBACK.fullmatch(query.data)
+        if found is None:
+            text = STALE_KEYS
+        else:
+            # 先拿掉按鈕，避免重複按；驗證可能要排在正在回答的題目後面。
+            await self.edit_plain(bot, chat_id, message_id, "驗證中…")
+            text = await self._key_job(self._usekey_job, token=found.group(1))
+        await self.edit_plain(bot, chat_id, message_id, text)
 
     async def handle_model_callback(self, bot, query, user_id):
         """依按鈕使用者 ID 授權；每個 callback 都先 answer 以停止轉圈。"""
@@ -1224,7 +1536,7 @@ def build_application(bot_core, token):
         query = update.callback_query
         if query is not None:
             user = update.effective_user
-            await bot_core.handle_model_callback(context.bot, query, user.id if user else None)
+            await bot_core.handle_callback(context.bot, query, user.id if user else None)
 
     async def on_error(update, context):
         log.error("處理 Telegram 更新時出錯：%s", type(context.error).__name__)

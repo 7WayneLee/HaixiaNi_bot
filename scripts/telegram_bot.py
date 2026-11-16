@@ -24,14 +24,23 @@ DEFAULT_INDEX = Path.home() / "haixia-index-build"
 
 def setup_logging(*secrets):
     handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s：%(message)s"))
     handler.addFilter(bot.RedactFilter(*secrets))
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(logging.INFO)
+    # anthropic 被 import 時會依 ANTHROPIC_LOG 調低 anthropic／httpx 的等級；先 import，下面的設定才不會被蓋掉。
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:  # pragma: no cover — 部署環境一定有
+        pass
     # httpx 在 INFO 會印出完整網址，Telegram 的網址裡有 bot token
-    for name in ("httpx", "httpcore", "telegram", "apscheduler"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    names = ("httpx", "httpcore", "httpx2", "httpcore2", "telegram", "anthropic", "apscheduler")
+    # PTB 的 DEBUG 會帶整則更新與請求內容；也清掉已載入子 logger 的 DEBUG 設定。
+    for name in set(names) | set(logging.root.manager.loggerDict):
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in names):
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main(argv=None):
@@ -63,8 +72,8 @@ def main(argv=None):
             from haixia import answer_gemini
             return answer_gemini.Answerer(args.index_dir, model, searcher=searcher,
                                           thinking_level=args.gemini_thinking, log_dir=args.log_dir)
-        return core.Answerer(args.index_dir, model, args.effort, api_key=config.api_key,
-                             workspace_id=config.workspace_id, searcher=searcher, log_dir=args.log_dir)
+        return core.Answerer(args.index_dir, model, args.effort, api_key=core.resolve_api_key(),
+                             workspace_id=core.resolve_workspace_id(), searcher=searcher, log_dir=args.log_dir)
 
     if args.check:
         try:

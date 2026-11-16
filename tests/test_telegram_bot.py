@@ -1,6 +1,6 @@
 """第五步 Telegram bot：白名單、格式、切訊息、指令、每日上限、自動重置、排隊、進度頻率、原文查詢。
 
-全部用假的 bot 物件（只有 send_message、edit_message_text、send_chat_action）與假的 Answerer，
+全部用假的 bot 物件與假的 Answerer，
 不連 Telegram、不打 Anthropic 或 Vertex，也不讀真的 .env。醫案姓名都是虛構的測試資料。
 """
 
@@ -54,11 +54,15 @@ class FakeBot:
     async def send_chat_action(self, **kwargs):
         self.calls.append(("action", kwargs))
 
+    async def delete_message(self, **kwargs):
+        self.calls.append(("delete", kwargs))
+        return True
+
     def texts(self, kind=None):
-        return [kwargs["text"] for name, kwargs in self.calls if name != "action" and kind in (None, name)]
+        return [kwargs["text"] for name, kwargs in self.calls if name in ("send", "edit") and kind in (None, name)]
 
     def messages(self):
-        return [(name, kwargs) for name, kwargs in self.calls if name != "action"]
+        return [(name, kwargs) for name, kwargs in self.calls if name in ("send", "edit")]
 
 
 class FakeCallback:
@@ -99,6 +103,8 @@ class FakeAnswerer:
 
 
 class FakePool:
+    invalidate_claude = tg.AnswererPool.invalidate_claude
+
     def __init__(self, script=None, store=None):
         self.script = script
         self.answerers = {}
@@ -1107,7 +1113,7 @@ def test_timeout_and_connection_errors():
     request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     assert "逾時" in tg.error_message(anthropic.APITimeoutError(request=request))
     assert "連不上" in tg.error_message(anthropic.APIConnectionError(request=request))
-    assert "ANTHROPIC_API_KEY" in tg.error_message(core.MissingApiKey("x"))
+    assert "/setkey" in tg.error_message(core.MissingApiKey("x"))
 
 
 def test_gemini_api_error_uses_vertex_wording_without_raw_text():

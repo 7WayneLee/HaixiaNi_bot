@@ -16,6 +16,7 @@
 import json
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -158,8 +159,13 @@ def read_env_file(path):
         key, value = key.strip(), value.strip()
         if not sep or not key.isidentifier():
             continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        if value.startswith(("\"", "'")):
+            end = value.find(value[0], 1)
+            if end > 0 and (not value[end + 1:].strip() or value[end + 1:].lstrip().startswith("#")):
+                value = value[1:end]
+        else:
+            # 和 dotenv 一樣：空白後面的 # 才是註解，值裡面的 a#b 保留。
+            value = re.split(r"[ \t]#", value, maxsplit=1)[0].rstrip()
         values[key] = value
     return values
 
@@ -187,13 +193,135 @@ def resolve_workspace_id(environ=None, env_path=None):
     return env_setting("ANTHROPIC_WORKSPACE_ID", environ, env_path)
 
 
+def atomic_write(path, data):
+    """同目錄暫存檔 → 權限 600 → os.replace；失敗時刪掉暫存檔，不留含金鑰的檔案。"""
+    path = Path(path)
+    temporary = None
+    try:
+        # 暫存檔名有固定前綴，.gitignore 擋得到（萬一程式在 replace 前被殺掉）。
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".tmp-", delete=False) as output:
+            temporary = Path(output.name)
+            os.chmod(temporary, 0o600)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_api_key(api_key, env_path=None):
+    """原子更新金鑰；其他行與換行原樣保留，不留備份。呼叫端先驗證金鑰。"""
+    path = Path(ENV_PATH if env_path is None else env_path)
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        text = ""
+    lines, changed = [], False
+    for line in text.splitlines(keepends=True):
+        found = re.fullmatch(r"([ \t]*(?:export[ \t]+)?ANTHROPIC_API_KEY[ \t]*=[ \t]*)([^\r\n]*)(\r\n|\r|\n)?", line)
+        if found:
+            # 重複設定也全部換掉，避免最後一行的舊金鑰蓋回來。
+            comment = re.search(r"[ \t]+#.*$", found[2])
+            line = found[1] + api_key + (comment[0] if comment else "") + (found[3] or "")
+            changed = True
+        lines.append(line)
+    if not changed:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if text and not text.endswith(("\r", "\n")):
+            lines.append(newline)
+        lines.append(f"ANTHROPIC_API_KEY={api_key}{newline}")
+    atomic_write(path, "".join(lines).encode("utf-8"))
+
+
+# ----- 多把金鑰：.env 旁邊的 JSON，{"active": 名稱, "keys": {名稱: 金鑰}} -----
+
+KEYS_NAME = ".anthropic_keys.json"
+DEFAULT_KEY_NAME = "預設"
+MAX_SAVED_KEYS = 10
+_KEY_FORMAT = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
+_KEY_NAME = re.compile(r"[\w-]{1,20}")      # \w 含中文、字母、數字與 _
+
+
+class KeyStoreError(RuntimeError):
+    """金鑰清單檔壞了。訊息不含檔案內容。"""
+
+
+@dataclass
+class KeyStore:
+    active: str | None
+    keys: dict          # 名稱 → 金鑰，依加入順序
+
+
+def is_key_format(key):
+    return 40 <= len(key) <= 300 and _KEY_FORMAT.fullmatch(key) is not None
+
+
+def is_key_name(name):
+    return _KEY_NAME.fullmatch(name) is not None and "sk-ant-" not in name
+
+
+def keys_path(env_path=None):
+    return Path(ENV_PATH if env_path is None else env_path).with_name(KEYS_NAME)
+
+
+def load_key_store(env_path=None):
+    """讀金鑰清單；檔案還沒建立時，把 .env 的金鑰當成「預設」（不寫檔）。"""
+    path = keys_path(env_path)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        key = (read_env_file(ENV_PATH if env_path is None else env_path).get("ANTHROPIC_API_KEY") or "").strip()
+        return KeyStore(DEFAULT_KEY_NAME, {DEFAULT_KEY_NAME: key}) if key else KeyStore(None, {})
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise KeyStoreError("金鑰清單不是有效的 JSON") from None
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if not isinstance(keys, dict) or not all(isinstance(name, str) and isinstance(key, str) and key.strip()
+                                             for name, key in keys.items()):
+        raise KeyStoreError("金鑰清單的格式不對")
+    active = data.get("active")
+    return KeyStore(active if isinstance(active, str) and active in keys else None,
+                    {name: key.strip() for name, key in keys.items()})
+
+
+def save_key_store(store, env_path=None):
+    data = {"active": store.active, "keys": store.keys}
+    atomic_write(keys_path(env_path), (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def activate_key_store(store, env_path=None):
+    """先寫清單，再把使用中的金鑰寫進 .env；.env 寫不進去就把清單還原，兩邊不會不一致。"""
+    path = keys_path(env_path)
+    try:
+        previous = path.read_bytes()
+    except FileNotFoundError:
+        previous = None
+    save_key_store(store, env_path)
+    try:
+        write_api_key(store.keys[store.active], env_path)
+    except BaseException:
+        try:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, previous)
+        except OSError:
+            pass
+        raise
+
+
 def redact(text, *secrets):
     """把訊息裡的金鑰等機密換成 ***（保險用：印出或記錄例外訊息前先過一次）。"""
     text = str(text)
     for secret in secrets:
         if secret:
             text = text.replace(secret, "***")
-    return text
+    # 輪換後的新金鑰也要遮掉，不依賴啟動時的機密清單。
+    return re.sub(r"sk-ant-[A-Za-z0-9_-]+", "***", text)
 
 
 def client_options(api_key, workspace_id=None):
@@ -204,10 +332,15 @@ def client_options(api_key, workspace_id=None):
     return options
 
 
-def make_client(api_key, workspace_id=None):
+def make_client(api_key, workspace_id=None, *, timeout=None, max_retries=None):
     import anthropic
 
-    return anthropic.Anthropic(**client_options(api_key, workspace_id))
+    options = client_options(api_key, workspace_id)
+    if timeout is not None:
+        options["timeout"] = timeout
+    if max_retries is not None:
+        options["max_retries"] = max_retries
+    return anthropic.Anthropic(**options)
 
 
 def default_embedder(timeout=10):
@@ -525,7 +658,7 @@ def log_answer(log_dir, model, effort, fallback_enabled, question, answer, error
         path = Path(log_dir)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         with open(path / LOG_NAME, "a", encoding="utf-8") as log:
-            log.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+            log.write(redact(json.dumps(entry, ensure_ascii=False, default=str)) + "\n")
     except OSError as problem:
         answer.notes.append(f"寫入 log 失敗：{type(problem).__name__}")
 
@@ -582,6 +715,7 @@ class Answerer:
                 embedder = default_embedder()
             searcher = Searcher(index_dir, embedder)
         self.searcher = searcher
+        self.owns_client = client is None
         self.client = client if client is not None else make_client(api_key, workspace_id)
 
     # ----- 請求 -----
@@ -720,5 +854,9 @@ class Answerer:
         log_answer(self.log_dir, self.model, self.effort, self.fallback, question, answer, error)
 
     def close(self):
-        if self.owns_searcher:
-            self.searcher.close()
+        try:
+            if self.owns_client:
+                self.client.close()
+        finally:
+            if self.owns_searcher:
+                self.searcher.close()

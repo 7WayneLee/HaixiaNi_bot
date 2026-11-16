@@ -704,6 +704,61 @@ def test_client_options_add_workspace_header():
     assert "anthropic-workspace-id" not in {k.lower() for k in plain.default_headers}
 
 
+@pytest.mark.parametrize("before, expected", [
+    ("# 保留\nOTHER=1\n", "# 保留\nOTHER=1\nANTHROPIC_API_KEY={key}\n"),
+    ("# 保留\nOTHER=1", "# 保留\nOTHER=1\nANTHROPIC_API_KEY={key}\n"),
+    ("", "ANTHROPIC_API_KEY={key}\n"),
+    (" export ANTHROPIC_API_KEY = '舊值'  # 保留註解\r\nOTHER=2\r\n",
+     " export ANTHROPIC_API_KEY = {key}  # 保留註解\r\nOTHER=2\r\n"),
+    ("ANTHROPIC_API_KEY=舊值\nOTHER=1\nANTHROPIC_API_KEY=最後舊值",
+     "ANTHROPIC_API_KEY={key}\nOTHER=1\nANTHROPIC_API_KEY={key}"),
+])
+def test_write_api_key_preserves_other_lines_and_restricts_mode(tmp_path, before, expected):
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    path = tmp_path / ".env"
+    path.write_bytes(before.encode())
+    path.chmod(0o644)
+    core.write_api_key(key, path)
+    assert path.read_bytes() == expected.format(key=key).encode()
+    assert core.resolve_api_key({}, path) == key
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_write_api_key_creates_missing_env(tmp_path):
+    path = tmp_path / ".env"
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    core.write_api_key(key, path)
+    assert core.resolve_api_key({}, path) == key
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_env_file_handles_inline_comments_and_quoted_hash(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text('A=one # 註解\nB="two#three" # 註解\nC=\'four#five\'\nD=six#seven\nE=eight\t# 註解\n')
+    assert core.read_env_file(path) == {"A": "one", "B": "two#three", "C": "four#five", "D": "six#seven",
+                                        "E": "eight"}
+
+
+def test_redact_masks_rotated_key_without_explicit_secret():
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    assert core.redact(f"/setkey {key}") == "/setkey ***"
+
+
+def test_answerer_closes_owned_client_but_keeps_shared_searcher(index_dir, monkeypatch):
+    from haixia.search import Searcher
+
+    closed = []
+    client = FakeClient([])
+    client.close = lambda: closed.append(True)
+    monkeypatch.setattr(core, "make_client", lambda *args: client)
+    searcher = Searcher(index_dir, FakeEmbedder())
+    answerer = core.Answerer(index_dir, MODEL, searcher=searcher, log_dir=None, system_prompt="s")
+    answerer.close()
+    assert closed == [True] and searcher.search("桂枝湯", k=1)["results"]
+    searcher.close()
+
+
 def test_cli_without_key_exits_cleanly(tmp_path, monkeypatch, capsys):
     import importlib.util
 
@@ -794,6 +849,32 @@ def test_reply_question_is_model_input_history_and_jsonl_question(index_dir, tmp
     assert conversation.messages[0]["content"] == expected
     entry = json.loads((tmp_path / "logs" / core.LOG_NAME).read_text(encoding="utf-8"))
     assert entry["question"] == expected
+
+
+def test_reply_with_key_never_reaches_model_history_or_jsonl(index_dir, tmp_path):
+    from haixia.telegram_bot import reply_question
+
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    replied = SimpleNamespace(text=f"/setkey {key}", from_user=SimpleNamespace(id=1001, is_bot=False))
+    question = reply_question("問這段", SimpleNamespace(reply_to_message=replied), 1001)
+    answerer, client = make(index_dir, [reply([text("測試答案")])], log_dir=tmp_path / "logs")
+    conversation = core.Conversation()
+    answerer.ask(conversation, question)
+    combined = json.dumps([client.calls, conversation.messages], ensure_ascii=False, default=str)
+    combined += (tmp_path / "logs" / core.LOG_NAME).read_text()
+    assert key not in combined and "/setkey ***" in combined
+
+
+def test_jsonl_redacts_keys_in_all_response_fields(tmp_path):
+    key = "sk-ant-test-" + "fake_" * 10 + "abcd"
+    result = core.Answer(text=key, stop_reason="end_turn", model=MODEL, thinking=key,
+                         tool_calls=[{"query": key}], notes=[key])
+    core.log_answer(tmp_path, MODEL, "medium", True, key, result, RuntimeError(key))
+    content = (tmp_path / core.LOG_NAME).read_text()
+    assert key not in content
+    entry = json.loads(content)
+    assert entry["question"] == entry["answer"] == entry["thinking"] == "***"
+    assert entry["tool_calls"] == [{"query": "***"}] and entry["notes"] == ["***"]
 
 
 def test_api_error_is_logged_without_message(index_dir, tmp_path):
