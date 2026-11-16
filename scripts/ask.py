@@ -105,8 +105,8 @@ def main(argv=None):
     parser.add_argument("--effort", choices=core.EFFORTS, default=None,
                         help=f"Claude 思考深度（預設依模型：{core.FABLE_MODEL} 是 "
                              f"{core.default_effort(core.FABLE_MODEL)}，其他 {core.DEFAULT_EFFORT}）")
-    parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
-                        default="default", help="Gemini 思考程度；default 用各模型的預設")
+    parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high", "xhigh"),
+                        default="default", help="Gemini 思考程度；default 用各模型的預設；xhigh 只有 gemini-4-hydrogen")
     parser.add_argument("--show-tools", action="store_true", help="印出每次搜尋的查詢與命中出處")
     parser.add_argument("--show-thinking", action="store_true", help="在答案前把官方思考摘要印到 stderr")
     parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX)

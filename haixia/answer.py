@@ -91,18 +91,20 @@ class GeminiModel(NamedTuple):
     callback: str               # /model 選單按鈕的 callback data（要短、固定）
     thinking: str = "default"
     max_output_tokens: int = 8192   # 思考 token 也算在內
+    # 這個模型接受的思考程度（Gemini 4 都不接受 MINIMAL；只有 Hydrogen 有 XHIGH）。
+    thinking_levels: tuple = ("low", "medium", "high")
 
 
 # Gemini 陣容的唯一來源（answer_gemini、telegram_bot、ask.py 都讀這裡），選單依這個順序。
 # 2026-11-16 依 Vertex 模型頁確認，三個都在 location=global 實測過 generateContent 與工具呼叫。
-# - 4 Hydrogen：官方指定的 3.8 Flash 後繼（快、便宜那一線），預設思考 HIGH。
-# - 4 Argon、4 Carbon：官方指定的 3.1 Pro 後繼，同價，模型預設思考 MEDIUM；Argon 這裡改用 HIGH。
+# - 4 Hydrogen：官方指定的 3.8 Flash 後繼（快、便宜那一線），預設思考 HIGH，另可選 XHIGH（google-genai ≥ 3.3）。
+# - 4 Argon、4 Carbon：官方指定的 3.1 Pro 後繼，同價，模型預設思考 MEDIUM。
 # 3.8 Flash 在 2026-11-16 依使用者決定停用（見 RETIRED_MODELS）。
 # Gemini 4 非串流單次輸出上限 32,768（Hydrogen 65,536），思考較多，上限放寬到 16,384。
 GEMINI_LINEUP = (
-    GeminiModel("gemini-4-hydrogen", "gemini-flash", "Gemini 4 Hydrogen", "m:f", max_output_tokens=16384),
-    # Argon 思考 HIGH（使用者 2026-11-16 決定）；思考也算在輸出上限裡，放寬到非串流上限 32,768。
-    GeminiModel("gemini-4-argon", "gemini-pro", "Gemini 4 Argon", "m:p", thinking="high", max_output_tokens=32768),
+    GeminiModel("gemini-4-hydrogen", "gemini-flash", "Gemini 4 Hydrogen", "m:f", max_output_tokens=16384,
+                thinking_levels=("low", "medium", "high", "xhigh")),
+    GeminiModel("gemini-4-argon", "gemini-pro", "Gemini 4 Argon", "m:p", max_output_tokens=16384),
     # Carbon 是「Google Frontier Model」：提示與回答可能被記錄最多 30 天、被標記的可能人工審查（使用者 2026-11-16 已接受）。
     GeminiModel("gemini-4-carbon", "gemini-carbon", "Gemini 4 Carbon", "m:ca", max_output_tokens=16384),
 )

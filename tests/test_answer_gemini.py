@@ -282,7 +282,7 @@ def test_retired_or_unknown_model_is_rejected():
 
 @pytest.mark.parametrize("model, level, max_tokens", [
     ("gemini-4-hydrogen", None, 16384),      # 模型預設 HIGH
-    ("gemini-4-argon", "HIGH", 32768),       # 陣容指定 HIGH
+    ("gemini-4-argon", None, 16384),         # 模型預設 MEDIUM
     ("gemini-4-carbon", None, 16384),        # 模型預設 MEDIUM
 ])
 def test_per_model_thinking_and_output_defaults(model, level, max_tokens):
@@ -298,12 +298,30 @@ def test_per_model_thinking_and_output_defaults(model, level, max_tokens):
 
 def test_lineup_thinking_default_is_applied(monkeypatch):
     answerer, _ = make([], model="gemini-4-argon")
-    assert answerer.request_config().thinking_config.thinking_level == "HIGH"
-    spec = core.GEMINI_MODELS["gemini-4-argon"]._replace(thinking="medium")
+    assert answerer.request_config().thinking_config.thinking_level is None
+    spec = core.GEMINI_MODELS["gemini-4-argon"]._replace(thinking="high")
     monkeypatch.setitem(core.GEMINI_MODELS, "gemini-4-argon", spec)
-    assert make([], model="gemini-4-argon")[0].request_config().thinking_config.thinking_level == "MEDIUM"
+    assert make([], model="gemini-4-argon")[0].request_config().thinking_config.thinking_level == "HIGH"
     explicit, _ = make([], model="gemini-4-argon", thinking_level="low")
     assert explicit.request_config().thinking_config.thinking_level == "LOW"
+
+
+def test_xhigh_only_where_the_model_supports_it():
+    assert types.ThinkingLevel.XHIGH.value == "XHIGH"     # 需要 google-genai ≥ 3.3
+    hydrogen, _ = make([], model="gemini-4-hydrogen", thinking_level="xhigh")
+    assert hydrogen.request_config().thinking_config.thinking_level == "XHIGH"
+    for model in ("gemini-4-argon", "gemini-4-carbon"):
+        with pytest.raises(ValueError, match="思考程度"):
+            make([], model=model, thinking_level="xhigh")
+    for model in gemini.MODELS:
+        with pytest.raises(ValueError):
+            make([], model=model, thinking_level="minimal")
+
+
+def test_model_armor_finish_reason_is_a_refusal():
+    answerer, _ = make([reply([types.Part.from_text(text="")], reason="MODEL_ARMOR")])
+    result = answerer.ask(core.Conversation(), "問題")
+    assert result.refused and "MODEL_ARMOR" in result.text
 
 
 def test_log_schema_matches_claude_and_hides_exception_message(tmp_path):

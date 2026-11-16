@@ -568,10 +568,18 @@ def error_message(problem, model=core.DEFAULT_MODEL):
     if isinstance(problem, core.MissingApiKey):
         return "沒有 Claude 金鑰，用 /setkey 金鑰 設定。"
     if gemini:
-        import httpx
-        if isinstance(problem, httpx.TimeoutException):
+        # google-genai 3 起預設用 httpx2，逾時、連線錯誤不包裝直接丟出；舊的 httpx 也一起認。
+        timeouts, connects = [], []
+        for name in ("httpx2", "httpx"):
+            try:
+                module = __import__(name)
+            except ImportError:
+                continue
+            timeouts.append(module.TimeoutException)
+            connects.append(module.ConnectError)
+        if isinstance(problem, tuple(timeouts)):
             return "Gemini 逾時，再問一次。"
-        if isinstance(problem, httpx.ConnectError):
+        if isinstance(problem, tuple(connects)):
             return "連不上 Gemini（網路問題），等一下再問。"
     if not gemini and anthropic is not None and isinstance(problem, anthropic.APITimeoutError):
         return "Claude 逾時，再問一次。"

@@ -1237,6 +1237,9 @@ def test_gemini_api_error_uses_vertex_wording_without_raw_text():
     assert "token-secret" not in message and "ANTHROPIC_API_KEY" not in message
     import httpx
     assert "逾時" in tg.error_message(httpx.ReadTimeout("private"), "gemini-3.8-flash")
+    httpx2 = pytest.importorskip("httpx2")       # google-genai 3 的預設 HTTP client
+    assert "逾時" in tg.error_message(httpx2.ReadTimeout("private"), "gemini-4-hydrogen")
+    assert "網路" in tg.error_message(httpx2.ConnectError("private"), "gemini-4-hydrogen")
 
 
 def test_non_text_message_gets_hint(make_core):
