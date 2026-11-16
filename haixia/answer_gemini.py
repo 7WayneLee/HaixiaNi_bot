@@ -11,9 +11,9 @@ from haixia.search import Searcher
 
 PROJECT = "vmdemo1-507014"
 LOCATION = "global"
-MODELS = ("gemini-3.8-flash", "gemini-3.1-pro-preview")
+MODELS = tuple(core.GEMINI_MODELS)       # 陣容定義在 answer.GEMINI_LINEUP
+# Gemini 4 和 3.8 Flash 都不接受 MINIMAL；Hydrogen 另有 XHIGH，但目前的 SDK 還不認得，先不開放。
 THINKING_LEVELS = ("default", "low", "medium", "high")
-MAX_OUTPUT_TOKENS = 8192  # 思考 token 也佔這個上限
 REFUSAL_TEXT = ("抱歉，這一題被 Gemini 的安全機制擋下，沒有產生回答（{reason}）。"
                 "這可能是誤判：可以換個說法再問；如果之後的問題也一直被擋，請開新對話。")
 BLOCKED_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII",
@@ -60,19 +60,24 @@ def make_client():
 class Answerer:
     def __init__(self, index_dir, model=MODELS[0], *, client=None, embedder="vertex",
                  system_prompt=None, max_tool_rounds=core.MAX_TOOL_ROUNDS,
-                 max_output_tokens=MAX_OUTPUT_TOKENS, thinking_level="default",
-                 log_dir=core.DEFAULT_LOG_DIR, prices=None, clock=time.monotonic, searcher=None):
+                 max_output_tokens=None, thinking_level="default",
+                 log_dir=core.DEFAULT_LOG_DIR, prices=None, clock=time.monotonic, searcher=None,
+                 today=None):
         if model not in MODELS:
             raise ValueError(f"不支援的 Gemini 模型：{model}")
+        spec = core.GEMINI_MODELS[model]
+        if thinking_level == "default":
+            thinking_level = spec.thinking       # 每個模型自己的預設
         if thinking_level not in THINKING_LEVELS:
             raise ValueError(f"Gemini 思考程度只能是 {'、'.join(THINKING_LEVELS)}")
         self.prices = core.PRICES if prices is None else prices
         if model not in self.prices:
             raise ValueError(f"價格表沒有 {model}，請用 --prices 提供")
+        self.today = today                      # 測試用；None＝每次用當天日期（促銷價會到期）
         self.model = model
         self.thinking_level = thinking_level
         self.max_tool_rounds = max_tool_rounds
-        self.max_output_tokens = max_output_tokens
+        self.max_output_tokens = spec.max_output_tokens if max_output_tokens is None else max_output_tokens
         self.log_dir = None if log_dir is None else Path(log_dir)
         self.clock = clock
         self.system = (system_prompt if system_prompt is not None
@@ -128,11 +133,8 @@ class Answerer:
             answer.context_tokens = (usage["input_tokens"] + usage["cache_read_input_tokens"])
             for name, value in usage.items():
                 answer.usage[name] = answer.usage.get(name, 0) + value
-            if (self.model == "gemini-3.1-pro-preview"
-                    and int(getattr(getattr(response, "usage_metadata", None), "prompt_token_count", 0) or 0) > 200_000
-                    and "提示超過 20 萬 token，Pro 價格估算可能偏低" not in answer.notes):
-                answer.notes.append("提示超過 20 萬 token，Pro 價格估算可能偏低")
-            price = self.prices[self.model]
+            # 現在的陣容都沒有 20 萬 token 以上的長脈絡加價（3.1 Pro 才有，已停用）。
+            price = core.price_for(self.model, self.prices, self.today)
             answer.cost_usd += core.usage_cost(usage, price)
             candidate = (getattr(response, "candidates", None) or [None])[0]
             reason = finish_reason(getattr(candidate, "finish_reason", None))

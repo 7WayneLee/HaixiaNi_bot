@@ -44,15 +44,17 @@ PROGRESS_QUERIES = 4            # 進度訊息最多列幾個查詢
 SERVICE = "haixia-bot"
 ALLOWED_UPDATES = ("message", "callback_query")
 
+CLAUDE_ALIASES = ("opus", "sonnet")
+GEMINI_ALIASES = tuple(item.alias for item in core.GEMINI_LINEUP)   # 陣容定義在 answer.GEMINI_LINEUP
 MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
-          "gemini-flash": "gemini-3.8-flash", "gemini-pro": "gemini-3.1-pro-preview"}
+          **{item.alias: item.id for item in core.GEMINI_LINEUP}}
 MODEL_NAMES = {"claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5",
-               "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.1-pro-preview": "Gemini 3.1 Pro"}
+               **{item.id: item.name for item in core.GEMINI_LINEUP}, **core.RETIRED_MODELS}
 COMMANDS = {"start", "help", "new", "model", "cost", "source", "key", "setkey", "usekey", "delkey"}
 # /setkey、/delkey 不放進選單，避免誤點；/key 有切換按鈕，/usekey 也不必放。
 BOT_COMMANDS = [("help", "說明"), ("new", "開新對話"), ("model", "換模型"),
                 ("cost", "看花費"), ("source", "看原文：/source 編號"), ("key", "看、換 Claude 金鑰")]
-MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:f": "gemini-flash", "m:p": "gemini-pro"}
+MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", **{item.callback: item.alias for item in core.GEMINI_LINEUP}}
 KEY_CALLBACK = re.compile(r"k:([0-9a-f]{8})")     # 只帶名稱的雜湊，不帶金鑰
 
 BM25_NOTE = "（語意搜尋失敗，這題只用關鍵字）"
@@ -67,9 +69,10 @@ def model_menu(model, provider=None):
     current = f"目前模型：{model_name(model)}"
     if provider is None:
         return current + "\n選服務：", [[("Claude", "m:c"), ("Gemini", "m:g")]]
-    aliases = ("opus", "sonnet") if provider == "claude" else ("gemini-flash", "gemini-pro")
-    rows = [[(model_name(MODELS[alias]) + ("（目前）" if MODELS[alias] == model else ""), data)]
-            for alias, data in zip(aliases, ("m:o", "m:s") if provider == "claude" else ("m:f", "m:p"))]
+    aliases = CLAUDE_ALIASES if provider == "claude" else GEMINI_ALIASES
+    callbacks = {alias: data for data, alias in MODEL_CALLBACKS.items()}
+    rows = [[(model_name(MODELS[alias]) + ("（目前）" if MODELS[alias] == model else ""), callbacks[alias])]
+            for alias in aliases]
     rows.append([("‹ 返回", "m:b")])
     return current + f"\n選 {'Claude' if provider == 'claude' else 'Gemini'} 模型：", rows
 
@@ -192,12 +195,17 @@ def parse_command(text):
     return None
 
 
+def retired_notice(model, default_model):
+    """停用模型的說明，例如「Gemini 3.1 Pro 已停用，改用 Opus 5.5」。"""
+    return f"{model_name(model)} 已停用，改用 {model_name(default_model)}"
+
+
 def resolve_model(arg):
-    """opus／sonnet（或完整模型 id）→ 模型 id；不認得回傳 None。"""
+    """opus／sonnet（或完整模型 id）→ 模型 id；不認得回傳 None。停用的 id 原樣傳回，由呼叫端處理。"""
     arg = (arg or "").strip().lower()
     if arg in MODELS:
         return MODELS[arg]
-    if arg in MODELS.values():
+    if arg in MODELS.values() or arg in core.RETIRED_MODELS:
         return arg
     return None
 
@@ -1342,6 +1350,13 @@ class BotCore:
         model = resolve_model(arg)
         if model is None:
             return f"不認得「{html.escape(arg)}」，可用：" + "、".join(MODELS)
+        if model in core.RETIRED_MODELS:
+            notice = retired_notice(model, self.default_model)
+            if state.model == self.default_model:
+                return notice + "。"
+            state.model = self.default_model
+            state.reset()
+            return notice + "，開新對話。"
         if model == state.model:
             return f"已經是 {model_name(model)}。"
         state.model = model
@@ -1489,6 +1504,10 @@ class BotCore:
         """worker 執行緒：自動重置、每日上限、呼叫 Answerer。"""
         state = self.state(chat_id)
         notices = []
+        if state.model != self.default_model and state.model not in MODELS.values():
+            notices.append(f"（{retired_notice(state.model, self.default_model)}，開新對話）")
+            state.model = self.default_model
+            state.reset()
         reason = reset_reason(state, self.clock())
         if reason:
             state.reset()

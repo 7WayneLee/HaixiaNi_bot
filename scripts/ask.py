@@ -100,11 +100,12 @@ def main(argv=None):
     parser.add_argument("question", nargs="?", help="問題（用 -i 時可省略）")
     parser.add_argument("-i", "--interactive", action="store_true", help="多輪互動")
     parser.add_argument("--model", default=core.DEFAULT_MODEL,
-                        help=f"模型（預設 {core.DEFAULT_MODEL}；可用 {core.COMPARE_MODEL}、gemini-3.8-flash、gemini-3.1-pro-preview）")
+                        help=f"模型（預設 {core.DEFAULT_MODEL}；可用 {core.COMPARE_MODEL}、"
+                             + "、".join(core.GEMINI_MODELS) + "）")
     parser.add_argument("--effort", choices=core.EFFORTS, default=core.DEFAULT_EFFORT,
                         help=f"Claude 思考深度（預設 {core.DEFAULT_EFFORT}）")
     parser.add_argument("--gemini-thinking", choices=("default", "low", "medium", "high"),
-                        default="default", help="Gemini 思考程度；default 用模型預設")
+                        default="default", help="Gemini 思考程度；default 用各模型的預設")
     parser.add_argument("--show-tools", action="store_true", help="印出每次搜尋的查詢與命中出處")
     parser.add_argument("--show-thinking", action="store_true", help="在答案前把官方思考摘要印到 stderr")
     parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX)

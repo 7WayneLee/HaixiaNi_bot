@@ -1,6 +1,7 @@
 """Gemini 問答全用假的 client 與搜尋器，不連外也不讀 .env。"""
 
 import json
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -60,8 +61,9 @@ def test_function_declarations_and_config():
     config = answerer.request_config()
     assert config.automatic_function_calling.disable is True
     assert config.thinking_config.include_thoughts is True
+    assert answerer.model == "gemini-4-hydrogen"
     assert config.thinking_config.thinking_level is None
-    assert config.max_output_tokens == 8192
+    assert config.max_output_tokens == 16384
     assert answerer.request_config(False).tool_config.function_calling_config.mode == "NONE"
     assert answerer.request_config(False).tools == [answerer.tool]
     medium, _ = make([], thinking_level="medium")
@@ -159,12 +161,12 @@ def test_blank_after_tool_retries_once_without_tools_and_keeps_history():
     first = reply([call_part])
     blank = reply([types.Part(text=" ")])
     final = reply([types.Part.from_text(text="【倪師原文依據】答案")])
-    answerer, client = make([first, blank, final], model="gemini-3.1-pro-preview")
+    answerer, client = make([first, blank, final], model="gemini-4-argon", today=date(2026, 11, 16))
     conversation = core.Conversation()
     result = answerer.ask(conversation, "問題")
     assert result.text == "【倪師原文依據】答案" and result.requests == 3
     assert len(result.notes) == 1 and "補答一次" in result.notes[0]
-    assert result.cost_usd == pytest.approx(3 * (100 * 2 + 25 * 12) / 1_000_000)
+    assert result.cost_usd == pytest.approx(3 * (100 * 2 + 25 * 10) / 1_000_000)
     assert conversation.messages[1] is first.candidates[0].content
     assert conversation.messages[1].parts[0].thought_signature == b"signature"
     assert conversation.messages[3] is blank.candidates[0].content
@@ -222,7 +224,8 @@ def test_usage_cost_counts_cache_thoughts_and_tool_prompt():
     usage = types.GenerateContentResponseUsageMetadata(
         prompt_token_count=1000, cached_content_token_count=200, candidates_token_count=100,
         thoughts_token_count=50, tool_use_prompt_token_count=30)
-    answerer, _ = make([reply([types.Part.from_text(text="答案")], usage=usage)])
+    answerer, _ = make([reply([types.Part.from_text(text="答案")], usage=usage)],
+                       model="gemini-3.8-flash", today=date(2026, 12, 31))
     result = answerer.ask(core.Conversation(), "問題")
     assert result.usage["input_tokens"] == 830
     assert result.usage["cache_read_input_tokens"] == 200
@@ -232,14 +235,67 @@ def test_usage_cost_counts_cache_thoughts_and_tool_prompt():
     assert result.cost_usd == pytest.approx((830 * .75 + 200 * .075 + 150 * 3.75) / 1_000_000)
 
 
-def test_pro_price_counts_thoughts_as_output():
+@pytest.mark.parametrize("model, day, expected", [
+    # (input, cache_read, output) 美元／百萬 token
+    ("gemini-4-hydrogen", date(2026, 11, 16), (1.5, .075, 7.5)),
+    ("gemini-4-hydrogen", date(2027, 6, 1), (1.5, .075, 7.5)),
+    ("gemini-4-argon", date(2026, 11, 30), (2, .1, 10)),          # 促銷價最後一天
+    ("gemini-4-argon", date(2026, 12, 1), (4, .2, 20)),
+    ("gemini-3.8-flash", date(2026, 12, 31), (.75, .075, 3.75)),  # 優惠價最後一天
+    ("gemini-3.8-flash", date(2027, 1, 1), (1.5, .15, 7.5)),
+])
+def test_price_per_model_and_date_counts_thoughts_as_output(model, day, expected):
     usage = types.GenerateContentResponseUsageMetadata(
         prompt_token_count=100, cached_content_token_count=20, candidates_token_count=10,
         thoughts_token_count=30)
-    answerer, _ = make([reply([types.Part.from_text(text="答案")], usage=usage)],
-                       model="gemini-3.1-pro-preview")
+    answerer, _ = make([reply([types.Part.from_text(text="答案")], usage=usage)], model=model, today=day)
     result = answerer.ask(core.Conversation(), "問題")
-    assert result.cost_usd == pytest.approx((80 * 2 + 20 * .2 + 40 * 12) / 1_000_000)
+    price_in, price_cache, price_out = expected
+    assert result.cost_usd == pytest.approx((80 * price_in + 20 * price_cache + 40 * price_out) / 1_000_000)
+
+
+def test_custom_price_table_ignores_scheduled_changes():
+    prices = {model: dict(values) for model, values in core.PRICES.items()}
+    assert core.price_for("gemini-4-argon", prices, date(2027, 1, 1)) == core.PRICES["gemini-4-argon"]
+    assert core.price_for("gemini-4-argon", today=date(2027, 1, 1))["output"] == 20
+
+
+def test_lineup_is_single_source_with_prices():
+    assert gemini.MODELS == ("gemini-4-hydrogen", "gemini-4-argon", "gemini-3.8-flash")
+    assert all(model in core.PRICES for model in gemini.MODELS)
+    assert not set(core.RETIRED_MODELS) & set(gemini.MODELS)
+    assert "gemini-3.1-pro-preview" not in core.PRICES
+
+
+def test_retired_or_unknown_model_is_rejected():
+    for model in ("gemini-3.1-pro-preview", "gemini-4-carbon"):
+        with pytest.raises(ValueError):
+            make([], model=model)
+
+
+@pytest.mark.parametrize("model, level, max_tokens", [
+    ("gemini-4-hydrogen", None, 16384),      # 模型預設 HIGH
+    ("gemini-4-argon", None, 16384),         # 模型預設 MEDIUM
+    ("gemini-3.8-flash", None, 8192),
+])
+def test_per_model_thinking_and_output_defaults(model, level, max_tokens):
+    answerer, _ = make([], model=model)
+    config = answerer.request_config()
+    assert config.thinking_config.thinking_level == level
+    assert config.thinking_config.include_thoughts is True
+    assert config.max_output_tokens == max_tokens
+    low, _ = make([], model=model, thinking_level="low", max_output_tokens=4096)
+    assert low.request_config().thinking_config.thinking_level == "LOW"
+    assert low.request_config().max_output_tokens == 4096
+
+
+def test_lineup_thinking_default_is_applied(monkeypatch):
+    spec = core.GEMINI_MODELS["gemini-4-argon"]._replace(thinking="high")
+    monkeypatch.setitem(core.GEMINI_MODELS, "gemini-4-argon", spec)
+    answerer, _ = make([], model="gemini-4-argon")
+    assert answerer.request_config().thinking_config.thinking_level == "HIGH"
+    explicit, _ = make([], model="gemini-4-argon", thinking_level="low")
+    assert explicit.request_config().thinking_config.thinking_level == "LOW"
 
 
 def test_log_schema_matches_claude_and_hides_exception_message(tmp_path):
@@ -250,7 +306,7 @@ def test_log_schema_matches_claude_and_hides_exception_message(tmp_path):
     expected = {"time", "model", "served_model", "effort", "fallback_enabled", "fallback_ran",
                 "question", "answer", "thinking", "stop_reason", "refused", "rounds", "requests", "tool_calls",
                 "usage", "cost_usd", "elapsed_sec", "notes", "error"}
-    assert set(entry) == expected and entry["model"] == "gemini-3.8-flash"
+    assert set(entry) == expected and entry["model"] == "gemini-4-hydrogen"
     failed, _ = make([RuntimeError("private-token")])
     failed.log_dir = tmp_path
     with pytest.raises(RuntimeError):
