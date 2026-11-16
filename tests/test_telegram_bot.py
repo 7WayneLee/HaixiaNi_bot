@@ -88,8 +88,8 @@ class FakeAnswerer:
         self.script = script
         self.calls = []
 
-    def ask(self, conversation, question, on_tool=None):
-        self.calls.append({"question": question, "conversation": conversation,
+    def ask(self, conversation, question, on_tool=None, effort=None):
+        self.calls.append({"question": question, "conversation": conversation, "effort": effort,
                            "thread": threading.get_ident(), "messages": len(conversation.messages)})
         step = self.script(self.model, question, on_tool) if callable(self.script) else None
         if isinstance(step, Exception):
@@ -657,12 +657,12 @@ def test_model_switch_starts_new_conversation(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "/model"))
     assert "目前模型：Opus 5.5" in bot.texts()[-1]
     run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
-    assert "已經是 Opus 5.5" in bot.texts()[-1] and state.conversation is old
+    assert bot.texts()[-1] == "已經是 Opus 5.5｜medium。" and state.conversation is old
     run(bot_core.handle_message(bot, CHAT, USER, "/model gpt"))
     assert "不認得「gpt」" in bot.texts()[-1] and "gemini-flash" in bot.texts()[-1]
     assert state.model == core.DEFAULT_MODEL
     run(bot_core.handle_message(bot, CHAT, USER, "/model sonnet"))
-    assert bot.texts()[-1] == "已切換到 Sonnet 5.5，開新對話。"
+    assert bot.texts()[-1] == "已切換到 Sonnet 5.5｜medium，開新對話。"
     assert state.model == "claude-sonnet-5-5" and state.conversation is not old and not state.conversation.messages
     run(bot_core.handle_message(bot, CHAT, USER, "第二題"))
     assert pool.answerers["claude-sonnet-5-5"].calls[0]["messages"] == 0
@@ -677,11 +677,11 @@ def test_gemini_models_are_listed_and_switch_resets_conversation(make_core):
     old.messages.append({"role": "user", "content": "舊問題"})
     run(bot_core.handle_message(bot, CHAT, USER, "/model"))
     listing = bot.messages()[-1][1]
-    assert listing["text"] == "目前模型：Opus 5.5\n選服務："
+    assert listing["text"] == "目前模型：Opus 5.5｜medium（預設）\n選服務："
     assert [button.text for button in listing["reply_markup"].inline_keyboard[0]] == ["Claude", "Gemini"]
     run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-flash"))
     assert state.model == "gemini-4-hydrogen" and state.conversation is not old
-    assert bot.texts()[-1] == "已切換到 Gemini 4 Hydrogen，開新對話。"
+    assert bot.texts()[-1] == "已切換到 Gemini 4 Hydrogen｜high，開新對話。"
     previous = state.conversation
     run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-pro"))
     assert state.model == "gemini-4-argon" and state.conversation is not previous
@@ -716,6 +716,11 @@ def test_model_callback_menu_navigation_and_switch(make_core):
         assert "目前模型：Opus 5.5" in edit["text"]
     callback = FakeCallback("m:p")
     run(bot_core.handle_model_callback(bot, callback, USER))
+    assert callback.answers == [{}] and state.model == core.DEFAULT_MODEL     # 只開第三層
+    assert [row[0].text for row in bot.messages()[-1][1]["reply_markup"].inline_keyboard] == [
+        "low", "medium（預設）（目前）", "high", "‹ 返回"]
+    callback = FakeCallback("e:p:medium")
+    run(bot_core.handle_model_callback(bot, callback, USER))
     assert callback.answers == [{}]
     assert state.model == "gemini-4-argon" and state.conversation is not old
     assert not state.conversation.messages
@@ -724,16 +729,16 @@ def test_model_callback_menu_navigation_and_switch(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "下一題"))
     assert pool.answerers["gemini-4-argon"].calls[0]["messages"] == 0
     current = state.conversation
-    callback = FakeCallback("m:p")
+    callback = FakeCallback("e:p:medium")
     run(bot_core.handle_model_callback(bot, callback, USER))
-    assert "已經是 Gemini 4 Argon" in bot.messages()[-1][1]["text"]
+    assert "已經是 Gemini 4 Argon｜medium" in bot.messages()[-1][1]["text"]
     assert state.conversation is current
     run(bot_core.handle_model_callback(bot, FakeCallback("m:g"), USER))
     assert [row[0].text for row in bot.messages()[-1][1]["reply_markup"].inline_keyboard] == [
         "Gemini 4 Hydrogen", "Gemini 4 Argon（目前）", "Gemini 4 Carbon", "‹ 返回"]
-    run(bot_core.handle_model_callback(bot, FakeCallback("m:ca"), USER))
-    assert state.model == "gemini-4-carbon" and "已切換到 Gemini 4 Carbon" in bot.messages()[-1][1]["text"]
-    run(bot_core.handle_model_callback(bot, FakeCallback("m:f"), USER))
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:ca:low"), USER))
+    assert state.model == "gemini-4-carbon" and "已切換到 Gemini 4 Carbon｜low" in bot.messages()[-1][1]["text"]
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:f:xhigh"), USER))
     assert state.model == "gemini-4-hydrogen"
 
 
@@ -921,7 +926,7 @@ def test_fable_in_claude_menu_and_switch(make_core):
     assert [row[0] for row in rows] == [("Opus 5.5（目前）", "m:o"), ("Sonnet 5.5", "m:s"),
                                         ("Fable 5.2", "m:fa"), ("‹ 返回", "m:b")]
     run(bot_core.handle_message(bot, CHAT, USER, "/model"))
-    callback = FakeCallback("m:fa")
+    callback = FakeCallback("e:fa:high")
     run(bot_core.handle_model_callback(bot, callback, USER))
     assert callback.answers == [{}]
     assert state.model == "claude-fable-5-2" and not state.conversation.messages
@@ -933,7 +938,7 @@ def test_fable_in_claude_menu_and_switch(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
     assert state.model == core.DEFAULT_MODEL
     run(bot_core.handle_message(bot, CHAT, USER, "/model fable"))
-    assert bot.texts()[-1] == "已切換到 Fable 5.2，開新對話。" and state.model == "claude-fable-5-2"
+    assert bot.texts()[-1] == "已切換到 Fable 5.2｜high，開新對話。" and state.model == "claude-fable-5-2"
     run(bot_core.handle_message(bot, CHAT, USER, "問題"))
     assert pool.answerers["claude-fable-5-2"].calls[0]["messages"] == 0
 
@@ -1432,3 +1437,209 @@ def test_build_application_handlers_match_allowed_updates(make_core):
     assert set(update_types) == set(tg.ALLOWED_UPDATES)
     assert len(tg.ALLOWED_UPDATES) == len(set(tg.ALLOWED_UPDATES))
     assert application.update_processor.max_concurrent_updates > 1
+
+
+# ---------- /model 第三層：思考程度 ----------
+
+def _labels(bot):
+    return [row[0].text for row in bot.messages()[-1][1]["reply_markup"].inline_keyboard]
+
+
+def _datas(bot):
+    return [row[0].callback_data for row in bot.messages()[-1][1]["reply_markup"].inline_keyboard]
+
+
+def test_effort_level_menu_per_provider_marks_default_and_current(make_core):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "/model"))
+    expected = {
+        "m:o": ("Opus 5.5", ["low", "medium（預設）（目前）", "high", "xhigh", "max", "‹ 返回"], "m:c"),
+        "m:s": ("Sonnet 5.5", ["low", "medium（預設）（目前）", "high", "xhigh", "max", "‹ 返回"], "m:c"),
+        "m:fa": ("Fable 5.2", ["low", "medium", "high（預設）（目前）", "xhigh", "max", "‹ 返回"], "m:c"),
+        "m:f": ("Gemini 4 Hydrogen", ["low", "medium", "high（預設）（目前）", "xhigh", "‹ 返回"], "m:g"),
+        "m:p": ("Gemini 4 Argon", ["low", "medium（預設）（目前）", "high", "‹ 返回"], "m:g"),
+        "m:ca": ("Gemini 4 Carbon", ["low", "medium（預設）（目前）", "high", "‹ 返回"], "m:g"),
+    }
+    for data, (name, labels, back) in expected.items():
+        callback = FakeCallback(data)
+        run(bot_core.handle_model_callback(bot, callback, USER))
+        assert callback.answers == [{}]
+        method, edit = bot.messages()[-1]
+        assert method == "edit" and edit["message_id"] == 101
+        assert edit["text"] == f"目前模型：Opus 5.5｜medium（預設）\n選 {name} 的思考程度："
+        assert _labels(bot) == labels
+        datas = _datas(bot)
+        assert datas[-1] == back and all(item.startswith("e:" + data[2:] + ":") for item in datas[:-1])
+        assert all(len(item.encode()) <= 64 for item in datas)
+    assert bot_core.state(CHAT).model == core.DEFAULT_MODEL      # 只是看選單，沒有切換
+    # 返回鍵回到該服務的模型清單
+    run(bot_core.handle_model_callback(bot, FakeCallback("m:g"), USER))
+    assert _labels(bot) == ["Gemini 4 Hydrogen", "Gemini 4 Argon", "Gemini 4 Carbon", "‹ 返回"]
+
+
+def test_effort_change_on_same_model_keeps_conversation(make_core):
+    bot_core, pool = make_core()
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "第一題"))
+    state = bot_core.state(CHAT)
+    conversation = state.conversation
+    callback = FakeCallback("e:o:high")
+    run(bot_core.handle_model_callback(bot, callback, USER))
+    assert callback.answers == [{}]
+    assert bot.messages()[-1][1]["text"] == "Opus 5.5 改用 high，下一題開始生效。"
+    assert bot.messages()[-1][1]["reply_markup"] is None
+    assert state.conversation is conversation and state.efforts == {core.DEFAULT_MODEL: "high"}
+    run(bot_core.handle_message(bot, CHAT, USER, "第二題"))
+    calls = pool.answerers[core.DEFAULT_MODEL].calls
+    assert [call["effort"] for call in calls] == [None, "high"] and calls[1]["messages"] == 2
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:o:high"), USER))
+    assert bot.messages()[-1][1]["text"] == "已經是 Opus 5.5｜high。"
+    # 選單標題與第三層都標出目前的程度
+    run(bot_core.handle_message(bot, CHAT, USER, "/model"))
+    assert bot.texts()[-1] == "目前模型：Opus 5.5｜high\n選服務："
+    run(bot_core.handle_model_callback(bot, FakeCallback("m:o"), USER))
+    assert _labels(bot)[:3] == ["low", "medium（預設）", "high（目前）"]
+    assert state.conversation is conversation
+
+
+def test_model_change_with_level_resets_and_each_model_keeps_its_level(make_core):
+    bot_core, pool = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    run(bot_core.handle_message(bot, CHAT, USER, "第一題"))
+    old = state.conversation
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:o:max"), USER))
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:p:low"), USER))
+    assert bot.messages()[-1][1]["text"] == "已切換到 Gemini 4 Argon｜low，開新對話。"
+    assert state.model == "gemini-4-argon" and state.conversation is not old
+    # 文字捷徑沿用該模型存的程度
+    run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
+    assert bot.texts()[-1] == "已切換到 Opus 5.5｜max，開新對話。"
+    run(bot_core.handle_message(bot, CHAT, USER, "問"))
+    assert pool.answerers[core.DEFAULT_MODEL].calls[-1]["effort"] == "max"
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-pro"))
+    assert bot.texts()[-1] == "已切換到 Gemini 4 Argon｜low，開新對話。"
+    run(bot_core.handle_message(bot, CHAT, USER, "問"))
+    assert pool.answerers["gemini-4-argon"].calls[-1]["effort"] == "low"
+    # 沒選過的模型用預設（傳 None 給 Answerer）
+    run(bot_core.handle_message(bot, CHAT, USER, "/model sonnet"))
+    assert bot.texts()[-1] == "已切換到 Sonnet 5.5｜medium，開新對話。"
+    run(bot_core.handle_message(bot, CHAT, USER, "問"))
+    assert pool.answerers[core.COMPARE_MODEL].calls[-1]["effort"] is None
+    # 開新對話不清掉程度
+    run(bot_core.handle_message(bot, CHAT, USER, "/new"))
+    assert state.efforts == {core.DEFAULT_MODEL: "max", "gemini-4-argon": "low"}
+
+
+def test_text_shortcut_with_level(make_core):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    run(bot_core.handle_message(bot, CHAT, USER, "第一題"))
+    conversation = state.conversation
+    run(bot_core.handle_message(bot, CHAT, USER, "/model opus HIGH"))
+    assert bot.texts()[-1] == "Opus 5.5 改用 high，下一題開始生效。" and state.conversation is conversation
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-pro xhigh"))
+    assert bot.texts()[-1] == "Gemini 4 Argon 可用：low、medium、high"
+    assert state.model == core.DEFAULT_MODEL and state.conversation is conversation
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-flash xhigh"))
+    assert bot.texts()[-1] == "已切換到 Gemini 4 Hydrogen｜xhigh，開新對話。"
+    assert state.efforts == {core.DEFAULT_MODEL: "high", "gemini-4-hydrogen": "xhigh"}
+    run(bot_core.handle_message(bot, CHAT, USER, "/model fable max"))
+    assert bot.texts()[-1] == "已切換到 Fable 5.2｜max，開新對話。"
+
+
+def test_effort_is_per_chat_and_does_not_leak_through_shared_answerer(make_core):
+    bot_core, pool = make_core()
+    bot = FakeBot()
+    other_chat = CHAT + 1
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:o:xhigh"), USER))
+    run(bot_core.handle_model_callback(bot, FakeCallback("e:o:low", chat_id=other_chat), USER))
+    run(bot_core.handle_message(bot, CHAT, USER, "甲"))
+    run(bot_core.handle_message(bot, other_chat, USER, "乙"))
+    run(bot_core.handle_message(bot, other_chat + 1, USER, "丙"))
+    calls = pool.answerers[core.DEFAULT_MODEL].calls
+    assert len(pool.answerers) == 1                       # 同一個 Answerer 共用
+    assert [(call["question"], call["effort"]) for call in calls] == [("甲", "xhigh"), ("乙", "low"), ("丙", None)]
+
+
+def test_pool_shares_one_answerer_and_passes_effort_per_call():
+    made = []
+
+    class Recorder:
+        def __init__(self, model):
+            self.model, self.efforts = model, []
+            made.append(self)
+
+        def ask(self, conversation, question, on_tool=None, effort=None):
+            self.efforts.append(effort)
+
+        def close(self):
+            pass
+
+    pool = tg.AnswererPool(lambda: SimpleNamespace(close=lambda: None), lambda model, searcher: Recorder(model))
+    first = pool.get(core.DEFAULT_MODEL)
+    assert pool.get(core.DEFAULT_MODEL) is first and len(made) == 1
+    first.ask(None, "a", effort="high")
+    first.ask(None, "b")
+    assert first.efforts == ["high", None]
+
+
+def test_cli_effort_override_is_the_menu_default(make_core):
+    bot_core, _ = make_core(effort_override="high", gemini_thinking="low")
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "/model"))
+    assert bot.texts()[-1] == "目前模型：Opus 5.5｜high（預設）\n選服務："
+    run(bot_core.handle_model_callback(bot, FakeCallback("m:fa"), USER))
+    assert _labels(bot)[2] == "high（預設）（目前）"
+    run(bot_core.handle_model_callback(bot, FakeCallback("m:p"), USER))
+    assert _labels(bot)[0] == "low（預設）（目前）"
+    plain, _ = make_core()
+    assert plain.default_effort(core.FABLE_MODEL) == "high"
+    assert plain.default_effort(core.DEFAULT_MODEL) == "medium"
+    assert plain.default_effort("gemini-4-hydrogen") == "high"
+
+
+def test_effort_callbacks_reject_strangers_and_stale_data(make_core, caplog):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    with caplog.at_level(logging.WARNING):
+        stranger = FakeCallback("e:o:high")
+        run(bot_core.handle_callback(bot, stranger, STRANGER))
+    assert stranger.answers == [{}] and not bot.messages() and not state.efforts
+    for data in ("e:p:xhigh", "e:p:max", "e:zz:high", "e:o:huge", "e:o", "e:o:high:x", "m:x"):
+        callback = FakeCallback(data)
+        run(bot_core.handle_callback(bot, callback, USER))
+        assert callback.answers == [{"text": "選單過期了，重打 /model"}], data
+    assert not bot.messages() and not state.efforts and state.model == core.DEFAULT_MODEL
+
+
+def test_title_shows_effort_used():
+    answer = make_answer("答案", cost=0.117, effort="high")
+    answer.elapsed_sec = 38.0
+    assert tg.answer_messages("問", answer, "答案")[0].startswith(
+        "<blockquote expandable><b>Opus 5.5 high｜思考 38 秒｜0.117 USD ≈ 3.7 TWD</b>")
+    gemini = make_answer("答案", model="gemini-4-argon", effort="default")
+    assert "<b>Gemini 4 Argon medium｜思考" in tg.answer_messages("問", gemini, "答案")[0]
+    assert "<b>Opus 5.5｜思考" in tg.answer_messages("問", make_answer("答案"), "答案")[0]
+
+
+def test_answer_title_in_chat_shows_chosen_level(make_core):
+    def script(model, question, on_tool):
+        return make_answer("總結：測試\n答案", model, effort="max")
+
+    bot_core, _ = make_core(script)
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "/model opus max"))
+    run(bot_core.handle_message(bot, CHAT, USER, "問"))
+    assert any("Opus 5.5 max｜思考" in text for text in bot.texts())
+
+
+def test_help_mentions_effort(make_core):
+    bot_core, _ = make_core()
+    bot = FakeBot()
+    run(bot_core.handle_message(bot, CHAT, USER, "/help"))
+    assert "/model 換模型、思考程度" in bot.texts()[-1] and "目前模型：Opus 5.5｜medium（預設）" in bot.texts()[-1]
+    assert [name for name, _ in tg.BOT_COMMANDS] == ["help", "new", "model", "cost", "source", "key"]

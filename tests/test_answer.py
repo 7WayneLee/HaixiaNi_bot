@@ -1073,3 +1073,44 @@ def test_shared_searcher_is_used_and_not_closed(index_dir):
     # 共用的 Searcher 由建立的人關；Answerer.close() 不會關掉它
     assert searcher.search("桂枝湯", k=1)["results"]
     searcher.close()
+
+
+# ---------- 每題的 effort（Telegram 每個聊天各自選） ----------
+
+def test_per_question_effort_overrides_without_changing_answerer(index_dir, tmp_path):
+    answerer, client = make(index_dir, [
+        reply([tool("t1", "search", {"query": "桂枝湯"})], "tool_use"),
+        reply([text("答案一")]),
+        reply([text("答案二")]),
+    ], log_dir=tmp_path)
+    conversation = core.Conversation()
+    first = answerer.ask(conversation, "第一題", effort="xhigh")
+    assert first.effort == "xhigh" and answerer.effort == "medium"
+    assert [call["output_config"] for call in client.calls] == [{"effort": "xhigh"}] * 2
+    history = list(conversation.messages)
+    second = answerer.ask(conversation, "第二題")             # 沒指定＝Answerer 的 effort
+    assert second.effort == "medium" and client.calls[-1]["output_config"] == {"effort": "medium"}
+    # 中途換 effort：歷史原樣接在後面，system、工具、思考設定都不變
+    assert conversation.messages[:len(history)] == history
+    assert client.calls[0]["system"] == client.calls[-1]["system"]
+    assert client.calls[0]["thinking"] == client.calls[-1]["thinking"]
+    entries = [json.loads(line) for line in (tmp_path / core.LOG_NAME).read_text().splitlines()]
+    assert [entry["effort"] for entry in entries] == ["xhigh", "medium"]
+    with pytest.raises(ValueError, match="effort"):
+        answerer.ask(core.Conversation(), "問", effort="huge")
+
+
+def test_effort_levels_and_labels_come_from_one_place():
+    for model in core.CLAUDE_MODELS:
+        assert core.effort_levels(model) == ("low", "medium", "high", "xhigh", "max")
+    assert core.effort_levels("gemini-4-hydrogen") == ("low", "medium", "high", "xhigh")
+    assert core.effort_levels("gemini-4-argon") == core.effort_levels("gemini-4-carbon") == ("low", "medium", "high")
+    assert core.effort_levels("gpt") == ()
+    assert core.default_effort(core.DEFAULT_MODEL) == "medium"
+    assert core.default_effort("gemini-4-hydrogen") == "high"
+    assert core.default_effort("gemini-4-argon") == "medium"
+    for spec in core.GEMINI_LINEUP:
+        assert core.default_effort(spec.id) in spec.thinking_levels
+    assert core.effort_label("gemini-4-argon", "default") == "medium"
+    assert core.effort_label(core.DEFAULT_MODEL, "high") == "high"
+    assert core.effort_label(core.DEFAULT_MODEL, "") == ""

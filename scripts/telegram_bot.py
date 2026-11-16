@@ -89,7 +89,8 @@ def main(argv=None):
         return 0
 
     pool = bot.AnswererPool(make_searcher, make_answerer)
-    bot_core = bot.BotCore(config.allowed, pool, daily_budget=config.daily_budget, log_dir=args.log_dir)
+    bot_core = bot.BotCore(config.allowed, pool, daily_budget=config.daily_budget, log_dir=args.log_dir,
+                           effort_override=args.effort, gemini_thinking=args.gemini_thinking)
     application = bot.build_application(bot_core, config.token)
     log.info("bot 啟動：允許 %d 個使用者，每日上限 US$%.2f，預設模型 %s，effort %s%s",
              len(config.allowed), config.daily_budget, core.DEFAULT_MODEL, args.effort or "依模型",

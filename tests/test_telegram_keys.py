@@ -530,7 +530,10 @@ def test_model_buttons_still_route_to_model_menu(make_core, key_env):
     bot = FakeBot()
     callback = press(bot_core, bot, "m:s")
     assert callback.answers == [{}]
-    assert bot.texts() == ["已切換到 Sonnet 5.5，開新對話。"]
+    assert bot.texts() == ["目前模型：Opus 5.5｜medium（預設）\n選 Sonnet 5.5 的思考程度："]
+    callback = press(bot_core, bot, "e:s:medium")
+    assert callback.answers == [{}]
+    assert bot.texts()[-1] == "已切換到 Sonnet 5.5｜medium，開新對話。"
 
 
 # ---------- /delkey ----------

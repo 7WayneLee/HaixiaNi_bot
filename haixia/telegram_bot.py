@@ -56,6 +56,9 @@ BOT_COMMANDS = [("help", "說明"), ("new", "開新對話"), ("model", "換模�
                 ("cost", "看花費"), ("source", "看原文：/source 編號"), ("key", "看、換 Claude 金鑰")]
 MODEL_CALLBACKS = {"m:o": "opus", "m:s": "sonnet", "m:fa": "fable", **{item.callback: item.alias for item in core.GEMINI_LINEUP}}
 KEY_CALLBACK = re.compile(r"k:([0-9a-f]{8})")     # 只帶名稱的雜湊，不帶金鑰
+# 第三層：e:<模型按鈕去掉 m: 的部分>:<程度>，例如 e:o:high。
+EFFORT_CALLBACK = re.compile(r"e:([a-z]{1,4}):([a-z]{3,6})")
+STALE_MODEL_MENU = "選單過期了，重打 /model"
 
 BM25_NOTE = "（語意搜尋失敗，這題只用關鍵字）"
 
@@ -64,9 +67,23 @@ def model_name(model):
     return MODEL_NAMES.get(model, model)
 
 
-def model_menu(model, provider=None):
-    """傳回選單文字與按鈕規格；callback data 固定且短。"""
-    current = f"目前模型：{model_name(model)}"
+def effort_text(effort, default):
+    """「medium（預設）」；effort 是空的就只顯示預設。"""
+    effort = effort or default
+    return effort + ("（預設）" if effort == default else "")
+
+
+def current_line(model, effort=None, default=None):
+    """「目前模型：Opus 5.5｜medium（預設）」；沒給程度時只有模型名。"""
+    line = f"目前模型：{model_name(model)}"
+    if effort or default:
+        line += "｜" + effort_text(effort, default)
+    return line
+
+
+def model_menu(model, provider=None, effort=None, default=None):
+    """傳回選單文字與按鈕規格；callback data 固定且短。effort／default 是目前模型的程度。"""
+    current = current_line(model, effort, default)
     if provider is None:
         return current + "\n選服務：", [[("Claude", "m:c"), ("Gemini", "m:g")]]
     aliases = CLAUDE_ALIASES if provider == "claude" else GEMINI_ALIASES
@@ -75,6 +92,28 @@ def model_menu(model, provider=None):
             for alias in aliases]
     rows.append([("‹ 返回", "m:b")])
     return current + f"\n選 {'Claude' if provider == 'claude' else 'Gemini'} 模型：", rows
+
+
+def effort_menu(target, current_model, current_effort, current_default, stored, default):
+    """第三層：target 模型可選的程度。stored＝這個聊天替 target 存的程度（None＝用 default）。"""
+    key = {MODELS[alias]: data for data, alias in MODEL_CALLBACKS.items()}[target][2:]
+    selected = stored or default
+    rows = [[(level + ("（預設）" if level == default else "") + ("（目前）" if level == selected else ""),
+              f"e:{key}:{level}")] for level in core.effort_levels(target)]
+    back = "m:g" if target.startswith("gemini-") else "m:c"
+    rows.append([("‹ 返回", back)])
+    text = current_line(current_model, current_effort, current_default) + f"\n選 {model_name(target)} 的思考程度："
+    return text, rows
+
+
+def parse_effort_callback(data):
+    """e:o:high → (模型 id, 程度)；格式不對或模型不支援這個程度時傳回 None（舊按鈕）。"""
+    found = EFFORT_CALLBACK.fullmatch(data)
+    if found is None or f"m:{found.group(1)}" not in MODEL_CALLBACKS:
+        return None
+    model = MODELS[MODEL_CALLBACKS[f"m:{found.group(1)}"]]
+    level = found.group(2)
+    return (model, level) if level in core.effort_levels(model) else None
 
 
 def model_keyboard(rows):
@@ -484,6 +523,8 @@ def cost_message(summary, budget):
 class ChatState:
     model: str = core.DEFAULT_MODEL
     conversation: core.Conversation = field(default_factory=core.Conversation)
+    # 每個模型各自選的 effort／思考程度；沒選的用預設。只在記憶體（跟對話一樣，重啟就沒了），開新對話不清掉。
+    efforts: dict = field(default_factory=dict)
     last_active: float | None = None       # time.time()；最後一題答完的時間
     context_tokens: int = 0                # 上一題最後一個請求的輸入總量
 
@@ -674,7 +715,9 @@ def _trim_thinking(thinking, limit):
 
 def answer_messages(question, answer, displayed, notices=()):
     """每則都含完整引用標籤；長答案每則重新包一個回答引用區塊。"""
-    title = f"{model_name(answer.model)}｜思考 {math.floor(answer.elapsed_sec + 0.5)} 秒｜{money(answer.cost_usd)}"
+    label = core.effort_label(answer.model, answer.effort)
+    name = model_name(answer.model) + (f" {label}" if label else "")
+    title = f"{name}｜思考 {math.floor(answer.elapsed_sec + 0.5)} 秒｜{money(answer.cost_usd)}"
     thinking = answer.thinking or "（這題沒有思考內容）"
     answer_title, answer_body = _answer_title_and_body(question, displayed, answer.model)
     answer_html = to_html(answer_body)
@@ -805,11 +848,11 @@ def source_messages(target, previous, following):
     return messages
 
 
-def help_text(model, budget):
+def help_text(model, budget, effort=None, default=None):
     return f"""直接打問題，病例寫越詳細越好。
 回覆 bot 的訊息再問，bot 會看到那段。
 
-/model 換模型
+/model 換模型、思考程度
 /new 開新對話
 /cost 看花費
 /source 編號 看原文
@@ -819,14 +862,18 @@ def help_text(model, budget):
 /delkey 名稱 刪金鑰
 點出處後面的 /s_… 看原文
 
-目前模型：{model_name(model)}
+{current_line(model, effort, default)}
 每日上限：{money(budget)}"""
 
 
 # ---------- 問答執行緒 ----------
 
 class AnswererPool:
-    """在 worker 執行緒裡建立、使用：一個共用的 Searcher（SQLite＋向量 memmap），每個模型一個 Answerer。"""
+    """在 worker 執行緒裡建立、使用：一個共用的 Searcher（SQLite＋向量 memmap），每個模型一個 Answerer。
+
+    effort 不放在 Answerer 上：每題由 BotCore 依聊天的選擇傳給 ask(effort=…)，所以同一個 Answerer
+    給所有聊天共用也不會互相影響。
+    """
 
     def __init__(self, make_searcher, make_answerer):
         self.make_searcher = make_searcher
@@ -1024,12 +1071,16 @@ class BotCore:
     def __init__(self, allowed, pool, *, daily_budget=DEFAULT_DAILY_BUDGET, log_dir=core.DEFAULT_LOG_DIR,
                  default_model=core.DEFAULT_MODEL, clock=time.time, monotonic=time.monotonic,
                  now=lambda: datetime.now(timezone.utc), progress_interval=PROGRESS_INTERVAL,
-                 typing_interval=TYPING_INTERVAL):
+                 typing_interval=TYPING_INTERVAL, effort_override=None, gemini_thinking="default"):
+        """effort_override／gemini_thinking：跟 make_answerer 一樣的命令列設定（--effort、--gemini-thinking），
+        只用來在選單標出「預設」；沒選過程度的聊天傳 effort=None，由 Answerer 用它自己的設定。"""
         self.allowed = frozenset(allowed)
         self.pool = pool                    # 只在 worker 執行緒裡使用
         self.daily_budget = daily_budget
         self.log_path = Path(log_dir) / core.LOG_NAME
         self.default_model = default_model
+        self.effort_override = effort_override
+        self.gemini_thinking = gemini_thinking
         self.clock, self.monotonic, self.now = clock, monotonic, now
         self.progress_interval = progress_interval
         self.typing_interval = typing_interval
@@ -1042,6 +1093,29 @@ class BotCore:
         if chat_id not in self.chats:
             self.chats[chat_id] = ChatState(model=self.default_model)
         return self.chats[chat_id]
+
+    def default_effort(self, model):
+        """這個模型沒選程度時用的程度（含命令列的設定）。"""
+        if model.startswith("gemini-"):
+            if self.gemini_thinking != "default" and self.gemini_thinking in core.effort_levels(model):
+                return self.gemini_thinking
+            return core.default_effort(model)
+        if model.startswith("claude-") and self.effort_override:
+            return self.effort_override
+        return core.default_effort(model)
+
+    @staticmethod
+    def chosen_effort(state, model):
+        """聊天替這個模型選的程度；沒選或已不支援傳回 None。"""
+        effort = state.efforts.get(model)
+        return effort if effort in core.effort_levels(model) else None
+
+    def effort_of(self, state, model):
+        return self.chosen_effort(state, model) or self.default_effort(model)
+
+    def menu(self, state, provider=None):
+        return model_menu(state.model, provider, self.effort_of(state, state.model),
+                          self.default_effort(state.model))
 
     def is_allowed(self, user_id):
         return user_id is not None and user_id in self.allowed
@@ -1170,7 +1244,9 @@ class BotCore:
     async def handle_command(self, bot, chat_id, command, *, message=None):
         state = self.state(chat_id)
         if command.name in ("start", "help"):
-            await self.send_html(bot, chat_id, help_text(state.model, self.daily_budget))
+            await self.send_html(bot, chat_id, help_text(state.model, self.daily_budget,
+                                                         self.effort_of(state, state.model),
+                                                         self.default_effort(state.model)))
         elif command.name == "new":
             state.reset()
             await self.send_html(bot, chat_id, "已開新對話。")
@@ -1178,7 +1254,7 @@ class BotCore:
             if command.arg:
                 await self.send_html(bot, chat_id, self.switch_model(state, command.arg))
             else:
-                menu_text, rows = model_menu(state.model)
+                menu_text, rows = self.menu(state)
                 await self._call(bot.send_message, chat_id=chat_id, text=menu_text,
                                  reply_markup=model_keyboard(rows))
         elif command.name == "cost":
@@ -1398,7 +1474,10 @@ class BotCore:
         return f"已刪掉 {name} {key_suffix(key)}。"
 
     def switch_model(self, state, arg):
-        model = resolve_model(arg)
+        """/model 名稱 [程度]：沒給程度時沿用這個聊天替該模型存的程度。"""
+        name, _, level = (arg or "").strip().partition(" ")
+        level = level.strip().lower()
+        model = resolve_model(name)
         if model is None:
             return f"不認得「{html.escape(arg)}」，可用：" + "、".join(MODELS)
         if model in core.RETIRED_MODELS:
@@ -1408,11 +1487,29 @@ class BotCore:
             state.model = self.default_model
             state.reset()
             return notice + "，開新對話。"
+        if level:
+            levels = core.effort_levels(model)
+            if level not in levels:
+                return f"{model_name(model)} 可用：" + "、".join(levels)
+            return self.select_effort(state, model, level)
         if model == state.model:
-            return f"已經是 {model_name(model)}。"
+            return f"已經是 {model_name(model)}｜{self.effort_of(state, model)}。"
         state.model = model
         state.reset()
-        return f"已切換到 {model_name(model)}，開新對話。"
+        return f"已切換到 {model_name(model)}｜{self.effort_of(state, model)}，開新對話。"
+
+    def select_effort(self, state, model, level):
+        """選模型＋程度。換模型才開新對話；只換程度從下一題生效、保留對話。"""
+        if model != state.model:
+            state.efforts[model] = level
+            state.model = model
+            state.reset()
+            return f"已切換到 {model_name(model)}｜{level}，開新對話。"
+        if level == self.effort_of(state, model):
+            state.efforts[model] = level
+            return f"已經是 {model_name(model)}｜{level}。"
+        state.efforts[model] = level
+        return f"{model_name(model)} 改用 {level}，下一題開始生效。"
 
     async def handle_callback(self, bot, query, user_id):
         """依 callback data 分派：k: 是金鑰按鈕，其他交給模型選單。"""
@@ -1451,8 +1548,10 @@ class BotCore:
             await query.answer()
             return
         data = query.data
-        if not isinstance(data, str) or (data not in ("m:c", "m:g", "m:b") and data not in MODEL_CALLBACKS):
-            await query.answer(text="選單過期了，重打 /model")
+        choice = parse_effort_callback(data) if isinstance(data, str) else None
+        if not isinstance(data, str) or (data not in ("m:c", "m:g", "m:b") and data not in MODEL_CALLBACKS
+                                         and choice is None):
+            await query.answer(text=STALE_MODEL_MENU)
             return
         await query.answer()
         message = query.message
@@ -1460,14 +1559,19 @@ class BotCore:
             return
         chat_id, message_id = message.chat_id, message.message_id
         state = self.state(chat_id)
-        if data in MODEL_CALLBACKS:
-            model = MODELS[MODEL_CALLBACKS[data]]
-            text = (f"已經是 {model_name(model)}。" if model == state.model
-                    else self.switch_model(state, MODEL_CALLBACKS[data]))
+        if choice is not None:
+            text = self.select_effort(state, *choice)
             markup = None
+        elif data in MODEL_CALLBACKS:
+            # 第二層選模型 → 第三層選程度（同一則訊息）
+            model = MODELS[MODEL_CALLBACKS[data]]
+            text, rows = effort_menu(model, state.model, self.effort_of(state, state.model),
+                                     self.default_effort(state.model), self.chosen_effort(state, model),
+                                     self.default_effort(model))
+            markup = model_keyboard(rows)
         else:
             provider = {"m:c": "claude", "m:g": "gemini", "m:b": None}[data]
-            text, rows = model_menu(state.model, provider)
+            text, rows = self.menu(state, provider)
             markup = model_keyboard(rows)
         await self._call(bot.edit_message_text, chat_id=chat_id, message_id=message_id,
                          text=text, reply_markup=markup)
@@ -1572,7 +1676,9 @@ class BotCore:
         conversation = state.conversation
         try:
             answerer = self.pool.get(state.model)
-            result = answerer.ask(conversation, question, on_tool=progress.on_tool)
+            # 程度每題傳入（None＝Answerer 自己的預設），不存在共用的 Answerer 上。
+            result = answerer.ask(conversation, question, on_tool=progress.on_tool,
+                                  effort=self.chosen_effort(state, state.model))
         except Exception as problem:  # noqa: BLE001 — 一律回友善說明，log 只記類型與狀態碼
             log.error("回答失敗：%s（HTTP %s）", type(problem).__name__,
                       getattr(problem, "status_code", None) or getattr(problem, "code", None))

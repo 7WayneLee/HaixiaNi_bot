@@ -93,6 +93,8 @@ class GeminiModel(NamedTuple):
     max_output_tokens: int = 8192   # 思考 token 也算在內
     # 這個模型接受的思考程度（Gemini 4 都不接受 MINIMAL；只有 Hydrogen 有 XHIGH）。
     thinking_levels: tuple = ("low", "medium", "high")
+    # 不指定思考程度（default）時模型自己用的程度，只用來在選單與標題顯示。
+    default_level: str = "medium"
 
 
 # Gemini 陣容的唯一來源（answer_gemini、telegram_bot、ask.py 都讀這裡），選單依這個順序。
@@ -103,7 +105,7 @@ class GeminiModel(NamedTuple):
 # Gemini 4 非串流單次輸出上限 32,768（Hydrogen 65,536），思考較多，上限放寬到 16,384。
 GEMINI_LINEUP = (
     GeminiModel("gemini-4-hydrogen", "gemini-flash", "Gemini 4 Hydrogen", "m:f", max_output_tokens=16384,
-                thinking_levels=("low", "medium", "high", "xhigh")),
+                thinking_levels=("low", "medium", "high", "xhigh"), default_level="high"),
     GeminiModel("gemini-4-argon", "gemini-pro", "Gemini 4 Argon", "m:p", max_output_tokens=16384),
     # Carbon 是「Google Frontier Model」：提示與回答可能被記錄最多 30 天、被標記的可能人工審查（使用者 2026-11-16 已接受）。
     GeminiModel("gemini-4-carbon", "gemini-carbon", "Gemini 4 Carbon", "m:ca", max_output_tokens=16384),
@@ -460,8 +462,30 @@ def default_embedder(timeout=10):
 # ---------- 費用 ----------
 
 def default_effort(model):
-    """模型的預設 effort：Fable 5.2 是 high，其他（Opus 5.5、Sonnet 5.5…）是 DEFAULT_EFFORT。"""
+    """模型的預設 effort：Fable 5.2 是 high，其他（Opus 5.5、Sonnet 5.5…）是 DEFAULT_EFFORT。
+
+    Gemini 傳回陣容裡的預設思考程度（thinking 是 default 時用模型自己的 default_level）。
+    """
+    spec = GEMINI_MODELS.get(model)
+    if spec is not None:
+        return spec.default_level if spec.thinking == "default" else spec.thinking
     return MODEL_EFFORTS.get(model, DEFAULT_EFFORT)
+
+
+def effort_levels(model):
+    """模型可選的 effort／思考程度（bot 選單與檢查都讀這裡）：Claude 是 EFFORTS，Gemini 看陣容。"""
+    spec = GEMINI_MODELS.get(model)
+    if spec is not None:
+        return tuple(spec.thinking_levels)
+    return EFFORTS if model.startswith("claude-") else ()
+
+
+def effort_label(model, effort):
+    """顯示用：Gemini 的 default（不指定）換成模型自己的程度；空值傳回空字串。"""
+    if effort == "default":
+        spec = GEMINI_MODELS.get(model)
+        return spec.default_level if spec is not None else ""
+    return effort or ""
 
 
 def load_prices(path, base=PRICES):
@@ -757,6 +781,7 @@ class Answer:
     # 最後一個請求的輸入總量（input＋快取讀＋快取寫）＝目前對話的長度，下一題至少要重送這麼多
     context_tokens: int = 0
     thinking: str = ""
+    effort: str = ""            # 這題實際用的 effort（Gemini 是思考程度，default＝不指定）
 
 
 def log_answer(log_dir, model, effort, fallback_enabled, question, answer, error):
@@ -846,7 +871,9 @@ class Answerer:
 
     # ----- 請求 -----
 
-    def request_params(self, messages, allow_tools=True):
+    def request_params(self, messages, allow_tools=True, effort=None):
+        """effort：None＝Answerer 的 effort。同一段對話中途換 effort 沒關係：思考區塊與歷史原樣保留，
+        只是頂層 output_config 改了，那一個請求的 prompt 快取會失效（之後又會重新命中），可以接受。"""
         thinking = {"type": "adaptive", "display": "summarized"}
         betas = []
         params = {
@@ -857,7 +884,7 @@ class Answerer:
             "tool_choice": {"type": "auto" if allow_tools else "none"},
             "messages": messages,
             "thinking": thinking,
-            "output_config": {"effort": self.effort},
+            "output_config": {"effort": effort or self.effort},
             "cache_control": {"type": "ephemeral"},
         }
         if self.prefix_mismatch:
@@ -870,8 +897,8 @@ class Answerer:
             params["betas"] = betas
         return params
 
-    def _send(self, messages, allow_tools):
-        params = self.request_params(messages, allow_tools)
+    def _send(self, messages, allow_tools, effort=None):
+        params = self.request_params(messages, allow_tools, effort)
         for attempt in range(JSON_RETRIES + 1):
             try:
                 with self.client.beta.messages.stream(**params) as stream:
@@ -894,16 +921,23 @@ class Answerer:
 
     # ----- 問答 -----
 
-    def ask(self, conversation, question, on_tool=None):
-        """問一題（可接在之前的對話後面）。回傳 Answer；API 錯誤會往外丟（仍會記 log）。"""
+    def ask(self, conversation, question, on_tool=None, effort=None):
+        """問一題（可接在之前的對話後面）。回傳 Answer；API 錯誤會往外丟（仍會記 log）。
+
+        effort：只用在這一題（Telegram 每個聊天各自選）；None＝Answerer 建立時的 effort。
+        不存在 Answerer 上，所以共用的 Answerer 不會把某個聊天的選擇帶到別的聊天。
+        """
+        effort = effort or self.effort
+        if effort not in EFFORTS:
+            raise ValueError(f"effort 只能是 {'、'.join(EFFORTS)}")
         started = self.clock()
-        answer = Answer(text="", stop_reason="", model=self.model)
+        answer = Answer(text="", stop_reason="", model=self.model, effort=effort)
         messages = conversation.messages
         messages.append({"role": "user", "content": question})
         conversation.questions += 1
         error = None
         try:
-            self._loop(messages, answer, on_tool, conversation)
+            self._loop(messages, answer, on_tool, conversation, effort)
         except Exception as problem:
             error = problem
             raise
@@ -912,10 +946,10 @@ class Answerer:
             self._log(question, answer, error)
         return answer
 
-    def _loop(self, messages, answer, on_tool, conversation):
+    def _loop(self, messages, answer, on_tool, conversation, effort=None):
         allow_tools = True
         while True:
-            response = self._send(messages, allow_tools)
+            response = self._send(messages, allow_tools, effort)
             answer.requests += 1
             usage, cost, notes = response_cost(response, self.model, self.prices)
             last = usage_dict(response.usage)
@@ -977,7 +1011,7 @@ class Answerer:
     # ----- 紀錄 -----
 
     def _log(self, question, answer, error):
-        log_answer(self.log_dir, self.model, self.effort, self.fallback, question, answer, error)
+        log_answer(self.log_dir, self.model, answer.effort or self.effort, self.fallback, question, answer, error)
 
     def close(self):
         try:

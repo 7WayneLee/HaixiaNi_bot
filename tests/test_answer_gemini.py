@@ -338,3 +338,26 @@ def test_log_schema_matches_claude_and_hides_exception_message(tmp_path):
     with pytest.raises(RuntimeError):
         failed.ask(core.Conversation(), "問題")
     assert "private-token" not in (tmp_path / core.LOG_NAME).read_text()
+
+
+def test_per_question_thinking_level_keeps_history_and_signatures(tmp_path):
+    signed = types.Part(function_call=types.FunctionCall(name="search", args={"query": "傷寒"}),
+                        thought_signature=b"sig-1")
+    first = reply([signed])
+    answerer, client = make([first, reply([types.Part.from_text(text="答一")]),
+                             reply([types.Part.from_text(text="答二")])], model="gemini-4-hydrogen")
+    answerer.log_dir = tmp_path
+    conversation = core.Conversation()
+    one = answerer.ask(conversation, "第一題", effort="xhigh")
+    assert one.effort == "xhigh" and answerer.thinking_level == "default"
+    assert [call["config"].thinking_config.thinking_level for call in client.models.calls] == ["XHIGH"] * 2
+    two = answerer.ask(conversation, "第二題", effort="low")
+    assert two.effort == "low" and client.models.calls[-1]["config"].thinking_config.thinking_level == "LOW"
+    # 簽章跟著原本的 Content 原樣送回，不受思考程度改變影響
+    assert conversation.messages[1] is first.candidates[0].content
+    assert conversation.messages[1].parts[0].thought_signature == b"sig-1"
+    entries = [json.loads(line) for line in (tmp_path / core.LOG_NAME).read_text().splitlines()]
+    assert [entry["effort"] for entry in entries] == ["xhigh", "low"]
+    argon, _ = make([], model="gemini-4-argon")
+    with pytest.raises(ValueError, match="思考程度"):
+        argon.ask(core.Conversation(), "問", effort="xhigh")

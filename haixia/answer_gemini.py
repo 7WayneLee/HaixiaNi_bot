@@ -91,7 +91,17 @@ class Answerer:
         self.searcher = searcher
         self.client = client if client is not None else make_client()
 
-    def request_config(self, allow_tools=True):
+    def check_level(self, thinking_level):
+        spec = core.GEMINI_MODELS[self.model]
+        if thinking_level != "default" and thinking_level not in spec.thinking_levels:
+            raise ValueError(f"{spec.name} 的思考程度只能是 default、{'、'.join(spec.thinking_levels)}")
+        return thinking_level
+
+    def request_config(self, allow_tools=True, thinking_level=None):
+        """thinking_level：None＝Answerer 的設定。思考程度只放在每個請求的 ThinkingConfig，
+        對話中途改了也不影響 thought signature：歷史裡的 Content 原樣送回，簽章跟著各自的 Part，
+        不綁定之後請求的思考設定。"""
+        thinking_level = thinking_level or self.thinking_level
         config = types.GenerateContentConfig(
             system_instruction=self.system, max_output_tokens=self.max_output_tokens,
             tools=[self.tool],
@@ -101,33 +111,35 @@ class Answerer:
         )
         config.thinking_config = types.ThinkingConfig(
             include_thoughts=True,
-            **({"thinking_level": self.thinking_level.upper()} if self.thinking_level != "default" else {}))
+            **({"thinking_level": thinking_level.upper()} if thinking_level != "default" else {}))
         return config
 
-    def ask(self, conversation, question, on_tool=None):
+    def ask(self, conversation, question, on_tool=None, effort=None):
+        """effort：這一題的思考程度（Telegram 每個聊天各自選）；None＝Answerer 的設定。"""
+        level = self.check_level(effort or self.thinking_level)
         started = self.clock()
-        answer = core.Answer(text="", stop_reason="", model=self.model)
+        answer = core.Answer(text="", stop_reason="", model=self.model, effort=level)
         messages = conversation.messages
         messages.append(types.Content(role="user", parts=[types.Part.from_text(text=question)]))
         conversation.questions += 1
         error = None
         try:
-            self._loop(messages, answer, on_tool, conversation)
+            self._loop(messages, answer, on_tool, conversation, level)
         except Exception as problem:
             error = problem
             raise
         finally:
             answer.elapsed_sec = round(self.clock() - started, 3)
-            core.log_answer(self.log_dir, self.model, self.thinking_level, False, question, answer, error)
+            core.log_answer(self.log_dir, self.model, level, False, question, answer, error)
         return answer
 
-    def _loop(self, messages, answer, on_tool, conversation):
+    def _loop(self, messages, answer, on_tool, conversation, level=None):
         allow_tools = True
         has_tool_results = False
         retried_blank = False
         while True:
             response = self.client.models.generate_content(
-                model=self.model, contents=messages, config=self.request_config(allow_tools))
+                model=self.model, contents=messages, config=self.request_config(allow_tools, level))
             answer.requests += 1
             usage = usage_from_metadata(getattr(response, "usage_metadata", None))
             answer.context_tokens = (usage["input_tokens"] + usage["cache_read_input_tokens"])
