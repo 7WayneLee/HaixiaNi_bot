@@ -393,6 +393,12 @@
     - Claude 加入 Fable 5.2（`claude-fable-5-2`，$8/$40，快取讀 $0.20，effort high，fallbacks 開）；Opus、Sonnet 預設 effort medium。實測一次 0.013 美元，估計每題 0.20–0.35 美元。
     - 修正 Sonnet 5.5 快取讀取價格：官方是 $0.10（之前記 $0.20）。
     - 白名單現在有 2 個使用者，兩人都能換金鑰。
+  - 2026-11-16 下午（commit 01c525d、de13fa7、3f1418c；821 個測試通過）：
+    - 使用者決定：Argon、Carbon 都提供（Carbon 用 `/model gemini-carbon`，使用者知道它會保留提示 30 天、可能人工審查）；移除 3.8 Flash；兩個帳號都能換金鑰。
+    - google-genai 升到 3.3.0（3.0 起改用 httpx2；3.3.0 才有 XHIGH），movie-nas 已安裝，Python 3.11.2，bot 記憶體約 85 MB。回退：`pip install google-genai==2.25.0`。
+    - 實測同一題（桂枝湯組成）：Hydrogen xhigh 0.150 美元、135 秒；Argon medium 0.012 美元、22 秒、沒有思考摘要；Carbon medium 0.096 美元、89 秒。
+    - `/model` 改成三層：服務 → 模型 → 思考程度（Claude low–max；Hydrogen low–xhigh；Argon、Carbon low–high），每個 chat、每個模型各自記住，只改程度不開新對話。使用者不要另外的 `/effort` 指令。
+    - 派工：程式角色用 Opus（medium），文件 worker 用 Antigravity 的 `gemini-4-argon-high`（使用者指定）。
 - [ ] 第五步：Telegram bot（2026-09-29 部署完成，待使用者實測）
   - 程式：commit 4b89cc1，515 個測試通過。
     - 前半由 Claude Code worker 撰寫；Claude 5 小時額度到 84% 時，依使用者指示「Work 你可以用 codex」停掉，改由 Codex 接手。
