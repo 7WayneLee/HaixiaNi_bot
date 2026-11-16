@@ -685,8 +685,8 @@ def test_gemini_models_are_listed_and_switch_resets_conversation(make_core):
     previous = state.conversation
     run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-pro"))
     assert state.model == "gemini-4-argon" and state.conversation is not previous
-    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-3.8-flash"))
-    assert state.model == "gemini-3.8-flash"
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-carbon"))
+    assert state.model == "gemini-4-carbon"
     run(bot_core.handle_message(bot, CHAT, USER, "/model GEMINI-4-ARGON"))
     assert state.model == "gemini-4-argon"
     run(bot_core.handle_message(bot, CHAT, USER, "/model opus"))
@@ -703,7 +703,7 @@ def test_model_callback_menu_navigation_and_switch(make_core):
     assert len(bot.messages()) == 1
     for data, expected in [("m:c", ["Opus 5.5（目前）", "Sonnet 5.5", "Fable 5.2", "‹ 返回"]),
                            ("m:b", ["Claude", "Gemini"]),
-                           ("m:g", ["Gemini 4 Hydrogen", "Gemini 4 Argon", "Gemini 3.8 Flash", "‹ 返回"])]:
+                           ("m:g", ["Gemini 4 Hydrogen", "Gemini 4 Argon", "Gemini 4 Carbon", "‹ 返回"])]:
         callback = FakeCallback(data)
         run(bot_core.handle_model_callback(bot, callback, USER))
         assert callback.answers == [{}]
@@ -730,28 +730,29 @@ def test_model_callback_menu_navigation_and_switch(make_core):
     assert state.conversation is current
     run(bot_core.handle_model_callback(bot, FakeCallback("m:g"), USER))
     assert [row[0].text for row in bot.messages()[-1][1]["reply_markup"].inline_keyboard] == [
-        "Gemini 4 Hydrogen", "Gemini 4 Argon（目前）", "Gemini 3.8 Flash", "‹ 返回"]
-    run(bot_core.handle_model_callback(bot, FakeCallback("m:3"), USER))
-    assert state.model == "gemini-3.8-flash" and "已切換到 Gemini 3.8 Flash" in bot.messages()[-1][1]["text"]
+        "Gemini 4 Hydrogen", "Gemini 4 Argon（目前）", "Gemini 4 Carbon", "‹ 返回"]
+    run(bot_core.handle_model_callback(bot, FakeCallback("m:ca"), USER))
+    assert state.model == "gemini-4-carbon" and "已切換到 Gemini 4 Carbon" in bot.messages()[-1][1]["text"]
     run(bot_core.handle_model_callback(bot, FakeCallback("m:f"), USER))
     assert state.model == "gemini-4-hydrogen"
 
 
 def test_gemini_menu_follows_lineup():
-    assert tg.GEMINI_ALIASES == ("gemini-flash", "gemini-pro", "gemini-3.8-flash")
+    assert tg.GEMINI_ALIASES == ("gemini-flash", "gemini-pro", "gemini-carbon")
     assert {alias: tg.MODELS[alias] for alias in tg.GEMINI_ALIASES} == {
         "gemini-flash": "gemini-4-hydrogen", "gemini-pro": "gemini-4-argon",
-        "gemini-3.8-flash": "gemini-3.8-flash"}
+        "gemini-carbon": "gemini-4-carbon"}
     assert {data: tg.MODELS[alias] for data, alias in tg.MODEL_CALLBACKS.items()} == {
         "m:o": "claude-opus-5-5", "m:s": "claude-sonnet-5-5", "m:fa": "claude-fable-5-2", "m:f": "gemini-4-hydrogen",
-        "m:p": "gemini-4-argon", "m:3": "gemini-3.8-flash"}
+        "m:p": "gemini-4-argon", "m:ca": "gemini-4-carbon"}
     assert len(set(tg.MODEL_CALLBACKS)) == len(tg.MODEL_CALLBACKS)
     assert "gemini-3.1-pro-preview" not in tg.MODELS.values()
+    assert "gemini-3.8-flash" not in tg.MODELS.values()
     for model in tg.MODELS.values():
         assert model in core.PRICES and tg.model_name(model) != model
-    _, rows = tg.model_menu("gemini-3.8-flash", "gemini")
+    _, rows = tg.model_menu("gemini-4-carbon", "gemini")
     assert [row[0] for row in rows] == [("Gemini 4 Hydrogen", "m:f"), ("Gemini 4 Argon", "m:p"),
-                                        ("Gemini 3.8 Flash（目前）", "m:3"), ("‹ 返回", "m:b")]
+                                        ("Gemini 4 Carbon（目前）", "m:ca"), ("‹ 返回", "m:b")]
 
 
 def test_retired_model_alias_falls_back_to_default(make_core):
@@ -767,6 +768,21 @@ def test_retired_model_alias_falls_back_to_default(make_core):
     run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-3.1-pro-preview"))
     assert bot.texts()[-1] == "Gemini 3.1 Pro 已停用，改用 Opus 5.5，開新對話。"
     assert state.model == core.DEFAULT_MODEL and state.conversation is not old
+
+
+def test_retired_flash_falls_back_to_default(make_core):
+    bot_core, pool = make_core()
+    bot = FakeBot()
+    state = bot_core.state(CHAT)
+    run(bot_core.handle_message(bot, CHAT, USER, "/model gemini-3.8-flash"))
+    assert bot.texts()[-1] == "Gemini 3.8 Flash 已停用，改用 Opus 5.5。"
+    assert state.model == core.DEFAULT_MODEL
+    state.model = "gemini-3.8-flash"
+    state.conversation.messages.append({"role": "user", "content": "舊題"})
+    run(bot_core.handle_message(bot, CHAT, USER, "下一題"))
+    assert state.model == core.DEFAULT_MODEL
+    assert "gemini-3.8-flash" not in pool.answerers
+    assert any("（Gemini 3.8 Flash 已停用，改用 Opus 5.5，開新對話）" in text for text in bot.texts())
 
 
 def test_state_on_retired_model_falls_back_before_answering(make_core):

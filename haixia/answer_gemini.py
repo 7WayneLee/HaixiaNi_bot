@@ -12,7 +12,7 @@ from haixia.search import Searcher
 PROJECT = "vmdemo1-507014"
 LOCATION = "global"
 MODELS = tuple(core.GEMINI_MODELS)       # 陣容定義在 answer.GEMINI_LINEUP
-# Gemini 4 和 3.8 Flash 都不接受 MINIMAL；Hydrogen 另有 XHIGH，但目前的 SDK 還不認得，先不開放。
+# Gemini 4 不接受 MINIMAL；Hydrogen 另有 XHIGH，但目前的 SDK 還不認得，先不開放。
 THINKING_LEVELS = ("default", "low", "medium", "high")
 REFUSAL_TEXT = ("抱歉，這一題被 Gemini 的安全機制擋下，沒有產生回答（{reason}）。"
                 "這可能是誤判：可以換個說法再問；如果之後的問題也一直被擋，請開新對話。")

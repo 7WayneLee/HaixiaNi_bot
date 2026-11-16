@@ -225,14 +225,14 @@ def test_usage_cost_counts_cache_thoughts_and_tool_prompt():
         prompt_token_count=1000, cached_content_token_count=200, candidates_token_count=100,
         thoughts_token_count=50, tool_use_prompt_token_count=30)
     answerer, _ = make([reply([types.Part.from_text(text="答案")], usage=usage)],
-                       model="gemini-3.8-flash", today=date(2026, 12, 31))
+                       model="gemini-4-hydrogen", today=date(2026, 12, 31))
     result = answerer.ask(core.Conversation(), "問題")
     assert result.usage["input_tokens"] == 830
     assert result.usage["cache_read_input_tokens"] == 200
     assert result.usage["output_tokens"] == 150
     assert result.usage["thoughts_tokens"] == 50
     assert result.context_tokens == 1030
-    assert result.cost_usd == pytest.approx((830 * .75 + 200 * .075 + 150 * 3.75) / 1_000_000)
+    assert result.cost_usd == pytest.approx((830 * 1.5 + 200 * .075 + 150 * 7.5) / 1_000_000)
 
 
 @pytest.mark.parametrize("model, day, expected", [
@@ -241,8 +241,8 @@ def test_usage_cost_counts_cache_thoughts_and_tool_prompt():
     ("gemini-4-hydrogen", date(2027, 6, 1), (1.5, .075, 7.5)),
     ("gemini-4-argon", date(2026, 11, 30), (2, .1, 10)),          # 促銷價最後一天
     ("gemini-4-argon", date(2026, 12, 1), (4, .2, 20)),
-    ("gemini-3.8-flash", date(2026, 12, 31), (.75, .075, 3.75)),  # 優惠價最後一天
-    ("gemini-3.8-flash", date(2027, 1, 1), (1.5, .15, 7.5)),
+    ("gemini-4-carbon", date(2026, 11, 30), (2, .1, 10)),         # 促銷價最後一天
+    ("gemini-4-carbon", date(2026, 12, 1), (4, .2, 20)),
 ])
 def test_price_per_model_and_date_counts_thoughts_as_output(model, day, expected):
     usage = types.GenerateContentResponseUsageMetadata(
@@ -254,6 +254,12 @@ def test_price_per_model_and_date_counts_thoughts_as_output(model, day, expected
     assert result.cost_usd == pytest.approx((80 * price_in + 20 * price_cache + 40 * price_out) / 1_000_000)
 
 
+def test_retired_flash_keeps_dated_prices_for_old_logs():
+    assert core.price_for("gemini-3.8-flash", today=date(2026, 12, 31))["output"] == 3.75   # 優惠價最後一天
+    assert core.price_for("gemini-3.8-flash", today=date(2027, 1, 1)) == {
+        "input": 1.5, "output": 7.5, "cache_read": .15, "cache_write": 1.5}
+
+
 def test_custom_price_table_ignores_scheduled_changes():
     prices = {model: dict(values) for model, values in core.PRICES.items()}
     assert core.price_for("gemini-4-argon", prices, date(2027, 1, 1)) == core.PRICES["gemini-4-argon"]
@@ -261,22 +267,23 @@ def test_custom_price_table_ignores_scheduled_changes():
 
 
 def test_lineup_is_single_source_with_prices():
-    assert gemini.MODELS == ("gemini-4-hydrogen", "gemini-4-argon", "gemini-3.8-flash")
+    assert gemini.MODELS == ("gemini-4-hydrogen", "gemini-4-argon", "gemini-4-carbon")
     assert all(model in core.PRICES for model in gemini.MODELS)
     assert not set(core.RETIRED_MODELS) & set(gemini.MODELS)
     assert "gemini-3.1-pro-preview" not in core.PRICES
+    assert "gemini-3.8-flash" in core.RETIRED_MODELS and "gemini-3.8-flash" in core.PRICES
 
 
 def test_retired_or_unknown_model_is_rejected():
-    for model in ("gemini-3.1-pro-preview", "gemini-4-carbon"):
+    for model in ("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-4-unknown"):
         with pytest.raises(ValueError):
             make([], model=model)
 
 
 @pytest.mark.parametrize("model, level, max_tokens", [
     ("gemini-4-hydrogen", None, 16384),      # 模型預設 HIGH
-    ("gemini-4-argon", None, 16384),         # 模型預設 MEDIUM
-    ("gemini-3.8-flash", None, 8192),
+    ("gemini-4-argon", "HIGH", 32768),       # 陣容指定 HIGH
+    ("gemini-4-carbon", None, 16384),        # 模型預設 MEDIUM
 ])
 def test_per_model_thinking_and_output_defaults(model, level, max_tokens):
     answerer, _ = make([], model=model)
@@ -290,10 +297,11 @@ def test_per_model_thinking_and_output_defaults(model, level, max_tokens):
 
 
 def test_lineup_thinking_default_is_applied(monkeypatch):
-    spec = core.GEMINI_MODELS["gemini-4-argon"]._replace(thinking="high")
-    monkeypatch.setitem(core.GEMINI_MODELS, "gemini-4-argon", spec)
     answerer, _ = make([], model="gemini-4-argon")
     assert answerer.request_config().thinking_config.thinking_level == "HIGH"
+    spec = core.GEMINI_MODELS["gemini-4-argon"]._replace(thinking="medium")
+    monkeypatch.setitem(core.GEMINI_MODELS, "gemini-4-argon", spec)
+    assert make([], model="gemini-4-argon")[0].request_config().thinking_config.thinking_level == "MEDIUM"
     explicit, _ = make([], model="gemini-4-argon", thinking_level="low")
     assert explicit.request_config().thinking_config.thinking_level == "LOW"
 

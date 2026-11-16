@@ -66,15 +66,18 @@ PRICES = {
     # 不收快取寫入費，cache_write 跟輸入價一樣只是佔位（cache_creation_input_tokens 永遠是 0）。
     # 4 Hydrogen：2027-01-12 起開放 TTL 快取，寫入 $1.875，這裡用不到。
     "gemini-4-hydrogen": {"input": 1.50, "output": 7.50, "cache_read": 0.075, "cache_write": 1.50},
-    # 4 Argon：到 2026-11-30 是促銷價（以 5 成 credits 回饋），之後見 PRICE_CHANGES。
+    # 4 Argon、4 Carbon：到 2026-11-30 是促銷價（以 5 成 credits 回饋），之後見 PRICE_CHANGES。
     "gemini-4-argon": {"input": 2.00, "output": 10.00, "cache_read": 0.10, "cache_write": 2.00},
-    # 3.8 Flash：優惠價到 2026-12-31，之後見 PRICE_CHANGES。
+    "gemini-4-carbon": {"input": 2.00, "output": 10.00, "cache_read": 0.10, "cache_write": 2.00},
+    # 3.8 Flash（已停用，留著讓舊紀錄算得出費用）：優惠價到 2026-12-31，之後見 PRICE_CHANGES。
     "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075, "cache_write": 0.75},
 }
 # 已排定的調價：模型 → ((生效日（UTC 日期）, 價格), ...)，依日期由舊到新。只套用在預設價格表上。
 PRICE_CHANGES = {
     "gemini-4-argon": ((date(2026, 12, 1),
                         {"input": 4.00, "output": 20.00, "cache_read": 0.20, "cache_write": 4.00}),),
+    "gemini-4-carbon": ((date(2026, 12, 1),
+                         {"input": 4.00, "output": 20.00, "cache_read": 0.20, "cache_write": 4.00}),),
     "gemini-3.8-flash": ((date(2027, 1, 1),
                           {"input": 1.50, "output": 7.50, "cache_read": 0.15, "cache_write": 1.50}),),
 }
@@ -93,18 +96,20 @@ class GeminiModel(NamedTuple):
 # Gemini 陣容的唯一來源（answer_gemini、telegram_bot、ask.py 都讀這裡），選單依這個順序。
 # 2026-11-16 依 Vertex 模型頁確認，三個都在 location=global 實測過 generateContent 與工具呼叫。
 # - 4 Hydrogen：官方指定的 3.8 Flash 後繼（快、便宜那一線），預設思考 HIGH。
-# - 4 Argon：官方指定的 3.1 Pro 後繼之一，預設思考 MEDIUM。另一個 4 Carbon 是「Google Frontier Model」，
-#   所有提示與回答都會被記錄最多 30 天、可能有人工審查，醫案有病人資料，所以不用。
-# - 3.8 Flash：優惠價到 2026-12-31，比 Hydrogen 便宜一半；2027 起同價，就可以拿掉。
+# - 4 Argon、4 Carbon：官方指定的 3.1 Pro 後繼，同價，模型預設思考 MEDIUM；Argon 這裡改用 HIGH。
+# 3.8 Flash 在 2026-11-16 依使用者決定停用（見 RETIRED_MODELS）。
 # Gemini 4 非串流單次輸出上限 32,768（Hydrogen 65,536），思考較多，上限放寬到 16,384。
 GEMINI_LINEUP = (
     GeminiModel("gemini-4-hydrogen", "gemini-flash", "Gemini 4 Hydrogen", "m:f", max_output_tokens=16384),
-    GeminiModel("gemini-4-argon", "gemini-pro", "Gemini 4 Argon", "m:p", max_output_tokens=16384),
-    GeminiModel("gemini-3.8-flash", "gemini-3.8-flash", "Gemini 3.8 Flash", "m:3"),
+    # Argon 思考 HIGH（使用者 2026-11-16 決定）；思考也算在輸出上限裡，放寬到非串流上限 32,768。
+    GeminiModel("gemini-4-argon", "gemini-pro", "Gemini 4 Argon", "m:p", thinking="high", max_output_tokens=32768),
+    # Carbon 是「Google Frontier Model」：提示與回答可能被記錄最多 30 天、被標記的可能人工審查（使用者 2026-11-16 已接受）。
+    GeminiModel("gemini-4-carbon", "gemini-carbon", "Gemini 4 Carbon", "m:ca", max_output_tokens=16384),
 )
 GEMINI_MODELS = {item.id: item for item in GEMINI_LINEUP}
 # 停用的模型 id → 顯示名稱；舊對話或 /model 指到它們時改回預設模型並說明。
-RETIRED_MODELS = {"gemini-3.1-pro-preview": "Gemini 3.1 Pro"}
+# 3.8 Flash 的 PRICES／PRICE_CHANGES 保留，舊紀錄才算得出費用。
+RETIRED_MODELS = {"gemini-3.1-pro-preview": "Gemini 3.1 Pro", "gemini-3.8-flash": "Gemini 3.8 Flash"}
 PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
 USAGE_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
 
